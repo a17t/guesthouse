@@ -8,7 +8,7 @@ This page is contributed: it is not something each release of the daemon gets te
 
 ## The patch
 
-`qemu-gpupv.patch` gives QEMU the VMBus devices the guest needs, but the machine still has no display for the GPU's picture. The GPU renders into the daemon's frame socket (`frames.sock`), and QEMU knows nothing of it. `qemu-gh-frames.patch` adds a device, `gh-frames`, in `hw/display/gh-frames.c`, that connects to that socket and shows the pictures as a QEMU graphic console. The socket guards live under `sock_lock`; if the daemon restarts under a running machine, the device reconnects and keeps releasing slots to the right descriptor.
+`qemu-gpupv.patch` gives QEMU the VMBus devices the guest needs, but the machine still has no display for the GPU's picture. The GPU renders into the daemon's frame socket (`frames.sock`), and QEMU knows nothing of it. `qemu-gh-frames.patch` adds a device, `gh-frames`, in `hw/display/gh-frames.c`, that connects to that socket and shows the pictures as a QEMU graphic console. If the daemon restarts under a running machine, the device connects again by itself.
 
 Apply it after the first patch, from the QEMU source:
 
@@ -26,7 +26,7 @@ What the device does, in short:
 - **A steady 60 Hz.** The console presents on a fixed cadence and always takes the newest frame; frames in between are dropped, the way a monitor drops whatever the GPU flips while it is scanning out.
 - **The cursor.** Shape and position arrive on the socket and go to the console's cursor channel, so the cursor moves at wire latency instead of frame rate.
 
-Limits: view-only, no input injection, and no migration - the device carries no vmstate.
+Input works from the spice or VNC client, through the domain's USB tablet and keyboard as in the example domain. The device itself carries no input. There's no migration, as the device carries no vmstate.
 
 ## The setup
 

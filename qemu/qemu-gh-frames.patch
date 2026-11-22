@@ -1,4 +1,4 @@
-From f7824be2436534e99887437e38da36d51fc3faf3 Mon Sep 17 00:00:00 2001
+From 66704c86e1dd39b0ba1a0b625eb015deff4b41a6 Mon Sep 17 00:00:00 2001
 From: Simon Siebert <simon.siebert@a17t.dev>
 Date: Sat, 14 Nov 2026 13:38:54 +0100
 Subject: [PATCH] hw/display: add gh-frames, the guesthouse frame viewer
@@ -25,21 +25,26 @@ back until frames flow again.
 
 Thread safety and teardown: slot releases go out from the main loop
 while the reader thread reconnects, so the socket descriptor is
-guarded by its own lock; ramfb byte counts are computed in hwaddr
-(stride is a 32-bit wire field, the multiply must not wrap); ring
-descriptors are closed right after mmap; frame bounds include the
-offset, the same math as Descriptor::fits in crates/frame-socket.
+guarded by its own lock, and they are sent with MSG_DONTWAIT so the
+main loop never waits on the daemon. The reader checks quit under
+that lock as it publishes a new descriptor, so unrealize can't miss
+it. ramfb takes only XRGB8888 with a stride of whole pixels at least
+a row long, and its byte counts are computed in hwaddr (stride is a
+32-bit wire field, the multiply must not wrap); ring descriptors are
+closed right after mmap; ring and cursor messages are length-checked,
+and the cursor reads only pitch times height; frame bounds include
+the offset, the same math as Descriptor::fits in crates/frame-socket.
 Unrealize sets quit, breaks the socket, joins the reader and frees
 timer, bhs, surfaces and mappings - the bhs are kept as handles for
 that instead of anonymous oneshots.
 
-No migration: the device does not carry vmstate. View-only: it
-injects no input.
+No migration: the device does not carry vmstate. It injects no input
+itself; the machine's usb-tablet and keyboard carry it.
 ---
  hw/display/Kconfig     |   5 +
- hw/display/gh-frames.c | 905 +++++++++++++++++++++++++++++++++++++++++
+ hw/display/gh-frames.c | 943 +++++++++++++++++++++++++++++++++++++++++
  hw/display/meson.build |   1 +
- 3 files changed, 911 insertions(+)
+ 3 files changed, 949 insertions(+)
  create mode 100644 hw/display/gh-frames.c
 
 diff --git a/hw/display/Kconfig b/hw/display/Kconfig
@@ -60,10 +65,10 @@ index b3593fe..771418d 100644
      default y if PCI_DEVICES
 diff --git a/hw/display/gh-frames.c b/hw/display/gh-frames.c
 new file mode 100644
-index 0000000..09b4ab9
+index 0000000..c4b9e06
 --- /dev/null
 +++ b/hw/display/gh-frames.c
-@@ -0,0 +1,905 @@
+@@ -0,0 +1,943 @@
 +/*
 + * gh-frames: guesthouse frame viewer console.
 + *
@@ -79,7 +84,8 @@ index 0000000..09b4ab9
 + * GPU frame arrives, so firmware output lands on the one display
 + * without a second console.
 + *
-+ * View-only: the device injects no input.
++ * The device injects no input itself. The machine's usb-tablet and
++ * keyboard carry it, through whichever display backend is attached.
 + *
 + * SPDX-License-Identifier: GPL-2.0-or-later
 + */
@@ -234,6 +240,8 @@ index 0000000..09b4ab9
 +    return send(fd, buf, pos, 0) == (ssize_t)pos;
 +}
 +
++/* MSG_DONTWAIT: releases go out from the main loop, which must never
++ * wait on the daemon. A release that would block is dropped. */
 +static bool gh_send_release(int fd, uint32_t generation, uint32_t slot)
 +{
 +    uint8_t buf[16];
@@ -241,7 +249,7 @@ index 0000000..09b4ab9
 +    gh_put_header(buf, &pos, GH_KIND_RELEASE);
 +    memcpy(buf + pos, &generation, 4); pos += 4;
 +    memcpy(buf + pos, &slot, 4); pos += 4;
-+    return send(fd, buf, pos, 0) == (ssize_t)pos;
++    return send(fd, buf, pos, MSG_DONTWAIT) == (ssize_t)pos;
 +}
 +
 +/* Releases go out from the main loop while the reader thread may be
@@ -350,13 +358,13 @@ index 0000000..09b4ab9
 +    }
 +    gen = s->pending_gen;
 +    slot = s->pending_slot;
-+    src = s->slot_maps[slot] + s->frame_offset;
 +    s->pending_valid = false;
 +    if (!s->slot_maps[slot]) {
 +        qemu_mutex_unlock(&s->lock);
 +        gh_release_slot(s, gen, slot);
 +        return;
 +    }
++    src = s->slot_maps[slot] + s->frame_offset;
 +    surface = qemu_console_surface(s->con);
 +    if (surface &&
 +        (surface_width(surface) != (int)s->frame_w ||
@@ -425,18 +433,30 @@ index 0000000..09b4ab9
 +    uint32_t width = be32_to_cpu(s->ramfb_cfg.width);
 +    uint32_t height = be32_to_cpu(s->ramfb_cfg.height);
 +
++    /* XRGB8888 only: it is all OVMF uses, and the console surface the
++     * boot screen is copied into is always 4 bytes a pixel, so a 3-byte
++     * format would make the copy read past the end of the mapping */
++    if (fourcc != GH_SDR_FOURCC) {
++        return;
++    }
 +    format = qemu_drm_format_to_pixman(fourcc);
 +    if (width < 16 || width > 16384 ||
 +        height < 16 || height > 16384 || format == 0) {
 +        return;
 +    }
-+    linesize = width * PIXMAN_FORMAT_BPP(format) / 8;
++    linesize = (hwaddr)width * 4;
 +    /* stride is a 32-bit wire field; widening to hwaddr before the
 +     * multiply keeps the byte count from wrapping around into a
 +     * small map for a huge row length (ramfb.c does the same) */
 +    stride = be32_to_cpu(s->ramfb_cfg.stride);
 +    if (stride == 0) {
 +        stride = linesize;
++    }
++    /* a row shorter than the width would make the copy run past the
++     * mapping, and a stride that isn't whole pixels trips the assert in
++     * qemu_create_displaysurface_from */
++    if (stride < linesize || stride % 4 != 0) {
++        return;
 +    }
 +    mapsize = size = stride * (height - 1) + linesize;
 +    data = physical_memory_map(addr, &mapsize, false);
@@ -657,8 +677,16 @@ index 0000000..09b4ab9
 +            goto reconnect;
 +        }
 +        /* publish only the connected descriptor: from here on the
-+         * main loop may release slots against it */
++         * main loop may release slots against it. quit is checked under
++         * the same lock unrealize takes, so either unrealize sees the
++         * descriptor and shuts it down, or this sees quit and stops;
++         * otherwise the recvmsg below could wait forever. */
 +        qemu_mutex_lock(&s->sock_lock);
++        if (qatomic_read(&s->quit)) {
++            qemu_mutex_unlock(&s->sock_lock);
++            close(fd);
++            break;
++        }
 +        s->sock = fd;
 +        qemu_mutex_unlock(&s->sock_lock);
 +
@@ -691,6 +719,13 @@ index 0000000..09b4ab9
 +            case GH_KIND_RING: {
 +                uint32_t slots;
 +                uint64_t size;
++                if (rc < 8 + 16) {
++                    for (i = 0; i < nfds; i++) {
++                        close(fds[i]);
++                        fds[i] = -1;
++                    }
++                    break;
++                }
 +                memcpy(&generation, packet + 8, 4);
 +                memcpy(&slots, packet + 12, 4);
 +                memcpy(&size, packet + 16, 8);
@@ -751,6 +786,10 @@ index 0000000..09b4ab9
 +                    fds[0] = -1;
 +                    break;
 +                }
++                /* read only the rows the cursor uses: size is the
++                 * daemon's word for the whole buffer, pitch * height is
++                 * bounded by the checks above */
++                size = pitch * ch;
 +                px = g_malloc(size);
 +                while (off < (ssize_t)size) {
 +                    ssize_t got = pread(fds[0], px + off, size - off, off);
@@ -907,7 +946,11 @@ index 0000000..09b4ab9
 +/* The reader may sit in a blocking recvmsg: set quit, break the
 + * socket so the read returns, then join before anything of the state
 + * is freed. unrealize runs on the main loop, and so do the bhs, so
-+ * nothing scheduled can fire past qemu_bh_delete. */
++ * nothing scheduled can fire past qemu_bh_delete.
++ *
++ * The console and the fw_cfg file are left in place. An ISA device
++ * can't be unplugged, so this only runs as QEMU exits, and neither is
++ * used after that. */
 +static void gh_frames_unrealize(DeviceState *dev)
 +{
 +    GHFramesState *s = GH_FRAMES(dev);
@@ -982,5 +1025,5 @@ index ffecedb..bc946c5 100644
  system_ss.add(when: 'CONFIG_VGA_CIRRUS', if_true: files('cirrus_vga.c'))
  system_ss.add(when: ['CONFIG_VGA_CIRRUS', 'CONFIG_VGA_ISA'], if_true: files('cirrus_vga_isa.c'))
 -- 
-2.56.1
+2.47.3
 
