@@ -10,7 +10,7 @@
 use super::bytes::dword;
 use guesthouse_backend::guest_text::{self, utf16_list, utf16_zero};
 use guesthouse_backend::{RegistryName, RegistryValue, VendorQuery};
-use guesthouse_messages::registry::TYPE_STRING_LIST;
+use guesthouse_messages::registry::{TYPE_STRING, TYPE_STRING_LIST};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The Adrenalin drivers these answers are for. AMD ships one release as two drivers, the first for
@@ -32,18 +32,6 @@ const VERSION_FIELD: usize = 0;
 const NEWEST: usize = USER_DRIVERS.len() - 1;
 const KERNEL_DRIVER: &str = "amdkmdag.sys";
 
-/// What DXCore looks up, by the lower-case name the core asks with. The strings are Microsoft's
-/// public attribute GUIDs: a GPU, then Direct3D 11, Direct3D 12, compute, machine learning and media.
-/// Without the list, DXCore has nothing to say this adapter can draw.
-const DXCORE_ATTRIBUTES: &[&str] = &[
-    "{B69EB219-3DED-4464-979F-A00BD4687006}",
-    "{8C47866B-7583-450D-F0F0-6BADA895AF4B}",
-    "{0C9ECE4D-2F6E-4F01-8C96-E89E331B47B1}",
-    "{248E2800-A793-4724-ABAA-23A6DE1BE090}",
-    "{B71B0D41-1088-422F-A27C-0250B7D3A988}",
-    "{8EB2C848-82F6-4B49-AA87-AECFCF0174C6}",
-];
-
 static LOGGED_DRIVER_NAME: AtomicBool = AtomicBool::new(false);
 
 /// Writes the user-mode driver path into `out`, keeping the guest's version dword.
@@ -61,9 +49,14 @@ pub fn write_name(query: &VendorQuery<'_>, out: &mut Vec<u8>) {
     guest_text::user_driver_name(query, &path, out);
 }
 
-/// The driver paths, the attribute list DXCore asks for, and the values the Vulkan and OpenGL
-/// loaders look up. Any other registry name has no answer.
-pub fn registry(name: &RegistryName) -> Option<RegistryValue> {
+/// The value AMD's INF writes the card's name to. Every user-mode driver of AMD's names the card by it,
+/// through the same lookup as the values below: Direct3D, Vulkan and OpenGL all read it, and each says
+/// "Unknown AMD GPU" when the lookup fails. Programs show that name, as Minecraft and Blender did.
+const CARD_NAME_VALUE: &str = "DriverDesc";
+
+/// The driver paths, the attribute list DXCore asks for, the card's name, and the values the Vulkan
+/// and OpenGL loaders look up. Any other registry name has no answer.
+pub fn registry(name: &RegistryName, card_name: &str) -> Option<RegistryValue> {
     match name {
         RegistryName::DriverStorePath => {
             Some(RegistryValue { value_type: None, bytes: utf16_zero(DRIVER_STORE) })
@@ -72,8 +65,12 @@ pub fn registry(name: &RegistryName) -> Option<RegistryValue> {
             let path = format!("{DRIVER_STORE}\\{KERNEL_DRIVER}");
             Some(RegistryValue { value_type: None, bytes: utf16_zero(&path) })
         }
-        RegistryName::Value(name) if name.eq_ignore_ascii_case("dxcoreattributes") => {
-            Some(RegistryValue { value_type: Some(TYPE_STRING_LIST), bytes: utf16_list(DXCORE_ATTRIBUTES) })
+        RegistryName::Value(name) if name.eq_ignore_ascii_case(guest_text::DXCORE_ATTRIBUTES_VALUE) => {
+            let attributes = utf16_list(guest_text::DXCORE_GRAPHICS_ATTRIBUTES);
+            Some(RegistryValue { value_type: Some(TYPE_STRING_LIST), bytes: attributes })
+        }
+        RegistryName::Value(name) if name.eq_ignore_ascii_case(CARD_NAME_VALUE) => {
+            Some(RegistryValue { value_type: Some(TYPE_STRING), bytes: utf16_zero(card_name) })
         }
         RegistryName::Value(name) => super::api_drivers::registry_value(name),
     }
@@ -104,6 +101,7 @@ mod tests {
             size: data.len(),
             data: &data,
             process_is_32_bit,
+            program: "",
         };
         write_name(&query, &mut out);
         assert_eq!(out[0], version);
@@ -131,17 +129,26 @@ mod tests {
 
     #[test]
     fn the_driver_paths_are_under_the_store_and_nothing_else_is_answered() {
-        let store = registry(&RegistryName::DriverStorePath).unwrap();
-        let image = registry(&RegistryName::DriverImagePath).unwrap();
+        let store = registry(&RegistryName::DriverStorePath, CARD).unwrap();
+        let image = registry(&RegistryName::DriverImagePath, CARD).unwrap();
         assert_eq!(store.bytes, utf16_zero(DRIVER_STORE));
         assert!(name_text(&image.bytes).ends_with(KERNEL_DRIVER));
-        assert!(registry(&RegistryName::Value("vulkan".into())).is_none());
-        let attributes = registry(&RegistryName::Value("dxcoreattributes".into())).unwrap();
+        assert!(registry(&RegistryName::Value("vulkan".into()), CARD).is_none());
+        let attributes = registry(&RegistryName::Value("dxcoreattributes".into()), CARD).unwrap();
         assert_eq!(attributes.value_type, Some(TYPE_STRING_LIST));
         let units = attributes.bytes.as_chunks::<2>().0.iter().map(|unit| u16::from_le_bytes(*unit));
         let text = String::from_utf16_lossy(&units.collect::<Vec<_>>());
         assert!(text.contains("B69EB219-3DED-4464-979F-A00BD4687006"), "{text}");
         assert!(text.contains("8C47866B-7583-450D-F0F0-6BADA895AF4B"), "{text}");
+    }
+
+    const CARD: &str = "AMD Radeon RX 5700 XT";
+
+    #[test]
+    fn the_card_s_name_is_given_as_amd_s_inf_gives_it() {
+        let value = registry(&RegistryName::Value("driverdesc".into()), CARD).unwrap();
+        assert_eq!(value.value_type, Some(TYPE_STRING));
+        assert_eq!(name_text(&value.bytes), CARD);
     }
 
     fn name_text(bytes: &[u8]) -> String {

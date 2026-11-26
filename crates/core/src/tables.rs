@@ -1,6 +1,6 @@
 //! Allocations, queues and the other per-guest records.
 
-use guesthouse_backend::{MemoryId, MemoryKind, PagesView, SpaceId, SurfaceShape};
+use guesthouse_backend::{MemoryId, MemoryKind, PagesView, RangeView, SpaceId, SurfaceShape};
 use std::collections::VecDeque;
 
 /// Where an allocation is mapped in one address space.
@@ -43,6 +43,9 @@ pub struct Allocation {
     pub mappings: Vec<Mapping>,
     /// When it was first mapped, counting mapped allocations.
     pub first_mapped: Option<u64>,
+    /// Each address space it has ever been mapped in, with how much may have written through that
+    /// space when it first was. A mapping that goes leaves its entry, as what was written stays.
+    pub mapped_at: Vec<(SpaceId, u64)>,
     pub gpu_cached: bool,
     /// The guest made it to be shown, as DWM's buffers and a fullscreen program's are. Kept as the
     /// guest asked, whatever the answer said.
@@ -53,6 +56,9 @@ pub struct Allocation {
     /// The residency priority the guest set, if it has. Nothing here acts on it: the host's
     /// driver decides what stays in video memory.
     pub priority: Option<u32>,
+    /// The card had no room, so its memory is host system memory the card reaches, as Windows
+    /// moves memory out of a full card. It doesn't count as on the card.
+    pub spilled: bool,
 }
 
 impl Allocation {
@@ -75,10 +81,23 @@ pub struct Queue {
     pub last_fence: Option<u64>,
     /// The GPU stopped answering on this queue, so nothing waits for it any more.
     pub failed: bool,
+    /// Its last work runs until the guest ends it, so nothing waits for it either.
+    pub stays: bool,
     /// What the GPU has yet to finish, as (fence value, work), oldest first.
     pub backlog: VecDeque<(u64, u32)>,
     /// All the work in `backlog`.
     pub unfinished: u64,
+    /// The last work handed to the engine, as opposed to work only started and still held back.
+    pub rung: Option<Rung>,
+}
+
+/// Work a queue handed to the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rung {
+    /// The value its queue's fence reaches once it ends.
+    pub value: u64,
+    /// How much work had started in the queue's address space by then, this work included.
+    pub space_writes: u64,
 }
 
 impl Queue {
@@ -90,8 +109,10 @@ impl Queue {
             context,
             last_fence: None,
             failed: false,
+            stays: false,
             backlog: VecDeque::new(),
             unfinished: 0,
+            rung: None,
         }
     }
 }
@@ -104,4 +125,7 @@ pub struct ReservedRange {
     pub space: SpaceId,
     /// At an address the guest asked for and not one handed out, so it goes back differently.
     pub placed: bool,
+    /// What the guest said the range is for. Plain memory mapped here is used that way, whatever
+    /// the heap it comes from was made as.
+    pub view: RangeView,
 }

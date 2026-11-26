@@ -4,8 +4,18 @@
 //! process of the same user can read it: a daemon answering a guest's performance queries, or the
 //! app showing the host's figures over a guest's screen. A reader takes no lock and never waits.
 //! What reads the card, and when, is the reader's own business and lives elsewhere.
+//!
+//! [`guest_use`] is the same kind of file for one guest: the video memory its daemon's books say it
+//! holds, kept in its run folder for the app's share panel. [`card_processes`] is each process's part
+//! of one card, for a driver that counts that per process.
 
+// Linux only: it uses mmap, flock and getuid. Other systems get an empty crate.
+#![cfg(target_os = "linux")]
+
+pub mod card_processes;
+pub mod guest_use;
 mod shared;
+pub mod words;
 
 pub use shared::SharedSnapshot;
 
@@ -60,6 +70,17 @@ pub fn snapshot_path() -> PathBuf {
     PathBuf::from(format!("/dev/shm/gpupv-sensors-{user}-{LAYOUT}"))
 }
 
+/// The file for the readings of the card at `card`, an address as `0000:01:00.0`, which the guests on
+/// that card share. Each card has its own, so a guest on one is never told another's figures. With no
+/// address, as a setup from before addresses were kept has, it's the one file there always was.
+pub fn snapshot_path_for(card: Option<&str>) -> PathBuf {
+    let shared = snapshot_path();
+    match card {
+        Some(card) => PathBuf::from(format!("{}-{card}", shared.display())),
+        None => shared,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,5 +89,15 @@ mod tests {
     fn the_layout_is_in_the_files_name() {
         let name = snapshot_path().file_name().unwrap().to_string_lossy().into_owned();
         assert!(name.ends_with(&format!("-{LAYOUT}")), "{name}");
+    }
+
+    #[test]
+    fn each_card_has_a_file_and_no_address_is_the_shared_one() {
+        assert_eq!(snapshot_path_for(None), snapshot_path());
+        let first = snapshot_path_for(Some("0000:01:00.0"));
+        let second = snapshot_path_for(Some("0000:02:00.0"));
+        assert_ne!(first, second);
+        let name = second.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.ends_with(&format!("-{LAYOUT}-0000:02:00.0")), "{name}");
     }
 }

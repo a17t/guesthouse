@@ -5,12 +5,16 @@ use crate::random::random_bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::net::{TcpListener, UdpSocket};
+use std::net::{Ipv4Addr, TcpListener, UdpSocket};
 use std::path::Path;
 
 pub const MOST_PORT: u32 = 65535;
 /// The guest's agent listens here.
 pub const GUEST_AGENT_PORT: u16 = 8765;
+/// A Windows guest's helper for dropped and dragged files listens here, while a viewer is open.
+pub const GUEST_FILES_PORT: u16 = 8767;
+/// A Windows guest's app windows helper listens here, when the machine has app windows switched on.
+pub const GUEST_APP_WINDOWS_PORT: u16 = 8769;
 /// QEMU's own range, which is locally administered.
 const MAC_PREFIX: &str = "52:54:00";
 /// What QEMU gives a NIC when it is told nothing.
@@ -20,11 +24,18 @@ pub const CONTROL_MAC: &str = "52:54:00:67:68:01";
 pub const DEFAULT_BRIDGE: &str = "br0";
 /// Where install.sh puts Guesthouse's own bridge helper, setuid root. It says the same.
 pub const OWN_BRIDGE_HELPER: &str = "/usr/local/libexec/guesthouse/qemu-bridge-helper";
-/// Makes a tap as root, for a QEMU that runs as this user. Guesthouse's own comes first. A build of the
-/// repo has none, and then it's the distribution's: Fedora keeps it in the second of these, and Debian,
-/// Ubuntu and Arch in the third.
-const BRIDGE_HELPERS: [&str; 3] =
-    [OWN_BRIDGE_HELPER, "/usr/libexec/qemu-bridge-helper", "/usr/lib/qemu/qemu-bridge-helper"];
+/// Where Guesthouse's NixOS module puts the same helper, as a setuid wrapper. It isn't called
+/// `qemu-bridge-helper`, as NixOS's libvirt module already gives that name to its own QEMU's.
+pub const NIXOS_BRIDGE_HELPER: &str = "/run/wrappers/bin/guesthouse-bridge-helper";
+/// Makes a tap as root, for a QEMU that runs as this user. Guesthouse's own comes first, from
+/// install.sh or from the NixOS module. A build of the repo has none, and then it's the
+/// distribution's: Fedora keeps it in the third of these, and Debian, Ubuntu and Arch in the fourth.
+const BRIDGE_HELPERS: [&str; 4] = [
+    OWN_BRIDGE_HELPER,
+    NIXOS_BRIDGE_HELPER,
+    "/usr/libexec/qemu-bridge-helper",
+    "/usr/lib/qemu/qemu-bridge-helper",
+];
 /// The kernel's limit on an interface's name.
 const MOST_BRIDGE_NAME: usize = 15;
 const FIRST_FREE_PORT_FILE: &str = "/proc/sys/net/ipv4/ip_unprivileged_port_start";
@@ -35,9 +46,15 @@ fn first_that_exists<'a>(places: &[&'a str], exists: impl Fn(&str) -> bool) -> &
     places.iter().copied().find(|place| exists(place)).unwrap_or(places[0])
 }
 
-/// Where this PC keeps the helper. If it has none, the bridge check says so about Guesthouse's own.
+/// What NixOS has, and nothing else does.
+pub const NIXOS_MARK: &str = "/etc/NIXOS";
+
+/// Where this PC keeps the helper. If it has none, the bridge check says so about Guesthouse's own:
+/// install.sh's, or on NixOS the module's.
 pub fn bridge_helper() -> &'static str {
-    first_that_exists(&BRIDGE_HELPERS, |place| Path::new(place).exists())
+    let found = first_that_exists(&BRIDGE_HELPERS, |place| Path::new(place).exists());
+    let none = !Path::new(found).exists();
+    if none && Path::new(NIXOS_MARK).exists() { NIXOS_BRIDGE_HELPER } else { found }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -230,19 +247,24 @@ pub fn port_taken(protocol: Protocol, port: u16) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InUse {
     Passt,
+    /// passt, held to one interface that has since gone, so nothing gets out any more.
+    Cut,
     Bridge,
     Restricted,
     Slirp,
 }
 
 const SLIRP_NAME: &str = "QEMU's built-in NAT (slirp)";
+const CUT: &str = "Its network is cut, as the interface it goes out through went away. \
+                   Start the machine again once the interface is back.";
 const SECOND_ADAPTER: &str = "The guest sees a second network adapter, which only Guesthouse uses.";
 
 pub fn in_use_of(words: &[Vec<u8>]) -> Option<InUse> {
     let nic = words.windows(2).find(|pair| pair[0] == b"-nic")?;
     let word = &nic[1];
     let has = |needle: &[u8]| word.windows(needle.len()).any(|part| part == needle);
-    Some(if word.starts_with(b"passt,") {
+    // The jail's launcher starts passt, and QEMU has its end of the connection.
+    Some(if word.starts_with(b"passt,") || word.starts_with(b"socket,") {
         InUse::Passt
     } else if word.starts_with(b"bridge,") {
         InUse::Bridge
@@ -253,9 +275,15 @@ pub fn in_use_of(words: &[Vec<u8>]) -> Option<InUse> {
     })
 }
 
-/// What these settings give the guest.
-pub fn describe(mode: Mode, passt: bool, installed: bool) -> String {
+/// What these settings give the guest. `only_through` is the interface everything is held to, or empty.
+pub fn describe(mode: Mode, passt: bool, installed: bool, only_through: &str) -> String {
     match mode {
+        Mode::Nat if !only_through.is_empty() && installed => {
+            format!("Uses passt, through {only_through} and nothing else. {SECOND_ADAPTER}")
+        }
+        Mode::Nat if !only_through.is_empty() => {
+            format!("Only through {only_through}, which needs passt, and it is not installed.")
+        }
         Mode::None => {
             "No internet. Guesthouse can still reach the guest, and a shared folder still works.".into()
         }
@@ -269,6 +297,7 @@ pub fn describe(mode: Mode, passt: bool, installed: bool) -> String {
 /// What a running machine really has.
 pub fn in_use_text(found: Option<InUse>) -> String {
     let name = match found {
+        Some(InUse::Cut) => return CUT.to_owned(),
         Some(InUse::Passt) => "passt",
         Some(InUse::Bridge) => "the bridge",
         Some(InUse::Restricted) => "no internet",
@@ -283,6 +312,20 @@ pub fn bridge_name_problem(bridge: &str) -> Option<String> {
     let allowed = |byte: u8| byte.is_ascii_alphanumeric() || b"_.-".contains(&byte);
     let good = (1..=MOST_BRIDGE_NAME).contains(&bridge.len()) && bridge.bytes().all(allowed);
     (!good).then(|| "A bridge's name is up to 15 letters, digits, dots, dashes or underscores.".into())
+}
+
+/// The interface's name goes to passt as a word of its own and to the launcher, so it must not hold
+/// a space or a slash, and an empty one means the setting is off.
+pub fn interface_name_problem(name: &str) -> Option<String> {
+    let allowed = |byte: u8| byte.is_ascii_graphic() && !b",/".contains(&byte);
+    let good = name.is_empty() || ((1..=MOST_BRIDGE_NAME).contains(&name.len()) && name.bytes().all(allowed));
+    (!good).then(|| "An interface's name is up to 15 characters, with no spaces, commas or slashes.".into())
+}
+
+/// Why this can't be the DNS server of a machine that goes out through one interface. Empty finds one.
+pub fn dns_problem(address: &str) -> Option<String> {
+    let good = address.is_empty() || address.parse::<Ipv4Addr>().is_ok();
+    (!good).then(|| "A DNS server is an IPv4 address, like 10.64.0.1.".into())
 }
 
 #[cfg(test)]
@@ -386,17 +429,54 @@ mod tests {
         assert_eq!(in_use_of(&words("user,restrict=on")), Some(InUse::Restricted));
         assert_eq!(in_use_of(&words("user,model=e1000e")), Some(InUse::Slirp));
         assert_eq!(in_use_text(None), "");
+        assert!(in_use_text(Some(InUse::Cut)).contains("Start the machine again"));
     }
 
     #[test]
     fn passt_settings_are_described_as_they_will_work() {
-        assert!(describe(Mode::Nat, true, true).contains("passt"));
-        assert!(describe(Mode::Nat, true, false).contains("not installed"));
+        assert!(describe(Mode::Nat, true, true, "").contains("passt"));
+        assert!(describe(Mode::Nat, true, false, "").contains("not installed"));
+    }
+
+    #[test]
+    fn the_one_interface_is_said_whatever_the_passt_switch_is() {
+        for switch in [false, true] {
+            let text = describe(Mode::Nat, switch, true, "wg0");
+            assert!(text.contains("through wg0 and nothing else") && text.contains("passt"), "{text}");
+        }
+        assert!(describe(Mode::Nat, false, false, "wg0").contains("needs passt"));
+        assert_eq!(describe(Mode::None, false, true, "wg0"), describe(Mode::None, false, true, ""));
+    }
+
+    #[test]
+    fn a_launcher_started_passt_is_passt_too() {
+        let nic = b"socket,model=e1000e,fd=5".to_vec();
+        let words = vec![b"qemu".to_vec(), b"-nic".to_vec(), nic];
+        assert_eq!(in_use_of(&words), Some(InUse::Passt));
     }
 
     #[test]
     fn a_comma_cannot_reach_qemus_options() {
         assert!(bridge_name_problem("br0,helper=/tmp/x").unwrap().contains("up to 15"));
         assert_eq!(bridge_name_problem("br0"), None);
+    }
+
+    #[test]
+    fn an_interface_name_is_empty_or_one_the_kernel_and_passt_take() {
+        for name in ["", "wg0", "tun0", "proton0", "wlan0.5"] {
+            assert_eq!(interface_name_problem(name), None, "{name}");
+        }
+        for name in ["wg 0", "wg0,x", "../wg0", "a-name-that-is-too-long"] {
+            assert!(interface_name_problem(name).unwrap().contains("up to 15"), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_dns_server_is_an_ipv4_address_or_left_to_be_found() {
+        assert_eq!(dns_problem(""), None);
+        assert_eq!(dns_problem("10.64.0.1"), None);
+        for text in ["fc00::1", "one.one.one.one", "10.64.0.256", "10.64.0.1 "] {
+            assert!(dns_problem(text).unwrap().contains("IPv4"), "{text}");
+        }
     }
 }

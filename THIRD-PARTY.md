@@ -9,8 +9,21 @@ Everything in this repo is under GPL-2.0-or-later, apart from what's listed here
 - The tables in the `nvfwd` device in `qemu/qemu-gpupv.patch` (`nv_tables.h`, `nv_tables_extra.h`, `fd_controls.h`, `class_tables.h`, `uvm_tables.h`), and `linux/guest/fd_controls.h` and `linux/guest/nv_tables_extra.h`, are made from those same modules, and each carries that notice. The offsets in `rm_layout.h` and `rusd.c` are from their public headers. Most of the numbers in `linux/allow.txt` are from those headers too.
 - The Time Synchronization channel in `qemu/qemu-gpupv.patch` follows Linux's `hv_util.c`. Its instance ID and message layout come from Microsoft's [OpenVMM](https://github.com/microsoft/openvmm), under the MIT licence.
 - The DMA engine's copy packet in `crates/backend-amd/src/sdma_copy.rs` follows the one in Mesa's `src/amd/common/ac_cmdbuf_sdma.c`, under the MIT licence.
+- The commands that close an encode session in `crates/backend-amd/src/video_close.rs`, and the packet numbers a session is read by there, follow Mesa's `src/gallium/drivers/radeonsi/radeon_vcn_enc_1_2.c`, `src/amd/common/ac_vcn.h` and `src/amd/common/ac_vcn_enc.h`, under the MIT licence.
+- The xe query numbers and layouts in `crates/backend-intel/src/ioctl.rs` and `xe_query.rs` come from Linux's `include/uapi/drm/xe_drm.h`, under the MIT licence. The hwconfig key numbers in `crates/backend-intel/src/hwconfig.rs` come from Mesa's `src/intel/dev/intel_hwconfig_types.h`, under the MIT licence.
+- The platform numbers in `crates/backend-intel/src/generation.rs` and `protocol/`, the names of the fields they fill, the node numbering in `protocol/nodes.rs` (gmmlib's `UmKmEnum.h`) and the order of the GPU address partition in `protocol/partition.rs` (compute-runtime's `sharedata_wrapper.h`) come from Intel's [gmmlib](https://github.com/intel/gmmlib) and [compute-runtime](https://github.com/intel/compute-runtime), under the MIT licence. Their notice is below. The structure of the slice arrays in `protocol/shape.rs` follows gmmlib's `gtsysinfo.h` and the reader in compute-runtime's `wddm.cpp`, and the choice of feature flags in `protocol/record.rs` follows compute-runtime's Lunar Lake table (`hw_info_lnl.cpp`) and its default table (`hw_info.cpp`), under the same licence.
+- A release comes with Microsoft's installer of [OpenSSH for Windows](https://github.com/PowerShell/Win32-OpenSSH), as Microsoft publishes it, which goes into a Windows guest whose SSH is on. It isn't in this repo. OpenSSH is under a BSD licence, and the installer carries its licence and the notices of what it's built with, and puts them beside the programs in the guest.
 - A release's QEMU comes with [virglrenderer](https://gitlab.freedesktop.org/virgl/virglrenderer), built from upstream's source as it is, under the MIT licence. It isn't in this repo, and its source is in the release's bundled source, with its licence.
+- What a Windows host does through HCS, in `crates/hcs/` and `crates/host-windows/src/machine.rs`, follows James Stringer's [App Sandbox](https://github.com/jamesstringer90/appsandbox), under the MIT licence: the machine document a UEFI Windows guest needs to start with only Virtual Machine Platform (its Secure Boot template, its state files, its TPM, and the screen HCS won't start without), giving the GPU only once the machine runs and by its partition adapter's path, finding each card and its driver's folder through SetupAPI, the guest's host driver store taking that folder under its own name, the ICS network and its endpoint, and the sector sizes of a new VHDX. A Linux guest's Secure Boot left off and its serial port, the two places Ubuntu's GRUB looks for its menu on a UEFI disk, and the host's `lxss\lib` becoming the guest's `/usr/lib/wsl/lib`, in `crates/host-windows/src/windows/linux.rs` and `guest/linux/`, follow it too. None of its code is copied, as it's C and this is Rust, but those choices are its. The NVAPI wrapper in `crates/nvapi-shim/` follows its `tools/nvidia/nvapi_shim.c` in what it does: forwarding NVAPI's `nvapi_QueryInterface` to NVIDIA's DLL and answering `NvAPI_GPU_GetLogicalGpuInfo` and `NvAPI_GPU_GetAdapterIdFromPhysicalGpu` with one physical GPU and the guest adapter's LUID. It is written fresh, in Rust. The Windows app's console, `crates/app-windows/src/console.rs`, is ported from its `src/backend_win/vm_display.c`: Windows' Remote Desktop control hosted through ATL, RdpBase's named-pipe connector and its context with their GUIDs and method tables, the callbacks that hand the pipe's connection to the control, the control's settings, and its waits, checks and rebuilds. The control's event numbers there were wrong, and here are those the control's type information gives a program that hosts it, by name. Its authentication level is set where the control keeps it, in its advanced settings, as appsandbox's went to the control, which has no such property. Its notice is below.
+- `crates/host-windows/guest/linux/dxgkrnl/guesthouse-compat.h` holds the two VMBus channel GUIDs of GPU-PV as Microsoft's [WSL kernel](https://github.com/microsoft/WSL2-Linux-Kernel) defines them in `include/linux/hyperv.h`, under the GPL 2. The global one is also what a WSL guest on this PC lists. The guest fetches `dxgkrnl`'s own source from that repository when it builds it, and none of it is in this repo. The build's flags, `vmalloc.h` included in every file and `_MAIN_KERNEL_` defined, follow what [dxgkrnl-dkms](https://github.com/staralt/dxgkrnl-dkms) found a stock kernel needs, under the GPL 2. None of its files are copied.
+- `vendor/windows-reactor/` is Microsoft's [windows-reactor](https://github.com/microsoft/windows-rs), and `vendor/windows-rs/` the windows-rs crates it needs, from the windows-rs repository at commit `63a5e3d`, under the MIT licence or the Apache licence 2.0, as each folder's `license-mit` and `license-apache-2.0` say. They carry patches of mine from remoteman and blurman, each listed in the folder's `VENDORED.md`. Guesthouse's Windows app and its installer (`crates/installer-windows`) use them.
+- The Windows installer (`scripts/windows-setup.ps1`) carries [remoteman](https://github.com/ruxnhq/remoteman), also RUXN LLC's, under the GNU General Public License, version 3 or later (releases before 0.1.3: MIT), at the version `windows/remoteman.json` pins, as remoteman releases it: its host's installer as `screen\remoteman-host-setup.exe`, which the service runs in each Windows guest, and its Windows viewer, its zip unpacked, in `viewer\`, with remoteman's `LICENSE` beside `remoteman.exe`. The end of the installed copy of this file names the version and the files. The host's installer carries remoteman's display driver, which, like `drivers/windows-display/`, is a fork of [zako-vdd](https://github.com/qiin2333/zako-vdd) under the MIT licence, apart from what's left of Microsoft's indirect display sample under the Microsoft Public License, and it installs both licences with the driver in the guest. None of remoteman is in this repo.
+- remoteman's viewer, in `viewer\`, comes with [FFmpeg](https://ffmpeg.org)'s libraries as DLLs beside it (`avcodec`, `avutil` and `swresample`), unchanged: an LGPL shared build, under the GNU Lesser General Public License version 3 or later. The viewer's zip carries FFmpeg's LGPL text and a notice of the build and where its source is, which the installer puts in `viewer\` with the DLLs, and the installer adds `GPL-3.0.txt` (`windows/installer/GPL-3.0.txt` here), the GPL 3 the LGPL 3 builds on, to the install folder. The DLLs can be replaced with another build of the same FFmpeg version. None of FFmpeg is in this repo.
+- The Windows installer carries [WinFsp](https://github.com/winfsp/winfsp) (WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos), at the version `windows/winfsp.json` pins, as its project releases it, its MSI installer unmodified, as `guest\winfsp.msi`, with WinFsp's licence as `guest\WinFsp-License.txt` (`windows/installer/WinFsp-License.txt` here). The service gives both to a Windows guest that has a shared folder, which installs WinFsp (only its core feature) and mounts the folder as a drive with Guesthouse's own program, `guesthouse-guest-share.exe`. WinFsp is under the GNU General Public License, version 3, and is passed on under the GPLv3's own terms. Its author's exception for free and open source software isn't relied on, as it asks that WinFsp isn't distributed with proprietary software, and the installer also carries Microsoft's Windows App Runtime. So each Windows release offers WinFsp's complete source, the archive of the tag of the version it carries, which `windows/winfsp.json` pins by its SHA-256: at https://files.ruxn.com/p/guesthouse/ beside the installer (`winfsp-2.2-source.tar.gz` for WinFsp 2.2), and in the release on GitHub. `guesthouse-guest-share.exe` loads WinFsp's DLL in the guest, and is passed on under the GPLv3, which Guesthouse's GPL-2.0-or-later allows. None of WinFsp is in this repo apart from its licence text.
+- A macOS machine runs on a part that isn't in this repo or in a release. The app fetches it when a macOS machine first needs it. It holds [reims-vgpu](https://github.com/steelbrain/reims-vgpu)'s QEMU and library and [reims-util](https://github.com/steelbrain/reims-util), each built from its author's source as it is, and the option ROM and guest drivers that reims-vgpu's repo has ready built. Those are under GPL-2.0-or-later or LGPL-3.0-or-later, and the QEMU under QEMU's own licences. `packaging/build-macos-part.sh` names the commits, and the part's release has the source of all of it. When a machine is made, reims-util fetches OpenCore, OcBinaryData and OVMF from their own projects. macOS comes from Apple, under Apple's licence.
+- An Android machine runs Guesthouse's build of LineageOS, which isn't in this repo or in a release. The app fetches it from files.ruxn.com when an Android machine is made, and `android/` here is how it's built. It holds LineageOS and the Android Open Source Project, mostly under the Apache License 2.0, with the Linux kernel under GPL-2.0 and other parts under their own licences; [microG](https://github.com/microg/GmsCore), under the Apache License 2.0; and [Digitalis](https://github.com/DigitalisX64), under the Apache License 2.0. Each image has the pinned manifest of the sources it was built from beside it on files.ruxn.com. The image holds no Google apps or services. It isn't an official LineageOS build.
 - `linux/layer/zink_on_nvidia.c` and `linux/cast/glx_dri3.c` are mine, under the MIT licence, so that their fixes can go to Mesa.
+- The Windows guest's share program, `crates/share-windows/`, loads [WinFsp](https://winfsp.dev) at run time and doesn't link it or carry it. The layouts of the structures and the callback table in `crates/share-windows/src/ffi.rs`, and its sizes and field offsets, are those of the pre-generated bindings in `winfsp_wrs_sys` 0.4.1 by Scille, under the MIT licence, whose notice is below. They in turn are WinFsp's own headers' (`winfsp/fsctl.h` and `winfsp/winfsp.h`, GPLv3 with the FLOSS exception), which are the source of the layouts. The structures are written out again here, in Rust, with their own names. The Hyper-V socket address and the Plan 9 attach arguments follow App Sandbox's `tools/agent/p9copy.c` (MIT, its notice is below).
 
 The guest's modules build against NVIDIA's headers and `nvidia-drm` from NVIDIA's own source, which you get yourself. A driver image carries the host's own driver files into a VM on your machine. None of that is in this repo.
 
@@ -385,3 +398,86 @@ consider it more useful to permit linking proprietary applications with the
 library.  If this is what you want to do, use the GNU Library General
 Public License instead of this License.
 ```
+
+## Intel's gmmlib and compute-runtime
+
+```
+MIT License
+
+Copyright (c) 2017 Intel Corporation
+Copyright (C) 2021 Intel Corporation
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## App Sandbox
+
+```
+MIT License
+
+Copyright (c) 2026 James Stringer
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## winfsp_wrs_sys
+
+```
+MIT License
+
+Copyright (c) Scille (the winfsp_wrs_sys authors, @Scille/parsec-dev and @Scille/rust-code-owners)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## Trademarks
+
+NVIDIA, GeForce and CUDA are trademarks of NVIDIA Corporation. AMD and Radeon are trademarks of Advanced Micro Devices, Inc. Intel and Arc are trademarks of Intel Corporation. Microsoft, Windows and Direct3D are trademarks of the Microsoft group of companies. Apple and macOS are trademarks of Apple Inc. Google, Android and Google Play are trademarks of Google LLC. LineageOS is a trademark of LineageOS. Ubuntu is a trademark of Canonical Ltd. Linux is the registered trademark of Linus Torvalds. Vulkan and OpenGL ES are trademarks of the Khronos Group Inc. Other names are trademarks of their owners. They're used here only to say what Guesthouse works with, and Guesthouse isn't made, endorsed or supported by NVIDIA, AMD, Intel, Microsoft, Apple, Google, the LineageOS project or Canonical.

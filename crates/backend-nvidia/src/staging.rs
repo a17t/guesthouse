@@ -25,6 +25,34 @@ pub(crate) fn pixel_bytes(surface: &SurfaceShape) -> u32 {
     if surface.colour == SURFACE_COLOUR_16_BIT_FLOAT { FLOAT_PIXEL_BYTES } else { COPY_PIXEL_BYTES }
 }
 
+/// What a surface with red first carries, as a Direct3D 11 `R8G8B8A8` swap chain's back buffer does.
+const SURFACE_COLOUR_RED_FIRST: u32 = 0x20;
+/// The same with sRGB coding, as an `R8G8B8A8_UNORM_SRGB` swap chain's is.
+const SURFACE_COLOUR_RED_FIRST_SRGB: u32 = 0x59;
+/// What the kernel's staging surface carries: the standard colour, in `X8R8G8B8` or `A8R8G8B8`, which
+/// are blue first.
+const STAGING_COLOUR: u32 = 0;
+const FORMATS_BLUE_FIRST: [u32; 2] = [21, 22];
+
+/// Whether a copy goes from a surface with red first to one with blue first. A windowed program's
+/// present is such a copy when its back buffer is red first, and bytes moved as they are would show
+/// it with red and blue changed over.
+fn orders_differ(source: &SurfaceShape, target: &SurfaceShape) -> bool {
+    matches!(source.colour, SURFACE_COLOUR_RED_FIRST | SURFACE_COLOUR_RED_FIRST_SRGB)
+        && target.colour == STAGING_COLOUR
+        && FORMATS_BLUE_FIRST.contains(&target.format)
+}
+
+/// The width in bytes of a GOB, the tiled layout's smallest block.
+const GOB_BYTES: u32 = 64;
+
+/// How wide a tiled surface is to the engine, in bytes: its pixels' bytes rounded up to whole GOBs.
+/// The pitch the guest's driver gives can be rounded further than that (a Direct3D 9 surface's is, to
+/// 128 bytes), and the engine would then look for each row of blocks one GOB too far along.
+fn tiled_width(surface: &SurfaceShape, pixel: u32) -> Option<u32> {
+    surface.width.checked_mul(pixel)?.checked_next_multiple_of(GOB_BYTES)
+}
+
 /// One side of a copy: where it starts, its pitch, and the tiling the engine has to know about. A
 /// linear side starts at the rectangle, and a tiled side starts at the surface.
 fn copy_side(
@@ -42,7 +70,7 @@ fn copy_side(
     let side = TiledSide {
         x: u32::try_from(x_bytes).ok()?,
         y: u32::try_from(y).ok()?,
-        surface_width: surface.pitch,
+        surface_width: tiled_width(surface, u32::try_from(pixel).ok()?)?,
         surface_height: surface.height,
         block,
     };
@@ -52,7 +80,9 @@ fn copy_side(
 /// The copy channel, and where it lives.
 #[derive(Debug)]
 pub struct Copier {
-    channel: CopyChannel,
+    /// The surface whose waiters the copy's releases wake, if one was made.
+    pub(crate) wakes: Option<crate::wakes::Wakes>,
+    pub(crate) channel: CopyChannel,
     space: SpaceId,
     area: u64,
     /// True while a frame's copy is under way.
@@ -60,10 +90,40 @@ pub struct Copier {
     /// One retry on a new channel, as a fault in one app can take this channel with it, and every
     /// frame on the screen goes through it.
     retried: bool,
+    /// The kinds of surface a copy has gone between, each said once in the log.
+    kinds_said: Vec<[u32; 4]>,
+}
+
+/// How many kinds of copy the log names. A guest can't make it grow past this.
+const KINDS_SAID_LIMIT: usize = 32;
+
+impl Copier {
+    /// Says a kind of copy the first time it's seen, so a log from a program with the wrong colours
+    /// names the surface it draws to.
+    fn say_kind(&mut self, copy: &StagingCopy) {
+        let kind = [copy.source.format, copy.source.colour, copy.target.format, copy.target.colour];
+        if self.kinds_said.contains(&kind) || self.kinds_said.len() >= KINDS_SAID_LIMIT {
+            return;
+        }
+        self.kinds_said.push(kind);
+        log::debug!(
+            "a copy from format {} colour {:#x} to format {} colour {:#x}, red and blue {}",
+            kind[0],
+            kind[1],
+            kind[2],
+            kind[3],
+            if orders_differ(&copy.source, &copy.target) { "changed over" } else { "as they are" },
+        );
+    }
 }
 
 impl<R: Rm> NvidiaBackend<R> {
-    fn make_copy_channel(&mut self, area: u64, space: SpaceId) -> Result<CopyChannel, RmError> {
+    fn make_copy_channel(
+        &mut self,
+        area: u64,
+        space: SpaceId,
+        host: &mut dyn HostServices,
+    ) -> Result<(CopyChannel, Option<crate::wakes::Wakes>), RmError> {
         let place = ChannelPlace {
             ring_address: area,
             ring_entries: RING_ENTRIES,
@@ -75,8 +135,38 @@ impl<R: Rm> NvidiaBackend<R> {
         };
         let generation = self.generation;
         let sizes = self.host_branch;
-        Channel::new(&mut self.device, generation, sizes, address_space, place, Engine::Copy)
-            .map(CopyChannel::new)
+        let mut channel =
+            Channel::new(&mut self.device, generation, sizes, address_space, place, Engine::Copy)
+                .map(CopyChannel::new)?;
+        // The surface's address comes from the same allocator as the channel's, beside it.
+        let mut wakes = None;
+        if std::env::var("GUESTHOUSE_WAKES").ok().as_deref() != Some("0") {
+            let fd = self.device.rm.wake_fd();
+            let parent = self.device.subdevice;
+            if let (Some(fd), Ok(at)) = (fd, host.take_gpu_addresses(4096, CHANNEL_ADDRESS_ALIGN)) {
+                match crate::wakes::Wakes::new(&mut self.device, address_space, at, parent) {
+                    Ok(mut made) => match made.bind(&mut self.device, channel.channel.handle(), true) {
+                        Ok(()) => {
+                            channel.signal = Some((made.slot_address(0), made.surface, fd));
+                            wakes = Some(made);
+                        }
+                        Err(error) => {
+                            // A surface nothing is bound to never raises the interrupt, so its
+                            // waiters would only ever time out on the backstop. Closed, and the
+                            // copies take the polling they always had.
+                            log::warn!(
+                                "the copy channel is not bound to the surface, so its copies are polled: {error}"
+                            );
+                            let _ = made.close(&mut self.device);
+                        }
+                    },
+                    Err(error) => {
+                        log::warn!("no semaphore surface for the copies, so they are polled: {error}")
+                    }
+                }
+            }
+        }
+        Ok((channel, wakes))
     }
 
     /// The copy channel, made the first time something needs it.
@@ -84,8 +174,16 @@ impl<R: Rm> NvidiaBackend<R> {
         if self.copier.is_none() {
             let size = AREA_SIZE as u64 + COPY_AREA_EXTRA;
             let area = host.take_gpu_addresses(size, CHANNEL_ADDRESS_ALIGN)?;
-            let channel = self.make_copy_channel(area, space).map_err(memory_error)?;
-            self.copier = Some(Copier { channel, space, area, running: false, retried: false });
+            let (channel, wakes) = self.make_copy_channel(area, space, host).map_err(memory_error)?;
+            self.copier = Some(Copier {
+                wakes,
+                channel,
+                space,
+                area,
+                running: false,
+                retried: false,
+                kinds_said: Vec::new(),
+            });
         }
         Ok(self.copier.as_mut().expect("made just above"))
     }
@@ -102,7 +200,15 @@ impl<R: Rm> NvidiaBackend<R> {
         let (target_left, target_top) = (i64::from(copy.target_left), i64::from(copy.target_top));
         let (target, target_pitch, target_side) =
             copy_side(copy.target_address, &copy.target, target_left, target_top, pixel)?;
-        let rows = Rows { source, target, source_pitch, target_pitch, width, count };
+        let rows = Rows {
+            source,
+            target,
+            source_pitch,
+            target_pitch,
+            width,
+            count,
+            turned: orders_differ(&copy.source, &copy.target),
+        };
         if source_side.is_none() && target_side.is_none() {
             return Some(channel.rows(&rows));
         }
@@ -148,6 +254,7 @@ impl<R: Rm> NvidiaBackend<R> {
                 return StagingStart::Finished(Status::UNSUCCESSFUL);
             }
         };
+        copier.say_kind(copy);
         let Some(words) = Self::batch_for(&mut copier.channel, copy) else {
             log::warn!("a copy's numbers don't fit its batch: {copy:?}");
             return StagingStart::Finished(Status::UNSUCCESSFUL);
@@ -161,28 +268,38 @@ impl<R: Rm> NvidiaBackend<R> {
 
     fn slot_batch_for(channel: &mut CopyChannel, copy: &SlotCopy) -> Option<Vec<u32>> {
         let width = copy.width.checked_mul(COPY_PIXEL_BYTES)?;
-        let rows = |source_pitch| Rows {
+        // A tiled side is given from the surface's corner with no pitch, as in `copy_side`.
+        let source = copy.source.tiling.map(|block| TiledSide {
+            x: 0,
+            y: 0,
+            surface_width: copy.source.pitch,
+            surface_height: copy.source.height,
+            block,
+        });
+        // Whoever shows a tiled slot lays it out from the picture's width, in whole GOBs, and not from
+        // the pitch its rows would have, which is rounded further: at 1366 wide the pitch is 1408
+        // pixels' worth and the tiles are 1376, and each row of blocks came out 32 pixels along.
+        let slot_width = width.checked_next_multiple_of(GOB_BYTES)?;
+        let target = copy.slot_tiling.map(|block| TiledSide {
+            x: 0,
+            y: 0,
+            surface_width: slot_width,
+            surface_height: copy.height,
+            block,
+        });
+        let rows = Rows {
             source: copy.source_address,
             target: copy.slot_address,
-            source_pitch,
-            target_pitch: copy.slot_pitch,
+            source_pitch: if source.is_some() { 0 } else { copy.source.pitch },
+            target_pitch: if target.is_some() { 0 } else { copy.slot_pitch },
             width,
             count: copy.height,
+            turned: false,
         };
-        match copy.source.tiling {
-            None => Some(channel.rows(&rows(copy.source.pitch))),
-            Some(block) => channel.tiled(&Tiled {
-                rows: rows(0),
-                source: Some(TiledSide {
-                    x: 0,
-                    y: 0,
-                    surface_width: copy.source.pitch,
-                    surface_height: copy.source.height,
-                    block,
-                }),
-                target: None,
-            }),
+        if source.is_none() && target.is_none() {
+            return Some(channel.rows(&rows));
         }
+        channel.tiled(&Tiled { rows, source, target })
     }
 
     pub(crate) fn start_frame_copy(&mut self, host: &mut dyn HostServices, copy: &SlotCopy) -> StagingStart {
@@ -208,22 +325,35 @@ impl<R: Rm> NvidiaBackend<R> {
     }
 
     /// Replaces a dead channel, and runs its last batch again on the new one.
-    fn retry_copy(&mut self) -> Result<(), RmError> {
+    fn retry_copy(&mut self, host: &mut dyn HostServices) -> Result<(), RmError> {
         let mut copier = self.copier.take().expect("a copy is running");
         let mut words = std::mem::take(&mut copier.channel.last_words);
+        // The surface's unbinds name the channel, so they go while it still lives. Its page stays
+        // mapped until the channel is closed, as a channel that timed out can still end its batch
+        // late with a write to the slot, and that write must not land on an unmapped address.
+        let mut old = copier.wakes.take();
+        if let Some(old) = old.as_mut() {
+            old.unbind(&mut self.device);
+        }
         if let Some(space) = self.spaces.get(&copier.space)
             && let Err(error) = copier.channel.channel.close(&mut self.device, space)
         {
             log::warn!("closing the old copy channel: {error}");
         }
-        let mut channel = self.make_copy_channel(copier.area, copier.space)?;
+        if let Some(mut old) = old
+            && let Err(error) = old.close(&mut self.device)
+        {
+            log::warn!("closing the old surface: {error}");
+        }
+        let (mut channel, wakes) = self.make_copy_channel(copier.area, copier.space, host)?;
+        copier.wakes = wakes;
         channel.renumber(&mut words);
         channel.start(&mut self.device, words);
         self.copier = Some(Copier { channel, retried: true, running: true, ..copier });
         Ok(())
     }
 
-    pub(crate) fn poll_copy(&mut self, _host: &mut dyn HostServices, now: Instant) -> Option<Status> {
+    pub(crate) fn poll_copy(&mut self, host: &mut dyn HostServices, now: Instant) -> Option<Status> {
         let copier = self.copier.as_mut()?;
         if copier.channel.is_finished() {
             copier.running = false;
@@ -239,7 +369,7 @@ impl<R: Rm> NvidiaBackend<R> {
             return Some(Status::UNSUCCESSFUL);
         }
         log::warn!("the copy channel stopped answering, so it is being replaced");
-        match self.retry_copy() {
+        match self.retry_copy(host) {
             Ok(()) => {
                 let channel = &self.copier.as_ref().expect("made just above").channel;
                 log::warn!("the copy runs again on a new channel: {}", channel.state());
@@ -252,7 +382,10 @@ impl<R: Rm> NvidiaBackend<R> {
         }
     }
 
-    /// Copies what the GPU wrote into an allocation over to its new memory.
+    /// Copies what the GPU wrote into an allocation over to its new memory. The two windows hold
+    /// `COPY_WINDOW` bytes each, so a larger allocation goes over in pieces of that size, each
+    /// mapped at an offset into both memories. Dropping the rest would hand the guest zeroes where
+    /// its data was; a game's 128 MiB buffer lost that way took its device down as it started.
     pub(crate) fn move_contents(
         &mut self,
         host: &mut dyn HostServices,
@@ -261,15 +394,34 @@ impl<R: Rm> NvidiaBackend<R> {
         to: Handle,
         size: u64,
     ) -> Result<(), BackendError> {
-        if size > COPY_WINDOW {
-            log::warn!("{size:#x} bytes is too big to keep");
-            return Ok(());
+        let mut offset = 0;
+        while offset < size {
+            let piece = (size - offset).min(COPY_WINDOW);
+            if !self.move_piece(host, own_space, from, to, offset, piece)? {
+                log::warn!("a copy of {piece:#x} bytes at {offset:#x} of {size:#x} never finished");
+                break;
+            }
+            offset += piece;
         }
+        Ok(())
+    }
+
+    /// One piece of a move, of at most `COPY_WINDOW` bytes from `offset` in both memories. Says
+    /// whether the copy finished.
+    fn move_piece(
+        &mut self,
+        host: &mut dyn HostServices,
+        own_space: SpaceId,
+        from: Handle,
+        to: Handle,
+        offset: u64,
+        size: u64,
+    ) -> Result<bool, BackendError> {
         let area = self.copier(host, own_space)?.area;
         let (window, source) = (area + AREA_SIZE as u64, area + AREA_SIZE as u64 + COPY_WINDOW);
         let length = size.next_multiple_of(SMALL_PAGE);
         let space = self.spaces.get(&own_space).ok_or_else(|| BackendError::new("no address space"))?.clone();
-        let map = Mapping { length, small_pages: true, ..Mapping::default() };
+        let map = Mapping { offset, length, small_pages: true, ..Mapping::default() };
         self.device.map(&space, &Mapping { memory: to, address: window, ..map }).map_err(memory_error)?;
         if let Err(error) = self.device.map(&space, &Mapping { memory: from, address: source, ..map }) {
             // The window is one place, so a mapping left in it would stop every later move.
@@ -279,11 +431,10 @@ impl<R: Rm> NvidiaBackend<R> {
         let copier = self.copier.as_mut().expect("made above");
         let words = copier.channel.bytes(source, window, size as u32);
         copier.channel.start(&mut self.device, words);
-        if !copier.channel.wait() {
-            log::warn!("a copy of {size:#x} bytes never finished");
-        }
+        let finished = copier.channel.wait();
         self.device.unmap(&space, from, source, length).map_err(memory_error)?;
-        self.device.unmap(&space, to, window, length).map_err(memory_error)
+        self.device.unmap(&space, to, window, length).map_err(memory_error)?;
+        Ok(finished)
     }
 }
 
@@ -328,6 +479,7 @@ mod tests {
             width: 100,
             height: 50,
             own_space: SpaceId(1),
+            slot_tiling: None,
         }
     }
 
@@ -451,6 +603,69 @@ mod tests {
         assert_eq!(words[21], 0);
     }
 
+    #[test]
+    fn a_tiled_slot_is_written_from_its_corner_at_the_slots_own_size() {
+        let copy = SlotCopy { slot_tiling: Some(4), ..slot_copy(None) };
+        let words = NvidiaBackend::<FakeRm>::slot_batch_for(&mut channel(), &copy).unwrap();
+        assert_eq!(words[7..11], [512, 0, 400, 50], "the engine works out the slot's own pitch");
+        assert_eq!(words[17..19], [448, 50], "as wide as the picture in whole GOBs, and as high");
+        let read_tiled =
+            NvidiaBackend::<FakeRm>::slot_batch_for(&mut channel(), &slot_copy(Some(4))).unwrap();
+        assert_ne!(words.last(), read_tiled.last(), "writing tiles is another launch than reading them");
+    }
+
+    #[test]
+    fn tiles_on_both_sides_are_one_batch() {
+        let copy = SlotCopy { slot_tiling: Some(4), ..slot_copy(Some(3)) };
+        let words = NvidiaBackend::<FakeRm>::slot_batch_for(&mut channel(), &copy).unwrap();
+        assert_eq!(words[7..11], [0, 0, 400, 50]);
+    }
+
+    #[test]
+    fn a_red_first_back_buffer_is_turned_on_its_way_to_the_staging_surface() {
+        let mut copy = staging_copy(200, 50, Some(4));
+        copy.source.colour = SURFACE_COLOUR_RED_FIRST;
+        copy.target = SurfaceShape { format: 21, colour: STAGING_COLOUR, ..copy.target };
+        let plain =
+            NvidiaBackend::<FakeRm>::batch_for(&mut channel(), &staging_copy(200, 50, Some(4))).unwrap();
+        let turned = NvidiaBackend::<FakeRm>::batch_for(&mut channel(), &copy).unwrap();
+        // A row is counted in pixels, the remap comes just ahead of the launch, and the launch asks for it.
+        assert_eq!((plain[9], turned[9]), (800, 200));
+        assert_eq!(turned.len(), plain.len() + 2);
+        assert_eq!(turned[turned.len() - 3], 0x0330_3012);
+        assert_eq!(*turned.last().unwrap(), *plain.last().unwrap() | 1 << 10);
+        // The tiled source's width is in pixels too.
+        assert_eq!(turned[17] * 4, plain[17]);
+    }
+
+    #[test]
+    fn surfaces_in_one_order_and_colours_not_known_are_copied_as_they_are() {
+        let staging = SurfaceShape { format: 21, colour: STAGING_COLOUR, ..slot_copy(None).source };
+        let with = |colour| SurfaceShape { colour, ..slot_copy(Some(4)).source };
+        assert!(orders_differ(&with(SURFACE_COLOUR_RED_FIRST), &staging));
+        assert!(orders_differ(&with(SURFACE_COLOUR_RED_FIRST), &SurfaceShape { format: 22, ..staging }));
+        assert!(orders_differ(&with(SURFACE_COLOUR_RED_FIRST_SRGB), &staging));
+        assert!(!orders_differ(&with(7), &staging));
+        assert!(!orders_differ(&with(SURFACE_COLOUR_10_BIT), &staging));
+        assert!(!orders_differ(&with(SURFACE_COLOUR_16_BIT_FLOAT), &staging));
+        assert!(!orders_differ(&with(SURFACE_COLOUR_RED_FIRST), &with(SURFACE_COLOUR_RED_FIRST)));
+        assert!(!orders_differ(&with(SURFACE_COLOUR_RED_FIRST), &SurfaceShape { format: 17, ..staging }));
+    }
+
+    #[test]
+    fn a_tiled_surface_is_as_wide_as_its_pixels_in_whole_gobs_whatever_its_pitch() {
+        // A Direct3D 9 back buffer 1,484 pixels wide: 93 GOBs of pixels, and a pitch of 94.
+        let mut copy = staging_copy(1484, 50, Some(4));
+        copy.source = SurfaceShape { width: 1484, pitch: 6016, ..copy.source };
+        let words = NvidiaBackend::<FakeRm>::batch_for(&mut channel(), &copy).unwrap();
+        assert_eq!(words[17], 5952);
+        // One whose pitch is its pixels in whole GOBs is given as before.
+        copy.source = SurfaceShape { width: 1001, pitch: 4032, ..copy.source };
+        copy.right = 1001;
+        let words = NvidiaBackend::<FakeRm>::batch_for(&mut channel(), &copy).unwrap();
+        assert_eq!(words[17], 4032);
+    }
+
     fn staging_copy(right: i32, bottom: i32, tiling: Option<u32>) -> StagingCopy {
         let surface = slot_copy(tiling).source;
         StagingCopy {
@@ -508,12 +723,15 @@ mod tests {
 
     const AREA: u64 = 0x800_0000;
 
-    /// Nothing but a place for the copy channel, as a move asks for no more of the host.
-    struct AreaOnly;
+    /// Places for the copy channel and whatever it needs, handed out one after another as the host
+    /// does, as a copy asks for no more of the host.
+    struct AreaOnly(u64);
 
     impl HostServices for AreaOnly {
-        fn take_gpu_addresses(&mut self, _: u64, _: u64) -> Result<u64, BackendError> {
-            Ok(AREA)
+        fn take_gpu_addresses(&mut self, size: u64, _: u64) -> Result<u64, BackendError> {
+            let at = self.0;
+            self.0 += size.max(0x100_0000);
+            Ok(at)
         }
         fn read_at_gpu_address(&self, _: SpaceId, _: u64, _: &mut [u8]) -> Option<usize> {
             None
@@ -555,8 +773,91 @@ mod tests {
         let space = backend.create_address_space(&[range]).unwrap();
         let (from, _) = backend.allocate_video_memory(0x1000, guesthouse_backend::MemoryKind::PLAIN).unwrap();
         let (to, _) = backend.allocate_video_memory(0x1000, guesthouse_backend::MemoryKind::PLAIN).unwrap();
-        let moved = backend.preserve_contents(&mut AreaOnly, space, from, to, 0x1000);
+        let moved = backend.preserve_contents(&mut AreaOnly(AREA), space, from, to, 0x1000);
         assert!(moved.is_err());
         assert_eq!(backend.device().rm.memory_at(window), None);
+    }
+
+    #[test]
+    fn a_move_over_one_window_goes_in_pieces_and_keeps_all_of_it() {
+        use guesthouse_backend::{Backend, GpuRange};
+        let mut rm = FakeRm::new();
+        rm.engine.running = true;
+        let mut backend = crate::fake_guest::fake_backend(rm);
+        let range = GpuRange { start: 0x400_0000, end: 0x1_0000_0000 };
+        let space = backend.create_address_space(&[range]).unwrap();
+        // Marathon's was 0x8000000; this one also leaves a short last piece.
+        let size = 2 * COPY_WINDOW + 0x2000;
+        let kind = guesthouse_backend::MemoryKind::PLAIN;
+        let (from, _) = backend.allocate_video_memory(size, kind).unwrap();
+        let (to, _) = backend.allocate_video_memory(size, kind).unwrap();
+        backend.preserve_contents(&mut AreaOnly(AREA), space, from, to, size).unwrap();
+        let rm = &backend.device().rm;
+        let widths: Vec<u64> = rm.engine.copies.iter().map(|copy| u64::from(copy.width)).collect();
+        assert_eq!(widths, [COPY_WINDOW, COPY_WINDOW, 0x2000]);
+        assert!(rm.engine.faults.is_empty(), "{:?}", rm.engine.faults);
+        let offsets = |memory: crate::rm::Handle| -> Vec<u64> {
+            rm.calls
+                .iter()
+                .filter_map(|call| match call {
+                    crate::rm::fake::Call::MapDma(map) if map.memory == memory => Some(map.offset),
+                    _ => None,
+                })
+                .collect()
+        };
+        let pieces = [0, COPY_WINDOW, 2 * COPY_WINDOW];
+        assert_eq!(offsets(crate::handle_of(from)), pieces);
+        assert_eq!(offsets(crate::handle_of(to)), pieces);
+        let window = AREA + AREA_SIZE as u64;
+        assert_eq!(rm.memory_at(window), None);
+        assert_eq!(rm.memory_at(window + COPY_WINDOW), None);
+    }
+
+    #[test]
+    fn a_surface_that_will_not_bind_leaves_the_copies_polled() {
+        use crate::rm::classes::{SURFACE_BIND_CHANNEL, SURFACE_REGISTER_WAITER};
+        use crate::rm::fake::Call;
+        use guesthouse_backend::Backend;
+        let mut rm = FakeRm::new();
+        rm.wake = Some(0);
+        rm.refuse_control = Some(SURFACE_BIND_CHANNEL);
+        let mut backend = crate::fake_guest::fake_backend(rm);
+        let range = guesthouse_backend::GpuRange { start: 0x400_0000, end: 0x1_0000_0000 };
+        let space = backend.create_address_space(&[range]).unwrap();
+        let copy = SlotCopy { own_space: space, ..slot_copy(None) };
+        assert!(matches!(backend.start_frame_copy(&mut AreaOnly(AREA), &copy), StagingStart::Running));
+        // No waiter is armed for a copy that is only polled, and the surface and its memory were
+        // taken back rather than left half-made.
+        let calls = &backend.device().rm.calls;
+        assert!(!calls.iter().any(|call| matches!(
+            call,
+            Call::Control { command, .. } if *command == SURFACE_REGISTER_WAITER
+        )));
+        assert!(calls.iter().any(|call| matches!(call, Call::Free { .. })));
+    }
+
+    #[test]
+    fn a_bound_surface_arms_a_waiter_for_each_batch() {
+        use crate::rm::STATUS_OK;
+        use crate::rm::classes::{SURFACE_BIND_CHANNEL, SURFACE_REGISTER_WAITER};
+        use crate::rm::fake::Call;
+        use guesthouse_backend::Backend;
+        let mut rm = FakeRm::new();
+        rm.wake = Some(0);
+        rm.answer(SURFACE_BIND_CHANNEL, |_| STATUS_OK);
+        let mut backend = crate::fake_guest::fake_backend(rm);
+        let range = guesthouse_backend::GpuRange { start: 0x400_0000, end: 0x1_0000_0000 };
+        let space = backend.create_address_space(&[range]).unwrap();
+        let copy = SlotCopy { own_space: space, ..slot_copy(None) };
+        let mut host = AreaOnly(AREA);
+        assert!(matches!(backend.start_frame_copy(&mut host, &copy), StagingStart::Running));
+        let calls = &backend.device().rm.calls;
+        assert!(calls.iter().any(|call| matches!(
+            call,
+            Call::Control { command, .. } if *command == SURFACE_REGISTER_WAITER
+        )));
+        // The session's blocking wait takes the backend's own, which sleeps on the surface.
+        backend.copier.as_ref().expect("a copy runs").channel.pretend_finished();
+        assert_eq!(backend.wait_staging_copy(&mut host), guesthouse_messages::Status::SUCCESS);
     }
 }

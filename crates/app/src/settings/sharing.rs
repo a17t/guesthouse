@@ -1,8 +1,8 @@
-//! The clipboard and the shared folder.
+//! The clipboard, dragged files and the shared folder.
 
 use super::Shared;
 use crate::common::choose_folder;
-use crate::rows::row_button;
+use crate::rows::{explain, info_button, row_button};
 use adw::prelude::*;
 use guesthouse_app_core::machine::Kind;
 use guesthouse_app_core::start_checks::share_problem;
@@ -20,6 +20,17 @@ struct Parts {
 #[derive(Clone)]
 pub struct Sharing(Rc<Parts>);
 
+/// Where the guest finds the shared folder.
+fn place(machine: &guesthouse_app_core::machine::Machine) -> &'static str {
+    if machine.kind == Kind::Windows {
+        "as a drive, from its next start, for files up to 4 GiB"
+    } else if machine.macos() {
+        "in Finder, with Go, Connect to Server and http://10.0.2.4/"
+    } else {
+        "at http://10.0.2.4/, through a WebDAV client"
+    }
+}
+
 impl Sharing {
     pub fn new(shared: &Shared, page: &adw::PreferencesPage) -> Self {
         let machine = shared.machine.borrow().clone();
@@ -31,18 +42,38 @@ impl Sharing {
             .title("Clipboard")
             .active(machine.clipboard)
             .visible(machine.kind == Kind::Windows)
-            .subtitle(
-                "Shares copied text with the guest, both ways, while its screen is open and its window has \
-                 focus. Takes effect when the screen opens.",
-            )
+            .subtitle("Copied text, both ways")
             .build();
+        explain(
+            &clipboard,
+            "Shares copied text with the guest, both ways, while its screen is open and its window has focus. \
+             Takes effect when the screen opens.",
+        );
         let saving = shared.clone();
         clipboard.connect_active_notify(move |row| {
             saving.machine.borrow_mut().clipboard = row.is_active();
             saving.save();
         });
         group.add(&clipboard);
-        let folder = adw::ActionRow::builder().title("Shared folder").subtitle_lines(2).build();
+        let files = adw::SwitchRow::builder()
+            .title("Drag Files")
+            .active(!machine.file_drop_off)
+            .visible(machine.kind == Kind::Windows)
+            .subtitle("Both ways, as copies")
+            .build();
+        explain(
+            &files,
+            "Files dropped on the guest's screen land where its pointer is, and files dragged off the edge of \
+             the screen come to this PC as a copy. Takes effect when the screen opens.",
+        );
+        let saving = shared.clone();
+        files.connect_active_notify(move |row| {
+            saving.machine.borrow_mut().file_drop_off = !row.is_active();
+            saving.save();
+        });
+        group.add(&files);
+        let folder = adw::ActionRow::builder().title("Shared Folder").subtitle_lines(2).build();
+        folder.add_suffix(&info_button(&format!("The guest sees it {}.", place(&machine))));
         let choose = row_button("Choose");
         let clear = row_button("Clear");
         folder.add_suffix(&choose);
@@ -59,17 +90,12 @@ impl Sharing {
 
     fn show_folder(&self) {
         let machine = self.0.shared.machine.borrow();
-        let place = if machine.kind == Kind::Windows {
-            "as a drive, from its next start, for files up to 4 GiB"
-        } else {
-            "at http://10.0.2.4/, through a WebDAV client"
-        };
-        let note = if self.0.off.get() { "" } else { " The VM must be off to change this." };
         let share = &machine.share;
-        let text = if share.is_empty() {
-            format!("None. The guest would see it {place}.{note}")
+        let shown = if share.is_empty() { "None" } else { share.as_str() };
+        let text = if self.0.off.get() {
+            shown.to_owned()
         } else {
-            format!("{share}. The guest sees it {place}.{note}")
+            format!("{shown}. The VM must be off to change this.")
         };
         self.0.folder.set_subtitle(&gtk::glib::markup_escape_text(&text));
         self.0.clear.set_visible(!share.is_empty());

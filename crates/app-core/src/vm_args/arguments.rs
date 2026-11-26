@@ -1,5 +1,6 @@
 //! QEMU's arguments, in the order the guest has already seen.
 
+use super::qemu_jail::{GLOBAL_SOCKET, PID_FILE, TPM_SOCKET, VGPU_SOCKET};
 use super::{Boot, DISPLAY_SOCKET, Sound, VmPlan};
 use crate::firmware::format_of;
 use crate::guest_memory::WINDOW_GIB;
@@ -25,6 +26,11 @@ const BYTES_PER_PIXEL: u64 = 4;
 /// The relative mouse beside the tablet, which capturing the mouse moves.
 pub(super) const RELATIVE_MOUSE: &str = "usb-mouse,bus=xhci.0";
 pub(super) const MONITOR_SOCKETS: [&str; 4] = ["qmp.sock", "watch.sock", "input.sock", DISPLAY_SOCKET];
+/// The disk where it was before NVMe, the first port of the SATA controller, which still has the CDs.
+const SATA_DISK: &str = "ide-hd,bus=ahci.0,drive=hd0,bootindex=1";
+/// QEMU's NVMe controller needs a serial number. Each machine has its own controller, so one for all
+/// is enough, and it never changes under a guest.
+const NVME_DISK: &str = "nvme,serial=guesthouse,drive=hd0,bootindex=1";
 
 impl VmPlan {
     /// The firmware only offers modes that fit the VGA memory, and with Windows' highestmode boot
@@ -43,7 +49,7 @@ impl VmPlan {
         }
     }
 
-    fn sound_backend(&self) -> (String, &'static str) {
+    pub(super) fn sound_backend(&self) -> (String, &'static str) {
         match &self.sound {
             None => ("none,id=silent".to_owned(), "silent"),
             Some(Sound { sink: None }) => ("pipewire,id=sound".to_owned(), "sound"),
@@ -105,15 +111,10 @@ impl VmPlan {
             &format!("hda-output,audiodev={sound_id}"),
         ]));
         arguments.extend(self.screen_arguments(width, height));
+        arguments.extend(self.monitor_arguments());
         if self.passes_unix_sockets() {
-            arguments.extend(self.monitors_on_descriptors());
-        } else {
-            for socket in MONITOR_SOCKETS {
-                arguments.extend(words(&[
-                    "-qmp",
-                    &format!("unix:{},server=on,wait=off", self.in_run_folder(socket)),
-                ]));
-            }
+            // No monitor's path names the run folder then, and the app finds QEMU by this.
+            arguments.extend(words(&["-pidfile", &self.in_run_folder(PID_FILE)]));
         }
         arguments.extend(words(&[
             "-serial",
@@ -126,7 +127,7 @@ impl VmPlan {
                 qemu_value(&self.disk)
             ),
             "-device",
-            "ide-hd,bus=ahci.0,drive=hd0,bootindex=1",
+            if self.nvme { NVME_DISK } else { SATA_DISK },
         ]));
         arguments
     }
@@ -170,7 +171,7 @@ impl VmPlan {
             "-device",
             "hv-timesync",
             "-chardev",
-            &self.client_socket("gpg", "global.sock"),
+            &self.client_socket("gpg", GLOBAL_SOCKET),
             // The app's memfds, which the daemon has too: see `guesthouse_daemon::handover`.
             "-object",
             &format!(
@@ -183,7 +184,7 @@ impl VmPlan {
                 window_base()
             ),
             "-chardev",
-            &self.client_socket("gpv", "vgpu.sock"),
+            &self.client_socket("gpv", VGPU_SOCKET),
             "-device",
             &format!("gpupv-vgpu,chardev=gpv,instanceid={VGPU_INSTANCE}"),
             // Shared, because the GPU maps some of the guest's own pages.
@@ -222,7 +223,7 @@ impl VmPlan {
                 "ide-cd,bus=ahci.2,drive=cd1",
             ]),
             Boot::Gpu => self.gpu_arguments(),
-            Boot::UbuntuInstall(_) | Boot::Ubuntu(_) => Vec::new(),
+            Boot::UbuntuInstall(_) | Boot::Ubuntu(_) | Boot::Macos(_) | Boot::Android(_) => Vec::new(),
         }
     }
 
@@ -232,7 +233,20 @@ impl VmPlan {
     }
 
     pub fn qemu_arguments(&self) -> Vec<String> {
+        let mut arguments = self.line_arguments();
+        arguments.extend(self.throwaway_arguments());
+        arguments
+    }
+
+    /// The arguments of this kind of machine's own line.
+    fn line_arguments(&self) -> Vec<String> {
         if let Some(arguments) = self.ubuntu_arguments() {
+            return arguments;
+        }
+        if let Some(arguments) = self.macos_arguments() {
+            return arguments;
+        }
+        if let Some(arguments) = self.android_arguments() {
             return arguments;
         }
         let mut arguments = self.qemu_files_arguments();
@@ -244,7 +258,7 @@ impl VmPlan {
         if self.tpm.is_some() {
             arguments.extend(words(&[
                 "-chardev",
-                &self.client_socket("tpm", "tpm.sock"),
+                &self.client_socket("tpm", TPM_SOCKET),
                 "-tpmdev",
                 "emulator,id=tpm0,chardev=tpm",
                 "-device",
@@ -278,6 +292,8 @@ impl VmPlan {
             self.jail.as_ref().map(|jail| self.jailed_environment(jail)).unwrap_or_default();
         environment.extend(self.share.iter().map(|folder| ("SHARE".to_owned(), folder.clone())));
         environment.extend(self.amd_environment());
+        environment.extend(self.macos_environment());
+        environment.extend(self.android_environment());
         environment
     }
 

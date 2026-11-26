@@ -23,8 +23,33 @@ pub fn any_iso_maker() -> bool {
     ISO_MAKERS.iter().any(|program| on_path(program))
 }
 
-/// What the answer file and its key install.
+/// What the answer file and its key install when the disc has no other edition this project runs.
 pub const WINDOWS_EDITION: &str = "Windows 11 Pro";
+
+/// The Windows 11 editions a guest runs here, best first, each with the KMS client key Microsoft
+/// publishes for it. The key only tells Setup which edition to install, so it never stops to ask;
+/// Windows stays unactivated. A disc with both installs Pro, as it always did. These are the editions
+/// an install has been run with here. Another one goes in with its key once it has been.
+pub const WINDOWS_EDITIONS: [(&str, &str); 2] = [
+    (WINDOWS_EDITION, "W269N-WFGWX-YVC9B-4J6C9-T83GX"),
+    // The IoT LTSC disc carries no Pro image at all.
+    ("Windows 11 IoT Enterprise LTSC", "KBN8V-HFGQ4-MGXVD-347P6-PDQGT"),
+];
+
+/// The key that picks `edition` in Setup, when it is one of the editions above.
+pub fn edition_key(edition: &str) -> Option<&'static str> {
+    WINDOWS_EDITIONS.iter().find(|(name, _)| same_edition(edition, name)).map(|(_, key)| *key)
+}
+
+/// Whether an image is the edition `name`, or that edition's own yearly image: LTSC media name their
+/// images "Windows 11 IoT Enterprise LTSC 2024", and Setup shows them without the year.
+fn same_edition(image: &str, name: &str) -> bool {
+    if image == name {
+        return true;
+    }
+    let Some(rest) = image.strip_prefix(name) else { return false };
+    rest.len() == 5 && rest.starts_with(' ') && rest[1..].chars().all(|digit| digit.is_ascii_digit())
+}
 const FIRST_WINDOWS_11_BUILD: u32 = 22000;
 const WIM_AMD64: &str = "9";
 const WIM_MAGIC: &[u8; 8] = b"MSWIM\0\0\0";
@@ -45,6 +70,9 @@ pub struct Iso {
     /// What it is, in a few words.
     pub title: String,
     pub edition: String,
+    /// Whether it's a Windows disc, of any edition. A plain VM made from one still gets a TPM and
+    /// Secure Boot, as Windows 11's setup refuses a PC without them.
+    pub windows_disc: bool,
 }
 
 const UBUNTU_KERNEL: &str = "casper/vmlinuz";
@@ -72,13 +100,19 @@ fn read_ubuntu(names: &HashMap<String, &str>) -> Option<Iso> {
             kind: Kind::Linux,
             title: format!("Ubuntu server, {package}"),
             edition: package.to_owned(),
+            windows_disc: false,
         },
     ))
 }
 
 impl Iso {
     fn plain(title: &str) -> Self {
-        Self { kind: Kind::Plain, title: title.to_owned(), edition: String::new() }
+        Self { kind: Kind::Plain, title: title.to_owned(), edition: String::new(), windows_disc: false }
+    }
+
+    /// A Windows disc that doesn't install by itself.
+    fn plain_windows(title: &str) -> Self {
+        Self { windows_disc: true, ..Self::plain(title) }
     }
 }
 
@@ -90,7 +124,7 @@ fn field<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
 }
 
 /// Each image's name, build and architecture, from a WIM's XML block.
-fn images_in(text: &str) -> Vec<(String, u32, String)> {
+fn images_in(text: &str) -> Vec<(String, String, u32, String)> {
     let mut images = Vec::new();
     let mut rest = text;
     while let Some(start) = rest.find("<IMAGE ") {
@@ -98,7 +132,8 @@ fn images_in(text: &str) -> Vec<(String, u32, String)> {
         let image = &rest[start..start + end];
         let build = field(image, "BUILD").and_then(|text| text.parse().ok());
         if let (Some(name), Some(build), Some(arch)) = (field(image, "NAME"), build, field(image, "ARCH")) {
-            images.push((name.to_owned(), build, arch.to_owned()));
+            let shown = field(image, "DISPLAYNAME").unwrap_or(name);
+            images.push((name.to_owned(), shown.to_owned(), build, arch.to_owned()));
         }
         rest = &rest[start + end..];
     }
@@ -134,7 +169,7 @@ fn wim_xml(stream: &mut impl Read) -> Option<String> {
     Some(utf16_text(&data))
 }
 
-fn wim_images(path: &str, entry: &str) -> Vec<(String, u32, String)> {
+fn wim_images(path: &str, entry: &str) -> Vec<(String, String, u32, String)> {
     let child = Command::new("7z")
         .args(["x", "-so", path, entry])
         .stdout(Stdio::piped())
@@ -180,8 +215,28 @@ fn list_disc(path: &str) -> Result<String> {
     Ok(text)
 }
 
+/// How far to look into a Windows disc.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Look {
+    /// As far as its editions, which means reading through the install image: some gigabytes, and
+    /// minutes on a slow drive.
+    Editions,
+    /// Only that it's Windows.
+    Names,
+}
+
 /// Says what an ISO is.
 pub fn read_iso(path: &str) -> Result<Iso> {
+    read_disc(path, Look::Editions)
+}
+
+/// Says what an ISO is on a PC where a Windows disc makes a plain VM whatever its edition. The edition
+/// would change nothing there, so the install image isn't read.
+pub fn read_iso_for_plain_windows(path: &str) -> Result<Iso> {
+    read_disc(path, Look::Names)
+}
+
+fn read_disc(path: &str, look: Look) -> Result<Iso> {
     let listing = list_disc(path)?;
     let names: HashMap<String, &str> = listing
         .lines()
@@ -192,12 +247,24 @@ pub fn read_iso(path: &str) -> Result<Iso> {
     let Some(entry) = entry else {
         return Ok(read_ubuntu(&names).unwrap_or_else(|| Iso::plain("Not Windows")));
     };
-    for (name, build, architecture) in wim_images(path, entry) {
-        if name == WINDOWS_EDITION && build >= FIRST_WINDOWS_11_BUILD && architecture == WIM_AMD64 {
-            return Ok(Iso { kind: Kind::Windows, title: format!("{name}, build {build}"), edition: name });
+    if look == Look::Names {
+        return Ok(Iso::plain_windows("Windows"));
+    }
+    let images = wim_images(path, entry);
+    // The best edition the disc has, not the first image on it: a disc that carries Home and Pro
+    // installs Pro, as it did when Pro was the only one looked for. The answer file names the image
+    // by its own name, which is what Setup's /IMAGE/NAME matches. The display name can be in the
+    // disc's language, so it is only for the title.
+    for (edition, _) in WINDOWS_EDITIONS {
+        let found = images.iter().find(|(name, _, build, architecture)| {
+            same_edition(name, edition) && *build >= FIRST_WINDOWS_11_BUILD && architecture == WIM_AMD64
+        });
+        if let Some((name, shown, build, _)) = found {
+            let title = format!("{shown}, build {build}");
+            return Ok(Iso { kind: Kind::Windows, title, edition: name.clone(), windows_disc: true });
         }
     }
-    Ok(Iso::plain("Windows, but not 64-bit Windows 11 with the Pro edition"))
+    Ok(Iso::plain_windows("Windows, but not 64-bit Windows 11 Pro or IoT Enterprise LTSC"))
 }
 
 #[cfg(test)]
@@ -264,6 +331,59 @@ mod tests {
     }
 
     #[test]
+    fn an_iot_ltsc_disc_is_windows_and_keeps_its_own_edition() {
+        let scratch = Scratch::new();
+        // The image the IoT LTSC media carries, which is the whole disc: no Pro on it at all.
+        let data = wim(&["Windows 11 IoT Enterprise LTSC"], 26100, 9);
+        let found = read_iso(&make_iso(&scratch, "iot-ltsc", &[("sources/install.wim", &data)])).unwrap();
+        assert_eq!((found.kind, found.edition.as_str()), (Kind::Windows, "Windows 11 IoT Enterprise LTSC"));
+        assert_eq!(edition_key("Windows 11 IoT Enterprise LTSC"), Some("KBN8V-HFGQ4-MGXVD-347P6-PDQGT"));
+        assert_eq!(edition_key("Windows 11 Enterprise LTSC"), None, "an edition not run here has no key");
+    }
+
+    #[test]
+    fn the_edition_is_the_images_own_name_and_the_title_its_display_name() {
+        let scratch = Scratch::new();
+        let mut data = wim(&["Windows 11 IoT Enterprise LTSC 2024"], 26100, 9);
+        let shown = "<DISPLAYNAME>Windows 11 IoT Enterprise LTSC</DISPLAYNAME>";
+        let xml = String::from_utf16_lossy(
+            &data[4096..].chunks(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect::<Vec<_>>(),
+        )
+        .replace("</NAME>", &format!("</NAME>{shown}"));
+        let xml: Vec<u8> = xml.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        data.truncate(4096);
+        data[WIM_XML_ENTRY..WIM_XML_ENTRY + 8].copy_from_slice(&(xml.len() as u64 | 1 << 56).to_le_bytes());
+        data.extend(xml);
+        let found = read_iso(&make_iso(&scratch, "year", &[("sources/install.wim", &data)])).unwrap();
+        assert_eq!(
+            found.edition, "Windows 11 IoT Enterprise LTSC 2024",
+            "Setup matches the image's own name"
+        );
+        assert_eq!(found.title, "Windows 11 IoT Enterprise LTSC, build 26100");
+        assert_eq!(edition_key(&found.edition), Some("KBN8V-HFGQ4-MGXVD-347P6-PDQGT"));
+    }
+
+    #[test]
+    fn an_enterprise_ltsc_disc_is_still_a_plain_vm() {
+        let scratch = Scratch::new();
+        let data = wim(&["Windows 11 Enterprise LTSC"], 26100, 9);
+        let found = read_iso(&make_iso(&scratch, "ltsc", &[("sources/install.wim", &data)])).unwrap();
+        assert_eq!(
+            (found.kind, found.edition.as_str()),
+            (Kind::Plain, ""),
+            "no install has been run with it here"
+        );
+    }
+
+    #[test]
+    fn a_disc_with_pro_and_an_ltsc_image_installs_pro() {
+        let scratch = Scratch::new();
+        let data = wim(&["Windows 11 IoT Enterprise LTSC", "Windows 11 Pro"], 26100, 9);
+        let found = read_iso(&make_iso(&scratch, "both", &[("sources/install.wim", &data)])).unwrap();
+        assert_eq!(found.edition, "Windows 11 Pro", "Pro is still what a multi-edition disc gives");
+    }
+
+    #[test]
     fn anything_else_is_a_plain_vm_whatever_its_name_says() {
         let scratch = Scratch::new();
         let enterprise = wim(&["Windows 11 Enterprise Evaluation"], 26300, 9);
@@ -283,6 +403,21 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn where_windows_is_a_plain_vm_its_install_image_is_not_read() {
+        let scratch = Scratch::new();
+        // Not a WIM at all, so reading it would say it isn't Windows 11 Pro.
+        let windows = make_iso(&scratch, "windows", &[("sources/install.wim", b"never read")]);
+        let found = read_iso_for_plain_windows(&windows).unwrap();
+        assert_eq!((found.kind, found.title.as_str()), (Kind::Plain, "Windows"));
+        assert!(found.windows_disc);
+        let package = "pool/main/l/linux-signed/linux-image-7.0.0-38-generic_7.0.0-38.38_amd64.deb";
+        let files: [(&str, &[u8]); 3] =
+            [("casper/vmlinuz", b"kernel"), ("casper/initrd", b"initrd"), (package, b"deb")];
+        let ubuntu = make_iso(&scratch, "server", &files);
+        assert_eq!(read_iso_for_plain_windows(&ubuntu).unwrap(), read_iso(&ubuntu).unwrap());
     }
 
     #[test]

@@ -4,27 +4,37 @@
 //! to run. The order of devices is what the guest has already seen, so it must not change.
 
 mod amd;
+mod android;
 mod arguments;
 mod drives;
 mod forwarding_jail;
+mod macos;
 mod nic;
 mod own_linux;
+mod passt_age;
 mod qemu_jail;
 mod standalone;
+mod throwaway;
 mod ubuntu;
 
 pub use amd::{AmdBoot, RENDER_SERVER};
-pub use nic::PASST_PID_FILE;
+pub use android::{AndroidBoot, AndroidCard, LOGCAT_FILE};
+pub use macos::{MacosBoot, MacosCard, UDMABUF};
+pub use nic::{PASST_PID_FILE, only_through_probe_words, passt_probe_words};
+pub use passt_age::PasstAge;
 pub use qemu_jail::{PASST_FD, PID_FILE, TAP_FD};
 pub use standalone::memory_files_in;
+pub use throwaway::{THROWAWAY_FDS, THROWAWAY_MARK, throwaway_disk};
 pub use ubuntu::{FORWARDED_INPUT_SOCKET, FRAMES_PREFIX, INSTALL_LOG, ssh_port};
 
 use crate::context::Context;
 use crate::firmware::Firmware;
 use crate::gpu_identity::{PciIdentity, shown_identity};
+use crate::jailing::LAUNCHER;
 use crate::linux::card::ForwardedCard;
-use crate::machine::{Drive, Machine};
+use crate::machine::{Drive, Kind, Machine};
 use crate::network::{Forward, Mode};
+use crate::only_through::{OnlyThrough, dns_now};
 use guesthouse_daemon::memory_files::MemoryFiles;
 use guesthouse_daemon::slot::Slot;
 use std::fs;
@@ -56,6 +66,10 @@ pub enum Boot {
     Ubuntu(UbuntuBoot),
     /// A plain machine holding a Linux the user installed, with the forwarded GPU if it can have it.
     OwnLinux { iso: String, gpu: UbuntuBoot },
+    /// A plain machine holding macOS, on reims-vgpu's QEMU.
+    Macos(MacosBoot),
+    /// A plain machine holding Android for VMs, drawing through the virtio GPU on the host's card.
+    Android(AndroidBoot),
 }
 
 /// What Ubuntu's unattended install starts from.
@@ -84,6 +98,17 @@ pub enum UbuntuBoot {
     Amd(AmdBoot),
 }
 
+/// The address the machine's first card is given: the machine's own, which an empty one leaves as QEMU's
+/// default. An Ubuntu guest installed before its netplan found the card by name has that netplan pinned
+/// to the default address, so it only gets the machine's own where its scripts will put that right: in a
+/// boot with the driver image, which brings them. Otherwise it keeps the default, and its network.
+fn card_address(context: &Context, machine: &Machine, boot: &Boot) -> String {
+    let safe = machine.kind != Kind::Linux
+        || matches!(boot, Boot::UbuntuInstall(_) | Boot::Ubuntu(UbuntuBoot::WithGpu { .. }))
+        || machine.network_by_name_marker(context).is_file();
+    if safe { machine.mac.clone() } else { String::new() }
+}
+
 /// What the first NIC is, and what the private link carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkPlan {
@@ -93,8 +118,15 @@ pub struct NetworkPlan {
     pub bridge: String,
     pub mac: String,
     pub forwards: Vec<Forward>,
-    /// The host's DNS server, which passt passes on.
+    /// The DNS server passt passes the guest's names on to: the host's, or while the guest goes out
+    /// through one interface, one that works there. For a passt too old for that, one off the PC that
+    /// the guest asks itself.
     pub resolver: Option<String>,
+    /// NAT only: the one interface all of the guest's traffic goes through. It takes passt, whatever
+    /// `passt` says, and passt must be started by the jail's launcher, which guards its connections.
+    pub only_through: Option<OnlyThrough>,
+    /// Which of the app's words this PC's passt takes.
+    pub passt_age: PasstAge,
 }
 
 /// Everything QEMU's arguments are built from.
@@ -110,10 +142,17 @@ pub struct VmPlan {
     pub firmware: Firmware,
     pub run_folder: PathBuf,
     pub agent_port: u16,
+    /// Where the app reaches the helper for dropped and dragged files, which only Windows has.
+    pub files_port: Option<u16>,
+    /// Where the app reaches the app windows helper. Only a Windows machine that has app windows
+    /// switched on has one: with it off, QEMU gets the same words it always did.
+    pub app_windows_port: Option<u16>,
     pub cores: u32,
     pub ram: String,
     pub screen: String,
     pub disk: String,
+    /// The disk is on an NVMe controller, not the SATA one.
+    pub nvme: bool,
     pub vars: String,
     /// The folder of the machine's virtual TPM.
     pub tpm: Option<PathBuf>,
@@ -124,6 +163,9 @@ pub struct VmPlan {
     /// [`crate::host_drives::OpenDrives`].
     pub drives: Vec<Drive>,
     pub share_program: PathBuf,
+    /// The jail's launcher, which also starts passt for a machine held to one interface that has no
+    /// jail around QEMU.
+    pub launcher: PathBuf,
     /// The cap on video memory, as `8G`. The daemon reads it, and QEMU has no use for it.
     pub vram: Option<String>,
     /// A relative USB mouse beside the tablet, for games.
@@ -147,6 +189,9 @@ pub struct VmPlan {
     /// The folder of the drives' names, when QEMU opens each by its path and not from a descriptor
     /// the app opened: see [`standalone`].
     pub drives_by_path: Option<PathBuf>,
+    /// For a throwaway machine's run, its own disk, which is only read. `disk` is then the overlay
+    /// the app handed QEMU open: see [`crate::throwaway`].
+    pub throwaway: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,7 +220,23 @@ impl VmPlan {
         let run_folder = context.paths.run_folder(slot);
         let drives = Self::drives_for(machine, &boot);
         let tools = context.paths.store.join("iso/tools.iso");
-        let passt = machine.network_mode == Mode::Nat && machine.passt && passt_installed();
+        let nat = machine.network_mode == Mode::Nat;
+        let only_through = if nat { OnlyThrough::read(&machine.only_through) } else { None };
+        // Held to one interface, a machine never falls back to QEMU's own NAT, which has no such
+        // thing. If passt isn't there, the start is refused: see `network_start_problems`.
+        let passt = nat && (only_through.is_some() || (machine.passt && passt_installed()));
+        // Held to one interface, passt must be the newest, or the start is refused.
+        let passt_age = match &only_through {
+            None if passt => passt_age_now().unwrap_or_default(),
+            _ => PasstAge::default(),
+        };
+        let resolver = match &only_through {
+            Some(through) => dns_now(&machine.dns, &through.interface),
+            None if passt && passt_age == PasstAge::NoDnsHost => passt_age::outside_resolver_now(),
+            None if passt => host_resolver(),
+            None => None,
+        };
+        let mac = card_address(context, machine, &boot);
         Self {
             boot,
             slot,
@@ -184,16 +245,26 @@ impl VmPlan {
             qemu_files: Some(context.paths.helper("qemu/pc-bios")).filter(|folder| folder.is_dir()),
             firmware: context.paths.firmware.clone(),
             agent_port: context.paths.agent_port(slot),
+            files_port: (machine.kind == crate::machine::Kind::Windows).then(|| slot.files_port()),
+            app_windows_port: crate::app_windows::is_on(context, machine)
+                .then(|| crate::app_windows::host_port(context, Some(slot))),
             cores: machine.cores,
             ram: format!("{}G", machine.ram_gib),
-            screen: machine.basic_screen().to_owned(),
+            // Its device takes any size, where the VGA only has the firmware's.
+            screen: if machine.macos() || machine.android() {
+                machine.screen.clone()
+            } else {
+                machine.basic_screen().to_owned()
+            },
             disk: machine.disk.clone(),
+            nvme: machine.nvme,
             vars: machine.vars.clone(),
             tpm: machine.tpm.then(|| machine.tpm_folder(context)),
             pin: None,
             share: Some(machine.share.clone()).filter(|share| !share.is_empty()),
             drives,
             share_program: context.paths.binary(SHARE_PROGRAM),
+            launcher: context.paths.binary(LAUNCHER),
             vram: (vram_gib > 0).then(|| format!("{vram_gib}G")),
             mouse: machine.has_gpu(),
             render_identity: shown_identity(context, machine),
@@ -201,9 +272,11 @@ impl VmPlan {
                 mode: machine.network_mode,
                 passt,
                 bridge: machine.bridge.clone(),
-                mac: machine.mac.clone(),
+                mac,
                 forwards: machine.forwards.clone(),
-                resolver: if passt { host_resolver() } else { None },
+                resolver,
+                only_through,
+                passt_age,
             },
             tools_disc: tools.is_file().then_some(tools),
             sound: None,
@@ -211,6 +284,7 @@ impl VmPlan {
             jail_note: String::new(),
             memory_by_path: None,
             drives_by_path: None,
+            throwaway: None,
             run_folder,
         }
     }
@@ -240,12 +314,36 @@ pub fn program_on_path(program: &str) -> Option<PathBuf> {
     std::env::split_paths(&path).map(|folder| folder.join(program)).find(|found| is_program(found))
 }
 
+/// A program's first word in a command run with a cleared environment: where the app's own `PATH`
+/// finds it. The cleared environment's `PATH` is the one the program is looked for on, and it may not
+/// have the folder the program is in. NixOS keeps programs in its store, and the app's package adds
+/// their folders to the app's `PATH` only. One that isn't found keeps its name.
+pub fn program_word(program: &str) -> String {
+    program_on_path(program).map_or_else(|| program.to_owned(), |found| found.display().to_string())
+}
+
 fn is_program(path: &Path) -> bool {
     rustix::fs::access(path, rustix::fs::Access::EXEC_OK).is_ok() && path.is_file()
 }
 
 pub fn passt_installed() -> bool {
     on_path("passt")
+}
+
+/// Which of the app's words this PC's passt takes, or `None` if it takes none or isn't there.
+pub fn passt_age_now() -> Option<PasstAge> {
+    passt_age::age_now(passt_probe_words)
+}
+
+/// Why a machine on passt can't start on this PC's passt, if it can't. passt missing isn't one: the
+/// machine then uses QEMU's own NAT.
+pub fn passt_start_problem() -> Option<String> {
+    if !passt_installed() {
+        return None;
+    }
+    let age = passt_age_now();
+    let outside = (age == Some(PasstAge::NoDnsHost)).then(passt_age::outside_resolver_now).flatten();
+    passt_age::start_problem(age, outside.as_deref())
 }
 
 fn host_resolver() -> Option<String> {

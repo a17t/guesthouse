@@ -1,11 +1,13 @@
 //! Tasks as the app sees them: the small file each one writes, what is going on with a machine, and
 //! starting one. Actions themselves are in [`crate::actions`].
 
+use crate::auto_snapshot::{RestorePoint, restore_point};
 use crate::context::{Context, SLOT_VARIABLE};
 use crate::daemon::detached;
 use crate::display::{read_state, ring_in, screen_text};
 use crate::failure::{Failure, Result};
 use crate::gpu_identity::read_state as read_identity;
+use crate::gpu_maker::GpuMaker;
 use crate::jailing;
 use crate::linux::amd::{amd_mode, fallback_reason};
 use crate::linux::{amd_says, guest_says};
@@ -13,8 +15,9 @@ use crate::log::open_for_appending;
 use crate::machine::Machine;
 use crate::process_stat::{self, Seen};
 use crate::processes::{leftovers, memory_taken, running_machine, running_slots, still_running};
+use crate::render_cards::render_card;
 use crate::settings::write_json;
-use crate::setup::cards::card_in_use_note;
+use crate::setup::cards::{card_in_use_note, nvidia_card_note};
 use crate::slots;
 use guesthouse_daemon::gpu_note::read_note;
 use guesthouse_daemon::slot::{SLOTS, Slot};
@@ -28,6 +31,9 @@ pub const TASK_PROGRAM: &str = "guesthouse-task";
 const TASK_FILE: &str = "guesthouse-task.json";
 const STILL_BUSY: &str = "Something else is still in progress.";
 const QEMU_PAUSED_WORDS: [&str; 2] = ["paused", "debug"];
+/// The tasks that set the guest's screen to the size in the machine's settings: the ones that end
+/// with Windows' desktop up, and a change to the display's settings.
+const SCREEN_TASKS: [&str; 5] = ["start", "install", "after_reboot", "install_display", "apply_display"];
 const TASK_DIED: &str = "The task stopped before it finished. The log has more.";
 /// How a machine is told it would be one too many.
 /// Why there's no slot. Slots and their shared memory are the whole PC's, so another user's or another
@@ -93,6 +99,8 @@ pub struct Status {
     pub error: String,
     /// A task for this machine is running.
     pub busy: bool,
+    /// The running task gives the guest's screen the size in the machine's settings, as a start does.
+    pub sets_screen: bool,
     /// Which VM it is, if it's running or has a task.
     pub slot: Option<u8>,
     /// The VM's QEMU, while it's running.
@@ -103,6 +111,8 @@ pub struct Status {
     pub display_problem: String,
     /// What stands in the way of the card maker's vendor ID, or when it comes.
     pub identity_note: String,
+    /// The guest refused its new agent token and still shares the old one with another machine.
+    pub token_note: String,
     /// What the running machine's jail is missing, if anything.
     pub jail_note: String,
     /// Which card a GPU machine runs on, on a PC with more than one NVIDIA card.
@@ -111,6 +121,9 @@ pub struct Status {
     pub guest_gpu: String,
     /// The running Linux guest said its desktop is on the plain screen this boot.
     pub plain_desktop: bool,
+    /// The machine is off after a start that did not succeed, and Guesthouse took a snapshot before
+    /// it. Going back to it is offered, never done by itself.
+    pub restore_point: Option<RestorePoint>,
 }
 
 pub fn task_path(context: &Context, slot: Option<Slot>) -> PathBuf {
@@ -130,6 +143,12 @@ pub fn task_alive(context: &Context, record: &TaskRecord) -> bool {
     let file = context.processes.join(record.pid.to_string()).join("cmdline");
     let words = fs::read(file).unwrap_or_default();
     words.windows(TASK_PROGRAM.len()).any(|part| part == TASK_PROGRAM.as_bytes())
+}
+
+/// Whether the task with this pid still says it is working, in any slot. A task clears its pid when it
+/// is done, and a start can go on watching a desktop after that: see [`crate::actions`].
+pub fn still_working(context: &Context, pid: u32) -> bool {
+    slots::all().any(|slot| read_task(context, Some(slot)).pid == pid)
 }
 
 /// Whether a task's process has really gone. `task_alive` can't say: `spawn` returns while the kernel
@@ -208,8 +227,13 @@ pub fn status_since(context: &Context, machine: &Machine, before: Option<(u8, Se
         found.display_problem = shown.problem(found.state == State::Running).to_owned();
         let identity = read_identity(context, machine);
         found.identity_note = identity.problem(found.state == State::Running).to_owned();
-        found.card_note = match machine.windows_amd_card() {
-            Some(pci) => amd_card_note(context, pci),
+        found.token_note = crate::token_change::refused_note(context, machine).unwrap_or_default();
+        if found.state == State::Off && !found.busy {
+            found.restore_point = restore_point(context, machine);
+        }
+        found.card_note = match machine.windows_maker() {
+            Some(maker @ (GpuMaker::Amd | GpuMaker::Intel)) => card_note(context, maker, &machine.amd_gpu),
+            Some(GpuMaker::Nvidia) => nvidia_card_note(context, &machine.amd_gpu).unwrap_or_default(),
             None => card_in_use_note(context).unwrap_or_default(),
         };
         if found.state == State::Running {
@@ -223,10 +247,10 @@ pub fn status_since(context: &Context, machine: &Machine, before: Option<(u8, Se
     found
 }
 
-/// Which AMD card a Windows machine runs on, as a machine on AMD is the rarer case.
-fn amd_card_note(context: &Context, pci: &str) -> String {
-    crate::linux::amd::amd_card(context, pci).map_or_else(
-        || format!("Runs on the AMD card at {pci}."),
+/// Which card a Windows machine runs on, as a machine on a card other than NVIDIA's is the rarer case.
+fn card_note(context: &Context, maker: GpuMaker, pci: &str) -> String {
+    render_card(context, maker, pci).map_or_else(
+        || format!("Runs on the {} card at {pci}.", maker.name()),
         |card| format!("Runs on the {} at {pci}.", card.name),
     )
 }
@@ -265,7 +289,8 @@ fn what_is_running(context: &Context, machine: &Machine, before: Option<(u8, See
         _ => state,
     };
     let (step, error) = (task.step.clone(), task.error.clone());
-    Status { state, step, error, busy: true, slot: Some(number), qemu, ..Status::default() }
+    let sets_screen = SCREEN_TASKS.contains(&task.action.as_str());
+    Status { state, step, error, busy: true, sets_screen, slot: Some(number), qemu, ..Status::default() }
 }
 
 /// Starts a task that will outlive the app, and returns at once. It runs in the machine's slot, or
@@ -337,6 +362,26 @@ mod tests {
         let monitor = format!("unix:{}/qmp.sock,server=on", context.run_folder(None).display());
         let disk = format!("file={},format=qcow2", vm.disk);
         fake_process(context, 40, &[&qemu, "-qmp", &monitor, &disk], &[], "");
+    }
+
+    #[test]
+    fn the_card_note_names_the_card_by_its_maker_and_still_says_so_when_the_card_is_gone() {
+        use crate::linux::amd::stand_in::fake_render_node;
+        let scratch = Scratch::new();
+        let mut context = scratch_context(&scratch);
+        context.drm_class = scratch.path("drm");
+        const NAMES: &str = "1001  Other\n8086  Intel Corporation\n\t64a0  Lunar Lake [Intel Arc 140V]\n";
+        context.pci_names = scratch.write("pci.ids", NAMES);
+        fake_render_node(&scratch, 128, "0000:00:02.0", "0x8086", 0x64a0);
+        assert_eq!(
+            card_note(&context, GpuMaker::Intel, "0000:00:02.0"),
+            "Runs on the Intel Arc 140V at 0000:00:02.0."
+        );
+        assert_eq!(
+            card_note(&context, GpuMaker::Amd, "0000:00:02.0"),
+            "Runs on the AMD card at 0000:00:02.0.",
+            "an Intel card is not found as an AMD one"
+        );
     }
 
     #[test]
@@ -428,6 +473,18 @@ mod tests {
     }
 
     #[test]
+    fn a_task_is_working_until_it_clears_its_pid() {
+        let scratch = Scratch::new();
+        let context = scratch_context(&scratch);
+        context.make_run_folder(Some(slots::number(2))).unwrap();
+        write_task(&context, Some(slots::number(2)), &record("sample", 79, "")).unwrap();
+        assert!(still_working(&context, 79));
+        assert!(!still_working(&context, 78));
+        write_task(&context, Some(slots::number(2)), &record("sample", 0, "")).unwrap();
+        assert!(!still_working(&context, 79), "done, whatever its process does after");
+    }
+
+    #[test]
     fn a_window_with_a_slot_named_keeps_to_it() {
         let scratch = Scratch::new();
         let mut context = scratch_context(&scratch);
@@ -515,7 +572,25 @@ mod tests {
         let found = status(&context, &machine());
         assert_eq!((found.state, found.busy, found.slot), (State::Installing, true, Some(1)));
         assert_eq!(found.step, "x");
+        assert!(found.sets_screen, "an install ends with a start");
         assert_eq!(slot_of(&context, &machine()), Some(slots::number(1)));
+    }
+
+    #[test]
+    fn a_task_says_whether_it_sets_the_screen() {
+        let scratch = Scratch::new();
+        let context = scratch_context(&scratch);
+        fake_process(&context, 78, &["/usr/libexec/guesthouse/guesthouse-task", "x", "sample"], &[], "");
+        for (action, sets) in
+            [("start", true), ("after_reboot", true), ("apply_display", true), ("resume", false)]
+        {
+            let task = TaskRecord { action: action.into(), ..record("sample", 78, "") };
+            write_task(&context, None, &task).unwrap();
+            let found = status(&context, &machine());
+            assert_eq!((found.busy, found.sets_screen), (true, sets), "{action}");
+        }
+        write_task(&context, None, &record("sample", 0, "")).unwrap();
+        assert!(!status(&context, &machine()).sets_screen, "a finished task sets nothing");
     }
 
     #[test]

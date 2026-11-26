@@ -109,15 +109,26 @@ pub(super) fn console_user_script(task: &Task) -> String {
     )
 }
 
+/// What starts a session script. A console program started on its own gets a window from the
+/// default terminal, which is Windows Terminal on Windows 11, and the script waits on that window.
+/// While the desktop draws nothing it never comes, so the script hangs. A console with no window
+/// needs nothing from the desktop.
+const SESSION_HOST: &str = "conhost.exe";
+
+/// The session host's arguments: PowerShell in a console with no window, running `file`.
+fn session_arguments(file: &str) -> String {
+    format!("--headless powershell.exe -NoProfile -ExecutionPolicy Bypass -File {file}")
+}
+
 /// The script is in the guest's folder by now.
 fn run_placed_script(task: &Task, script: SessionScript) -> Result<String> {
     let SessionScript { name, patience, answer_seconds } = script;
     let user = console_user_script(task);
     let (file, result) = (format!("{GUEST_FOLDER}\\{name}.ps1"), format!("{GUEST_FOLDER}\\cap\\{name}.txt"));
-    let arguments = format!("-NoProfile -ExecutionPolicy Bypass -File {file}");
+    let arguments = session_arguments(&file);
     let run = format!(
         "Remove-Item {result} -ea 0; {user} \
-         $a=New-ScheduledTaskAction -Execute powershell.exe -Argument \"{arguments}\"; \
+         $a=New-ScheduledTaskAction -Execute {SESSION_HOST} -Argument \"{arguments}\"; \
          $p=New-ScheduledTaskPrincipal -UserId $u -LogonType Interactive; \
          Register-ScheduledTask -TaskName gh{name} -Action $a -Principal $p -Force | Out-Null; \
          Start-ScheduledTask gh{name}; $t=0; \
@@ -181,4 +192,18 @@ pub(super) fn set_up_desktop(task: &mut Task) -> Result<()> {
     note_boot(task)?;
     set_up_display(task);
     apply_share(task)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_session_script_runs_in_a_console_with_no_window() {
+        assert_eq!(SESSION_HOST, "conhost.exe");
+        assert_eq!(
+            session_arguments(r"C:\gpupv\display.ps1"),
+            r"--headless powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\gpupv\display.ps1"
+        );
+    }
 }

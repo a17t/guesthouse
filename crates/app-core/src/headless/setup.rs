@@ -3,9 +3,12 @@
 
 use crate::context::Context;
 use crate::failure::{Failure, Result};
+use crate::linux::amd::amd_cards;
 use crate::settings::driver_folder;
-use crate::setup::cards::{chosen_card, remember_card, remember_card_at};
-use crate::setup::checks::{Check, CheckState, check_pc};
+use crate::setup::cards::{chosen_card, find_cards, remember_card, remember_card_at};
+use crate::setup::checks::{
+    AMD_NEEDS_NO_SETUP, Check, CheckState, INTEL_NEEDS_NO_SETUP, Part, check_pc, gpu_verdict,
+};
 use crate::setup::driver::{Extraction, WINDOWS_DRIVER, check_installer, driver_problem};
 use std::cell::{Cell, RefCell};
 use std::io::Write;
@@ -46,8 +49,20 @@ pub(super) fn setup_after(
             writeln!(out, "         {}", check.fix)?;
         }
     }
-    if checks.iter().any(|check| check.state == CheckState::Failed) {
+    // An AMD card that can't run Windows doesn't stop setup for the NVIDIA card beside it.
+    let stopped = checks.iter().any(|check| check.state == CheckState::Failed && check.part != Part::Amd);
+    let amd_only = find_cards(context).is_empty() && !amd_cards(context).is_empty();
+    // The checks look at Intel's cards only where there is neither maker's, so a check about one says so.
+    let intel_only = checks.iter().any(|check| check.part == Part::Intel);
+    let verdict = gpu_verdict(checks);
+    if stopped || (amd_only && !verdict.amd) || (intel_only && !verdict.intel) {
         return Err(Failure::new(CANNOT_RUN));
+    }
+    if amd_only {
+        return Ok(writeln!(out, "{AMD_NEEDS_NO_SETUP}")?);
+    }
+    if intel_only {
+        return Ok(writeln!(out, "{INTEL_NEEDS_NO_SETUP}")?);
     }
     if let Some(installer) = driver {
         copy_driver(context, installer, out)?;

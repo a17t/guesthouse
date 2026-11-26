@@ -24,6 +24,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <poll.h>
+#include <time.h>
 #include <wayland-client.h>
 #include "nvfwd_proto.h"
 
@@ -64,6 +65,7 @@ struct swapchain {
     uint8_t *readback_map;
     VkCommandBuffer wl_copy[MAX_IMAGES];
     int fifo, *frame_flag;
+    int64_t frame_asked_ms; /* when the last frame callback was asked for */
 };
 
 extern PFN_vkGetInstanceProcAddr next_gipa;

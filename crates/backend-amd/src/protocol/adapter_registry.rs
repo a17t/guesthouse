@@ -58,7 +58,8 @@ mod tests {
 
     #[test]
     fn the_chip_type_names_amd_and_the_other_query_is_left_alone() {
-        let query = VendorQuery { kind: QUERY_TYPE, size: 2080, data: &[], process_is_32_bit: false };
+        let query =
+            VendorQuery { kind: QUERY_TYPE, size: 2080, data: &[], process_is_32_bit: false, program: "" };
         let mut out = Vec::new();
         assert_eq!(answer(&query, &mut out), Some(Status::SUCCESS));
         assert_eq!(out.len(), 2080);
@@ -66,13 +67,14 @@ mod tests {
         assert_eq!(field(&out, 1), "");
         assert_eq!(field(&out, 2), "");
         assert!(field(&out, 3).contains("AMD"));
-        let other = VendorQuery { kind: 0, size: 2080, data: &[], process_is_32_bit: false };
+        let other = VendorQuery { kind: 0, size: 2080, data: &[], process_is_32_bit: false, program: "" };
         assert!(answer(&other, &mut Vec::new()).is_none());
     }
 
     #[test]
     fn a_short_ask_is_refused() {
-        let query = VendorQuery { kind: QUERY_TYPE, size: 16, data: &[], process_is_32_bit: false };
+        let query =
+            VendorQuery { kind: QUERY_TYPE, size: 16, data: &[], process_is_32_bit: false, program: "" };
         let mut out = Vec::new();
         assert_eq!(answer(&query, &mut out), Some(Status::INVALID_PARAMETER));
         assert!(out.is_empty());

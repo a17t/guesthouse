@@ -65,6 +65,18 @@ fn one_failed_queue_leaves_the_rest_of_its_process_on_the_gpu() {
 }
 
 #[test]
+fn work_that_runs_until_the_guest_ends_it_is_no_hang_and_holds_nothing_up() {
+    let mut session = running_session();
+    session.backend_mut().work_stays = true;
+    let lanes = lanes_of(&mut session, FIRST_PROCESS, MOST_FAILED_QUEUES);
+    hang(&mut session, &lanes, Instant::now());
+    assert!(lanes.iter().all(|lane| !session.queues[&lane.queue].failed));
+    assert!(session.backend().closed_queues.is_empty(), "the process stays on the GPU");
+    assert!(session.queues_idle(lanes.iter().map(|lane| lane.queue)), "nothing waits for such a queue");
+    assert_eq!(session.memory.read_u64(lanes[0].fence).unwrap(), 0, "and nobody stood in at its fence");
+}
+
+#[test]
 fn a_backend_with_a_slow_card_gets_its_own_time_before_a_queue_fails() {
     const SLOW_CARD: Duration = Duration::from_secs(60);
     let mut session = running_session();

@@ -24,6 +24,14 @@ fn running(context: &Context, machine: &Machine, pid: u32) {
     fake_process(context, pid, &[&qemu, "-qmp", &monitor, &disk], &[], "");
 }
 
+/// A slot no VM on this PC is in, for a test that watches its task as a real process in `/proc`. A
+/// slot that is named is kept to, so a real VM in another can't be taken for ours, and naming one a
+/// real VM is in would leave the start no room.
+fn slot_free_on_this_pc(context: &Context) -> guesthouse_daemon::slot::Slot {
+    crate::tasks::free_slot(context)
+        .expect("a VM runs in every slot on this PC, and this test needs one free")
+}
+
 fn said(context: &Context, command: &str) -> (String, std::result::Result<(), Problem>) {
     let mut out = Vec::new();
     let result = run(context, &words(command), &mut out);
@@ -148,6 +156,28 @@ fn status_shows_the_state_and_what_is_wrong() {
 }
 
 #[test]
+fn status_says_when_a_machine_held_to_an_interface_had_its_network_cut() {
+    let scratch = Scratch::new();
+    let context = scratch_context(&scratch);
+    let machine = make(&context, "work", "Office PC", Kind::Plain);
+    let qemu = context.paths.qemu.display().to_string();
+    let monitor = format!("unix:{}/qmp.sock,server=on", context.run_folder(None).display());
+    let disk = format!("file={},format=qcow2", machine.disk);
+    let words = [&qemu, "-qmp", &monitor, &disk, "-nic", "socket,model=e1000e,fd=11"];
+    fake_process(&context, 40, &words, &[], "");
+    let run_folder = context.run_folder(None);
+    std::fs::create_dir_all(&run_folder).unwrap();
+    std::fs::write(run_folder.join("network-cut"), "wg0 went away\n").unwrap();
+    let (out, _) = said(&context, "status work");
+    assert!(!out.contains("network is cut"), "a file an earlier machine left: {out}");
+    Machine { only_through: "wg0".into(), ..machine }.save(&context).unwrap();
+    let (out, _) = said(&context, "status work");
+    assert!(out.contains("State: Running") && out.contains("Its network is cut"), "{out}");
+    std::fs::remove_file(run_folder.join("network-cut")).unwrap();
+    assert!(!said(&context, "status work").0.contains("network is cut"));
+}
+
+#[test]
 fn every_step_is_said_even_one_that_comes_and_goes_between_two_looks() {
     let scratch = Scratch::new();
     let context = scratch_context(&scratch);
@@ -238,8 +268,7 @@ fn a_task_that_fails_ends_the_command_with_its_error() {
     let scratch = Scratch::new();
     let mut context = scratch_context(&scratch);
     context.processes = "/proc".into();
-    // A slot that is named is kept to, so a real VM on this PC in another can't be taken for ours.
-    context.slot = crate::slots::number(3);
+    context.slot = slot_free_on_this_pc(&context);
     make(&context, "work", "Office PC", Kind::Plain);
     context.make_run_folder(None).unwrap();
     let file = context.run_folder(None).join("guesthouse-task.json");
@@ -266,7 +295,7 @@ fn no_wait_returns_once_the_task_is_launched() {
     let scratch = Scratch::new();
     let mut context = scratch_context(&scratch);
     context.processes = "/proc".into();
-    context.slot = crate::slots::number(3);
+    context.slot = slot_free_on_this_pc(&context);
     make(&context, "work", "Office PC", Kind::Plain);
     scratch.program("program/guesthouse-task", "#!/bin/sh\nexit 0\n");
     let (out, result) = said(&context, "start work --no-wait");
@@ -291,6 +320,16 @@ fn the_log_command_says_where_the_log_is_and_shows_its_end() {
     assert!(lines[3].ends_with("line 5") && lines.last().unwrap().ends_with("line 44"), "{out}");
 }
 
+mod apps_page_tests;
+mod copies_tests;
+mod idle_tests;
+mod launcher_tests;
 mod making_tests;
+mod modes_tests;
+mod open_tests;
+mod recipes_tests;
 mod settings_tests;
+mod share_tests;
+mod snapshots_tests;
 mod standalone_tests;
+mod windows_tests;

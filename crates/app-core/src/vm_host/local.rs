@@ -1,21 +1,30 @@
 //! The VM and the daemon as processes on this PC.
 
+use super::android_stop::long_power_press;
+use super::macos_stop::{KEYS_SHARE, shutdown_keys};
 use super::{Stopped, VmHost};
 use crate::context::Context;
 use crate::daemon::{self, DaemonStart, detached, is_own_daemon};
 use crate::failure::{Failure, Result};
+use crate::gpu_maker::GpuMaker;
 use crate::guest_memory::GuestMemory;
 use crate::host::GIB;
 use crate::host_drives::OpenDrives;
+use crate::intel_desktop;
 use crate::jailing;
+use crate::kept_logs;
+use crate::log::write_log;
 use crate::machine::{Machine, sorted_names};
 use crate::monitor::Command as Qmp;
 use crate::processes::{memory_taken, passt_pid, qemu_pid};
+use crate::setup::swtpm_profile::{self, missing_rules};
 use crate::start_checks::SECOND_INSTANCE_REFUSAL;
+use crate::throwaway::ThrowawayRun;
 use crate::vm_args::{OUTPUT_FILE, PASST_PID_FILE, Sound, VmPlan};
 use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 use std::fs::{self, File};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 const LAST_WORDS_BYTES: usize = 300;
@@ -39,9 +48,15 @@ const SOUND_CHECK_SECONDS: &str = "3";
 /// What versions before the memfds left in shared memory, which goes once nothing holds it.
 const OLD_SHARED_FILES: [&str; 3] = ["iomem", "ram", "display"];
 /// These can only be left by an earlier run, and a stale socket would pass for a ready daemon.
-const STALE_FILES: [&str; 4] = ["vgpu.sock", "global.sock", "screen.sock", PASST_PID_FILE];
-/// The last run's logs are the only evidence of whatever made someone restart.
-const LOGS_TO_KEEP: [&str; 3] = [daemon::OUTPUT_FILE, "serial.log", "qemu.log"];
+/// The daemon writes the desktop note again at each start, but the app reads it before then.
+const STALE_FILES: [&str; 5] =
+    ["vgpu.sock", "global.sock", "screen.sock", PASST_PID_FILE, guesthouse_daemon::desktop_note::NOTE_FILE];
+/// Which machine a run folder's logs are from. Slots are shared, so the folder alone can't say, and
+/// a file older than the note is from an earlier run, maybe another machine's.
+pub const MACHINE_NOTE: &str = "run-machine";
+/// The last run's logs are the only evidence of whatever made someone restart. The note goes along,
+/// so the kept logs still say whose they are.
+const LOGS_TO_KEEP: [&str; 4] = [daemon::OUTPUT_FILE, "serial.log", "qemu.log", MACHINE_NOTE];
 const TPM_SOCKET: &str = "tpm.sock";
 /// A new VM hasn't booted yet, whatever an earlier one noted.
 const BOOTS_FILE: &str = "guesthouse-boots";
@@ -51,6 +66,21 @@ const AGENT_UP_SCRIPT: &str = "\"up\"";
 /// The VM and the daemon as processes on this PC.
 pub struct LocalHost<'a> {
     pub context: &'a Context,
+    /// A throwaway machine's run, kept for as long as this task, so a start that starts the VM
+    /// again goes on from the same overlay.
+    throwaway: Mutex<Option<ThrowawayRun>>,
+}
+
+impl<'a> LocalHost<'a> {
+    pub fn new(context: &'a Context) -> Self {
+        Self { context, throwaway: Mutex::default() }
+    }
+}
+
+/// What the app opened for QEMU, to leave open in it.
+struct Handed<'a> {
+    drives: &'a OpenDrives,
+    throwaway: Option<&'a ThrowawayRun>,
 }
 
 impl LocalHost<'_> {
@@ -96,12 +126,19 @@ impl LocalHost<'_> {
         fs::create_dir_all(state)?;
         let done = Command::new("swtpm").args(arguments).status()?;
         if !done.success() {
-            return Err(Failure::new("The virtual TPM did not start."));
+            let rules = missing_rules(self.context);
+            if rules.is_empty() {
+                return Err(Failure::new("The virtual TPM did not start."));
+            }
+            let fix = swtpm_profile::fix(self.context, &rules);
+            return Err(Failure::new(format!(
+                "The virtual TPM did not start, as AppArmor keeps swtpm from writing its files. {fix}"
+            )));
         }
         Ok(())
     }
 
-    fn spawn_qemu(&self, plan: &VmPlan, memory: Option<&GuestMemory>, drives: &OpenDrives) -> Result<Child> {
+    fn spawn_qemu(&self, plan: &VmPlan, memory: Option<&GuestMemory>, handed: &Handed) -> Result<Child> {
         self.spawn_tpm(plan)?;
         let output = File::create(self.run_file(OUTPUT_FILE))?;
         let command = plan.qemu_command();
@@ -113,19 +150,25 @@ impl LocalHost<'_> {
         if let Some(memory) = memory {
             memory.hand_to(&mut qemu);
         }
-        drives.hand_to(&mut qemu);
+        handed.drives.hand_to(&mut qemu);
+        if let Some(run) = handed.throwaway {
+            run.hand_to(&mut qemu);
+        }
         let spawned = detached(qemu.args(arguments))
             .envs(plan.qemu_environment())
             .stdin(Stdio::null())
             .stdout(output.try_clone()?)
             .stderr(output)
-            .spawn()?;
+            .spawn()
+            .map_err(|error| not_run(program, &error))?;
         Ok(spawned)
     }
 
     /// QEMU with no daemon and no shared memory. Returns once its monitor answers.
-    fn start_plain(&self, plan: &VmPlan, drives: &OpenDrives) -> Result<()> {
+    fn start_plain(&self, plan: &VmPlan, machine: &Machine, handed: &Handed) -> Result<()> {
         let _ = fs::remove_file(self.run_file(BOOTS_FILE));
+        self.keep_last_run();
+        fs::write(self.run_file(MACHINE_NOTE), &machine.id)?;
         // Whatever an earlier machine in this slot had to say about its jail isn't this one's, and
         // its passt, if one is somehow still there, goes before this one's is noted.
         jailing::write_note(&plan.run_folder, &plan.jail_note)?;
@@ -134,7 +177,7 @@ impl LocalHost<'_> {
         if !plan.qemu.exists() {
             return Err(Failure::new(NO_QEMU_HELP));
         }
-        let mut qemu = self.spawn_qemu(plan, None, drives)?;
+        let mut qemu = self.spawn_qemu(plan, None, handed)?;
         let answered = self.wait_for_monitor(&mut qemu);
         if answered.is_err() {
             self.end_qemu(&mut qemu);
@@ -176,7 +219,17 @@ impl LocalHost<'_> {
         }
     }
 
-    fn clear_run_folder(&self) -> Result<()> {
+    /// The run that was in this slot, kept before its logs are rotated or written over, in case it
+    /// ended with nobody there to keep it.
+    fn keep_last_run(&self) {
+        if let Err(error) = kept_logs::keep_run(self.context, &self.context.run_folder(None)) {
+            let _ =
+                write_log(self.context, &format!("start: the last run's logs could not be kept: {error}"));
+        }
+    }
+
+    fn clear_run_folder(&self, machine: &Machine) -> Result<()> {
+        self.keep_last_run();
         for name in STALE_FILES {
             let _ = fs::remove_file(self.run_file(name));
         }
@@ -186,6 +239,8 @@ impl LocalHost<'_> {
                 fs::rename(&log, self.run_file(&format!("{name}.1")))?;
             }
         }
+        // The note goes first, as a report takes a file as this run's only if it changed after it.
+        fs::write(self.run_file(MACHINE_NOTE), &machine.id)?;
         File::create(self.run_file("serial.log"))?;
         Ok(())
     }
@@ -241,7 +296,7 @@ impl LocalHost<'_> {
 
     /// The VM with its GPU: the daemon must be up before QEMU, and anything left of an earlier run
     /// goes first.
-    fn start_gpu(&self, plan: &VmPlan, machine: &Machine, drives: &OpenDrives) -> Result<()> {
+    fn start_gpu(&self, plan: &VmPlan, machine: &Machine, handed: &Handed) -> Result<()> {
         let sound = if machine.sound { sound_on_this_host() } else { None };
         let plan = VmPlan { sound, ..plan.clone() };
         let choice = jailing::choose(self.context, machine, &plan, &(self.context.jail_offer)(&plan))?;
@@ -254,7 +309,7 @@ impl LocalHost<'_> {
         {
             return Err(Failure::new("The VM did not start: something is still running."));
         }
-        self.clear_run_folder()?;
+        self.clear_run_folder(machine)?;
         self.remove_old_shared_files();
         // The app's own copies close when this returns, and the memory goes back once both have gone.
         let memory =
@@ -264,12 +319,15 @@ impl LocalHost<'_> {
         if !choice.daemon_jailed {
             start = start.without_jail();
         }
-        if let Some(pci) = machine.windows_amd_card() {
-            start = start.on_amd_card(pci);
+        if let Some(maker) = machine.windows_maker() {
+            start = start.on_card(maker, &machine.amd_gpu)?;
+            if maker == GpuMaker::Intel {
+                start = start.with_intel_desktop(intel_desktop::for_start(self.context, machine));
+            }
         }
         let mut daemon = start.spawn(&plan.run_folder, &memory)?;
         self.wait_for_daemon(&mut daemon)?;
-        let mut qemu = self.spawn_qemu(&plan, Some(&memory), drives)?;
+        let mut qemu = self.spawn_qemu(&plan, Some(&memory), handed)?;
         let answered = self.wait_for_agent(machine, &mut qemu, &mut daemon);
         if answered.is_err() {
             self.end_qemu(&mut qemu);
@@ -283,13 +341,26 @@ impl VmHost for LocalHost<'_> {
         self.context.make_run_folder(Some(plan.slot))?;
         // Before anything is started, so a drive that can't be had leaves nothing running.
         let drives = OpenDrives::open(self.context, &plan.drives)?;
-        if !plan.is_gpu() {
-            return self.start_plain(plan, &drives);
+        let mut kept = self.throwaway.lock().unwrap_or_else(PoisonError::into_inner);
+        // An install writes to the disk itself, whatever the machine is.
+        let throwaway = machine.throwaway && !machine.installing;
+        if throwaway && kept.as_ref().is_none_or(|run| run.machine != machine.id) {
+            *kept = Some(ThrowawayRun::prepare(self.context, machine)?);
         }
-        if self.context.second_instance() {
-            return Err(Failure::new(SECOND_INSTANCE_REFUSAL));
+        let run = kept.as_ref().filter(|_| throwaway);
+        let plan = run.map_or_else(|| Ok(plan.clone()), |run| run.applied_to(plan))?;
+        let handed = Handed { drives: &drives, throwaway: run };
+        let started = if !plan.is_gpu() {
+            self.start_plain(&plan, machine, &handed)
+        } else if self.context.second_instance() {
+            Err(Failure::new(SECOND_INSTANCE_REFUSAL))
+        } else {
+            self.start_gpu(&plan, machine, &handed)
+        };
+        if started.is_ok() && run.is_some() {
+            crate::throwaway::note_started(self.context, machine);
         }
-        self.start_gpu(plan, machine, &drives)
+        started
     }
 
     /// With no daemon there's no agent to rely on, so the power button goes first.
@@ -299,12 +370,21 @@ impl VmHost for LocalHost<'_> {
         }
         let mut how = Stopped::Cleanly;
         if qemu_pid(self.context, None).is_some() {
+            let mut left = seconds;
             if machine.has_gpu() {
                 self.context.ask_guest(machine, "Stop-Computer -Force", crate::agent::QUICK_SECONDS, None);
+            } else if machine.android() {
+                self.context.ask_monitor(None, &long_power_press());
+            } else if machine.macos() {
+                self.context.ask_monitor(None, &shutdown_keys());
+                left -= seconds / KEYS_SHARE;
+                if !self.wait_gone(seconds / KEYS_SHARE) {
+                    self.context.ask_monitor(None, &Qmp::bare("system_powerdown"));
+                }
             } else {
                 self.context.ask_monitor(None, &Qmp::bare("system_powerdown"));
             }
-            if !self.wait_gone(seconds) {
+            if !self.wait_gone(left) {
                 terminate(qemu_pid(self.context, None));
                 if !self.wait_gone(AFTER_SIGTERM_SECONDS) {
                     return Err(Failure::new(STOPPED_LATE));
@@ -349,8 +429,8 @@ fn terminate(pid: Option<u32>) {
 }
 
 /// QEMU won't start if it can't reach PipeWire, as from a session with no sound server. Only GPU
-/// machines get sound, as they always have.
-fn sound_on_this_host() -> Option<Sound> {
+/// machines get sound, as they always have, and a macOS guest counts as one.
+pub fn sound_on_this_host() -> Option<Sound> {
     let reachable = Command::new("timeout")
         .args([SOUND_CHECK_SECONDS, "pw-cli", "info", "0"])
         .stdout(Stdio::null())
@@ -368,6 +448,14 @@ pub(super) fn start_failure(said: &str) -> String {
         return NO_DBUS_DISPLAY_HELP.to_owned();
     }
     format!("The VM did not start. {said}").trim().to_owned()
+}
+
+/// What to tell the user when QEMU's first word can't be run, which the system's error leaves out.
+pub(super) fn not_run(program: &str, error: &std::io::Error) -> Failure {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return Failure(format!("The VM did not start: {program} wasn't found."));
+    }
+    Failure(format!("The VM did not start: {program} couldn't be run. {error}"))
 }
 
 pub fn last_words(context: &Context) -> String {

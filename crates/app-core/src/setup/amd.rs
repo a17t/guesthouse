@@ -17,7 +17,8 @@ const DRIVER_VERSION_FIELD: &str = "driver_version";
 pub const NO_AMD_SETUP: &str = "A Windows machine on an AMD card needs AMD's Windows driver unpacked first, and it \
                                 hasn't been.";
 
-fn amd_setup_file(context: &Context) -> PathBuf {
+/// What setup found of AMD's Windows driver.
+pub fn amd_setup_file(context: &Context) -> PathBuf {
     context.paths.setup_folder().join(AMD_SETUP_FILE)
 }
 
@@ -27,6 +28,13 @@ pub fn amd_driver_folder(context: &Context) -> Option<PathBuf> {
     let setup: Value = serde_json::from_str(&text).ok()?;
     let folder = PathBuf::from(setup.get(DRIVER_FOLDER_FIELD)?.as_str()?);
     folder.is_dir().then_some(folder)
+}
+
+/// The version of AMD's Windows driver that was unpacked, if it says.
+pub fn amd_driver_version(context: &Context) -> Option<String> {
+    let text = fs::read_to_string(amd_setup_file(context)).ok()?;
+    let setup: Value = serde_json::from_str(&text).ok()?;
+    Some(setup.get(DRIVER_VERSION_FIELD)?.as_str()?.to_owned())
 }
 
 /// Brings a driver unpacked by an older version of the app up to what the guest gets now, and says

@@ -3,28 +3,23 @@
 //! may lack files the daemon now names, on this PC and in the guest, so a start brings both up to date.
 
 use super::Task;
-use super::guest_upload::{put_big_file, quoted};
+use super::driver_store::{HOST_DRIVER_STORE, guest_names, missing_in_guest};
+use super::guest_upload::put_big_file;
 use crate::failure::Result;
+use crate::gpu_maker::GpuMaker;
 use crate::log::write_log;
 use crate::setup::amd::complete_amd_driver;
 use crate::setup::guest_driver::guest_driver;
-use std::collections::HashSet;
-use std::fs;
-use std::path::{Path, PathBuf};
 
-/// Where Windows keeps a driver the host lends it, by the folder name the daemon gives.
-const HOST_DRIVER_STORE: &str = "C:\\Windows\\System32\\HostDriverStore\\FileRepository";
 /// The user-mode driver, which every guest set up for AMD got at install.
 const USER_DRIVER: &str = "amdxc64.dll";
-const LIST_SECONDS: u64 = 20;
-const LISTED_MARK: &str = "all listed";
 const PLACING: &str = "Giving Windows AMD's driver files it lacks";
 const NOT_PLACED: &str = "Some of AMD's driver files did not reach Windows, so Vulkan or OpenGL may not work. The \
                           log says which, and the next start tries again.";
 
 /// Any problem is said and doesn't stop the task: Direct3D works without what's missing.
 pub(super) fn complete_host_driver(task: &mut Task) -> Result<()> {
-    if task.machine.windows_amd_card().is_none() {
+    if task.machine.windows_maker() != Some(GpuMaker::Amd) {
         return Ok(());
     }
     if let Some(problem) = complete_amd_driver(task.context) {
@@ -32,34 +27,6 @@ pub(super) fn complete_host_driver(task: &mut Task) -> Result<()> {
         task.error = problem;
     }
     Ok(())
-}
-
-/// The names of the files in the guest's copy of the driver, in lower case as Windows ignores case,
-/// or `None` if the guest didn't say.
-fn guest_names(task: &Task, store: &str) -> Option<HashSet<String>> {
-    let script = format!(
-        "Get-ChildItem -LiteralPath {} -File -ea 0 | ForEach-Object Name; '{LISTED_MARK}'",
-        quoted(store)
-    );
-    let said = task.ask_guest(&script, LIST_SECONDS);
-    let lines: Vec<&str> = said.lines().map(str::trim).filter(|line| !line.is_empty()).collect();
-    let (last, names) = lines.split_last()?;
-    (*last == LISTED_MARK).then(|| names.iter().map(|name| name.to_lowercase()).collect())
-}
-
-/// The files of the driver's folder on this PC that the guest's copy lacks.
-fn missing_in_guest(folder: &Path, in_guest: &HashSet<String>) -> Result<Vec<PathBuf>> {
-    let mut missing: Vec<PathBuf> = fs::read_dir(folder)?
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.is_file())
-        .filter(|path| {
-            let name = path.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
-            !in_guest.contains(&name)
-        })
-        .collect();
-    missing.sort();
-    Ok(missing)
 }
 
 /// Brings the driver's folder on this PC up to date, then copies into the guest what its copy lacks.
@@ -102,6 +69,7 @@ pub(super) fn bring_amd_driver_up_to_date(task: &mut Task) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actions::driver_store::LISTED_MARK;
     use crate::actions::guest_upload::stand_in::FilesGuest;
     use crate::actions::tests::plain_task_context;
     use crate::context::Context;
@@ -112,6 +80,7 @@ mod tests {
     use crate::testing::{Scratch, scratch_context};
     use crate::vm_host::stand_in::RecordingHost;
     use std::fs;
+    use std::path::Path;
     use std::sync::Arc;
 
     const STORE: &str = "C:\\Windows\\System32\\HostDriverStore\\FileRepository\\amdxc.inf_amd64_gpupv";

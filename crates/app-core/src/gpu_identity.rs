@@ -1,13 +1,14 @@
 //! Which PCI identity the virtual render device shows Windows. Windows' own virtual render driver
 //! only binds to Microsoft's, so every machine starts with that one. Browsers and streaming programs
 //! look at the vendor number before they use a GPU, and stay on the CPU when it's Microsoft's. So once
-//! a guest holds a driver package for its card maker's number, NVIDIA's or AMD's, written there from
+//! a guest holds a driver package for its card maker's number, NVIDIA's, AMD's or Intel's, written there from
 //! its own copy of Windows' driver, every VM after that shows that number. The choice is kept in the
 //! machine's folder, as it has to outlive a VM: a guest shown a number without its package would
 //! start with no GPU.
 
 use crate::context::Context;
 use crate::failure::Result;
+use crate::gpu_maker::GpuMaker;
 use crate::machine::Machine;
 use crate::settings::write_json;
 use serde::{Deserialize, Serialize};
@@ -31,15 +32,33 @@ pub const NVIDIA_RENDER: PciIdentity = PciIdentity { vendor: 0x10DE, device: 0x2
 /// AMD's vendor number with a device number AMD has never shipped, far from every range it uses.
 pub const AMD_RENDER: PciIdentity = PciIdentity { vendor: 0x1002, device: 0x7FFE };
 
+/// Intel's vendor number with a device number Intel has never shipped, in a block it has never used.
+pub const INTEL_RENDER: PciIdentity = PciIdentity { vendor: 0x8086, device: 0xCFFE };
+
+/// The number a guest on a card of this maker shows once it holds the package.
+pub fn identity_of(maker: GpuMaker) -> PciIdentity {
+    match maker {
+        GpuMaker::Nvidia => NVIDIA_RENDER,
+        GpuMaker::Amd => AMD_RENDER,
+        GpuMaker::Intel => INTEL_RENDER,
+    }
+}
+
+/// The maker of the machine's card. Only a Windows machine has one that matters here, and any other
+/// has always been counted as NVIDIA's.
+pub(crate) fn machine_maker(machine: &Machine) -> GpuMaker {
+    machine.windows_maker().unwrap_or(GpuMaker::Nvidia)
+}
+
 /// The number a machine shows once its guest holds the package: its card maker's. A Windows machine
 /// stays with one maker, so this never changes under a guest.
 pub fn maker_identity(machine: &Machine) -> PciIdentity {
-    if machine.windows_amd_card().is_some() { AMD_RENDER } else { NVIDIA_RENDER }
+    identity_of(machine_maker(machine))
 }
 
 /// The card maker's name, for what the user hears.
 pub fn maker_name(machine: &Machine) -> &'static str {
-    if machine.windows_amd_card().is_some() { "AMD" } else { "NVIDIA" }
+    machine_maker(machine).name()
 }
 
 impl PciIdentity {
@@ -129,8 +148,43 @@ impl IdentityState {
     }
 }
 
-fn state_file(context: &Context, machine: &Machine) -> PathBuf {
+/// Where this machine's choice of identity is kept.
+pub fn state_file(context: &Context, machine: &Machine) -> PathBuf {
     machine.folder(context).join(STATE_FILE)
+}
+
+/// What a machine moved to Microsoft's number after a failed GPU check is told, and keeps as its
+/// reason.
+pub const FELL_BACK: &str = "The next start shows Windows Microsoft's vendor ID again.";
+/// What an Intel machine is told instead.
+pub const STAYS_ON_INTEL: &str = "Windows keeps Intel's vendor ID, as Intel's Direct3D 12 driver doesn't open on \
+                                  Microsoft's, and nothing would put Intel's back.";
+
+/// Whether a failed GPU check moves a machine on this maker's card to Microsoft's number for its next
+/// start. On NVIDIA and AMD, the maker's number is the first suspect and Microsoft's always works.
+/// Intel's Direct3D 12 driver doesn't open on Microsoft's number at all, and while Intel is experimental a
+/// failed check is what the stage is, not the number, so an Intel machine keeps its maker's.
+pub fn falls_back_after_failed_check(maker: GpuMaker) -> bool {
+    match maker {
+        GpuMaker::Nvidia | GpuMaker::Amd => true,
+        GpuMaker::Intel => false,
+    }
+}
+
+/// An earlier build did move Intel machines to Microsoft's number after a failed check, with Intel's
+/// package already in Windows. Such a machine goes back to Intel's number at its next start, as if
+/// it had never moved: Windows has the device under Intel's number from before.
+fn undo_old_fall_back(state: &mut IdentityState, machine: &Machine) {
+    let moved_back = state.shown == Shown::Microsoft && state.reason == FELL_BACK;
+    let maker = machine_maker(machine);
+    if moved_back
+        && !falls_back_after_failed_check(maker)
+        && state.package_vendor == identity_of(maker).vendor
+    {
+        state.shown = Shown::Maker;
+        state.failed_script.clear();
+        state.reason.clear();
+    }
 }
 
 /// A file that's missing or bad says Microsoft's number, which always works. So does a package for
@@ -138,6 +192,7 @@ fn state_file(context: &Context, machine: &Machine) -> PathBuf {
 pub fn read_state(context: &Context, machine: &Machine) -> IdentityState {
     let text = fs::read_to_string(state_file(context, machine)).unwrap_or_default();
     let mut state: IdentityState = serde_json::from_str(&text).unwrap_or_default();
+    undo_old_fall_back(&mut state, machine);
     if state.shown == Shown::Maker && state.package_vendor != maker_identity(machine).vendor {
         state.shown = Shown::Microsoft;
         state.restart_due = false;
@@ -168,6 +223,27 @@ mod tests {
     fn the_patterns_are_how_windows_writes_a_hardware_id() {
         assert_eq!(MICROSOFT_RENDER.windows_pattern(), r"PCI\VEN_1414&DEV_008E*");
         assert_eq!(NVIDIA_RENDER.windows_pattern(), r"PCI\VEN_10DE&DEV_2BFE*");
+        assert_eq!(INTEL_RENDER.windows_pattern(), r"PCI\VEN_8086&DEV_CFFE*");
+    }
+
+    #[test]
+    fn each_makers_identity_has_its_vendor_number_and_no_two_are_alike() {
+        for maker in GpuMaker::ALL {
+            assert_eq!(identity_of(maker).vendor, maker.vendor(), "{maker:?}");
+            assert_ne!(identity_of(maker), MICROSOFT_RENDER);
+        }
+        assert_ne!(identity_of(GpuMaker::Amd).device, identity_of(GpuMaker::Intel).device);
+    }
+
+    #[test]
+    fn an_intel_machine_shows_intels_number_and_says_intel() {
+        let mut machine = Machine::new("x", "x", "", "");
+        machine.use_windows_card(GpuMaker::Intel, "0000:00:02.0");
+        assert_eq!((maker_identity(&machine), maker_name(&machine)), (INTEL_RENDER, "Intel"));
+        assert_eq!(INTEL_RENDER.qemu_properties(), ",vendor-id=0x8086,device-id=0xcffe");
+        let mut amd = machine;
+        amd.use_windows_card(GpuMaker::Amd, "0000:7c:00.0");
+        assert_eq!((maker_identity(&amd), maker_name(&amd)), (AMD_RENDER, "AMD"));
     }
 
     #[test]
@@ -196,5 +272,54 @@ mod tests {
         let state = IdentityState { reason: "why".into(), ..state };
         assert_eq!(state.problem(true), "why");
         assert_eq!(state.problem(false), "why");
+    }
+
+    /// The tester's machine as 0.6.2-intel.2 left it after a failed check.
+    fn moved_by_an_earlier_build(context: &Context, machine: &Machine) {
+        let state = IdentityState {
+            shown: Shown::Microsoft,
+            failed_script: "0dc59626496a5133".into(),
+            reason: FELL_BACK.into(),
+            package_vendor: INTEL_RENDER.vendor,
+            ..IdentityState::default()
+        };
+        write_state(context, machine, &state).unwrap();
+    }
+
+    #[test]
+    fn an_intel_machine_an_earlier_build_moved_to_microsofts_number_goes_back_to_intels() {
+        let scratch = Scratch::new();
+        let context = scratch_context(&scratch);
+        let mut machine = Machine::new("arc", "Arc", "/d", "/v");
+        machine.use_windows_card(GpuMaker::Intel, "0000:03:00.0");
+        fs::create_dir_all(machine.folder(&context)).unwrap();
+        moved_by_an_earlier_build(&context, &machine);
+        let state = read_state(&context, &machine);
+        assert_eq!(
+            (state.shown, state.failed_script.as_str(), state.reason.as_str()),
+            (Shown::Maker, "", "")
+        );
+        assert_eq!(shown_identity(&context, &machine), INTEL_RENDER);
+    }
+
+    #[test]
+    fn an_nvidia_or_amd_machine_that_fell_back_stays_on_microsofts_number() {
+        let scratch = Scratch::new();
+        let context = scratch_context(&scratch);
+        let mut amd = Machine::new("radeon", "Radeon", "/d", "/v");
+        amd.use_windows_card(GpuMaker::Amd, "0000:7c:00.0");
+        fs::create_dir_all(amd.folder(&context)).unwrap();
+        let state = IdentityState {
+            shown: Shown::Microsoft,
+            reason: FELL_BACK.into(),
+            package_vendor: AMD_RENDER.vendor,
+            ..IdentityState::default()
+        };
+        write_state(&context, &amd, &state).unwrap();
+        assert_eq!(read_state(&context, &amd).shown, Shown::Microsoft);
+        assert!(
+            falls_back_after_failed_check(GpuMaker::Nvidia)
+                && !falls_back_after_failed_check(GpuMaker::Intel)
+        );
     }
 }

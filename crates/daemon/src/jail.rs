@@ -8,7 +8,7 @@
 //! the filter leaves no way to make a socket, and it covers every thread.
 
 use guesthouse_jail::seccomp::{self, Threads, trap};
-use guesthouse_jail::{Grant, Plan, Support, filters, landlock, only_thread};
+use guesthouse_jail::{Grant, Plan, Support, filters, landlock, only_thread, system};
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
@@ -28,13 +28,12 @@ const NVIDIA_PREFIX: &str = "nvidia";
 const NVIDIA_LEFT_OUT: [&str; 3] = ["nvidia-modeset", "nvidia-caps", "nvidia-nvswitchctl"];
 const OWNER_ONLY: u32 = 0o600;
 
-/// The system's libraries, which the management library is loaded from when this daemon's turn to
-/// read the card comes, and `nvidia-smi`, which reads the card's rated clocks at the start. `/proc`
-/// and `/sys` are read for the driver's version and the card's place, and reading `/proc` gives
-/// nothing away, as Landlock doesn't let a jailed process look into another. A program it runs gets
-/// `/dev/null` for its input.
-const SYSTEM: [(Grant, &str); 5] = [
-    (Grant::Run, "/usr"),
+/// Besides the system's programs and libraries, which the management library is loaded from when
+/// this daemon's turn to read the card comes, and which hold `nvidia-smi`, which reads the card's
+/// rated clocks at the start. `/proc` and `/sys` are read for the driver's version and the card's
+/// place, and reading `/proc` gives nothing away, as Landlock doesn't let a jailed process look into
+/// another. A program it runs gets `/dev/null` for its input.
+const SYSTEM: [(Grant, &str); 4] = [
     (Grant::Read, "/etc/ld.so.cache"),
     (Grant::Read, "/sys"),
     (Grant::Read, "/proc"),
@@ -51,11 +50,14 @@ pub struct Needs {
     pub devices: Vec<PathBuf>,
     /// The guest's driver, from setup.
     pub driver_folder: Option<PathBuf>,
+    /// Files it only reads, as a recorded card a lab run stands in for a card with.
+    pub read_files: Vec<PathBuf>,
 }
 
 impl Needs {
     pub fn plan(&self) -> Plan {
         let mut plan = Plan::default();
+        system::grant_programs(&mut plan);
         for (grant, path) in SYSTEM {
             plan.grant(grant, path);
         }
@@ -67,6 +69,9 @@ impl Needs {
         }
         if let Some(folder) = &self.driver_folder {
             plan.grant(Grant::Read, folder);
+        }
+        for file in &self.read_files {
+            plan.grant(Grant::Read, file);
         }
         plan.grant(Grant::Own, &self.run_folder);
         plan
@@ -92,35 +97,67 @@ pub fn gpu_devices(devices: &Path, render_nodes: &Path) -> Vec<PathBuf> {
     found
 }
 
-#[cfg(feature = "amd")]
+#[cfg(any(feature = "amd", feature = "intel"))]
 impl Needs {
-    /// What the AMD daemon of this slot needs. Only the one render node is granted, so the other
-    /// cards' device files are not reachable from this process.
-    pub fn of_amd_card(
+    /// What the daemon of this slot needs for a card it reaches through one render node, as AMD's
+    /// and Intel's are. Only that node is granted, so the other cards' device files are not
+    /// reachable from this process. `memory_device` is the device that makes a dma-buf of the
+    /// guest's memory, on a PC that has it and for a backend that uses it: a rule can't name a file
+    /// that isn't there, and the backend does without it.
+    pub fn of_render_node(
         slot: crate::slot::Slot,
         project: &Path,
         driver_folder: &Path,
         render_node: PathBuf,
+        memory_device: Option<PathBuf>,
     ) -> Self {
         Self {
             run_folder: slot.run_folder(project),
             shared_files: Vec::new(),
-            devices: vec![render_node],
+            devices: std::iter::once(render_node).chain(memory_device).collect(),
             driver_folder: Some(driver_folder.to_owned()),
+            read_files: Vec::new(),
+        }
+    }
+
+    /// What the daemon of this slot needs when a recording stands in for its card: that file, to
+    /// read, and no device at all, so a lab run can't reach any card on the PC.
+    pub fn of_recorded_card(
+        slot: crate::slot::Slot,
+        project: &Path,
+        driver_folder: &Path,
+        recording: PathBuf,
+    ) -> Self {
+        Self {
+            run_folder: slot.run_folder(project),
+            shared_files: Vec::new(),
+            devices: Vec::new(),
+            driver_folder: Some(driver_folder.to_owned()),
+            read_files: vec![recording],
         }
     }
 }
 
 #[cfg(feature = "nvidia")]
 impl Needs {
-    /// What the real daemon of this slot needs.
-    pub fn of_card(slot: crate::slot::Slot, project: &Path, driver_folder: &Path) -> Self {
-        let snapshot = guesthouse_sensors::snapshot_path();
+    /// What the real daemon of this slot needs, for the NVIDIA card at `card`. Its readings go in
+    /// that card's files: the snapshot, and the table of each process's part of the card, both
+    /// owner-only files in shared memory that only the daemon holding the card's lock writes.
+    pub fn of_card(
+        slot: crate::slot::Slot,
+        project: &Path,
+        driver_folder: &Path,
+        card: Option<&guesthouse_backend::PciAddress>,
+    ) -> Self {
+        let card = card.map(ToString::to_string);
+        let snapshot = guesthouse_sensors::snapshot_path_for(card.as_deref());
+        let processes = guesthouse_sensors::card_processes::table_path_for(card.as_deref());
         Self {
             run_folder: slot.run_folder(project),
-            shared_files: vec![snapshot],
+            shared_files: vec![snapshot, processes],
             devices: host_gpu_devices(),
             driver_folder: Some(driver_folder.to_owned()),
+            read_files: Vec::new(),
         }
     }
 }
@@ -225,6 +262,60 @@ mod tests {
         fs::remove_dir_all(folder).unwrap();
     }
 
+    #[cfg(feature = "amd")]
+    #[test]
+    fn an_amd_daemon_reaches_its_render_node_and_the_memory_device_where_there_is_one() {
+        let devices_of = |memory_device: Option<&str>| {
+            let slot = crate::slot::Slot::parse(Some("2")).unwrap();
+            let node = PathBuf::from("/dev/dri/renderD129");
+            let needs = Needs::of_render_node(
+                slot,
+                Path::new("/project"),
+                Path::new("/store/driver"),
+                node,
+                memory_device.map(PathBuf::from),
+            );
+            let granted = needs.plan().paths.into_iter().filter(|(grant, _)| *grant == Grant::Device);
+            granted.map(|(_, path)| path.display().to_string()).collect::<Vec<_>>()
+        };
+        assert_eq!(devices_of(Some("/dev/udmabuf")), ["/dev/dri/renderD129", "/dev/udmabuf"]);
+        assert_eq!(devices_of(None), ["/dev/dri/renderD129"]);
+    }
+
+    #[cfg(any(feature = "amd", feature = "intel"))]
+    #[test]
+    fn a_recorded_card_is_read_and_no_device_is_reachable() {
+        let needs = Needs::of_recorded_card(
+            crate::slot::Slot::parse(Some("2")).unwrap(),
+            Path::new("/run/user/1000/guesthouse"),
+            Path::new("/store/intel"),
+            "/lab/arc-b580.card".into(),
+        );
+        let plan = needs.plan();
+        assert!(needs.devices.is_empty());
+        assert!(!plan.paths.iter().any(|(grant, _)| *grant == Grant::Device));
+        assert!(plan.paths.contains(&(Grant::Read, "/lab/arc-b580.card".into())));
+    }
+
+    #[cfg(feature = "nvidia")]
+    #[test]
+    fn an_nvidia_daemon_writes_its_cards_two_shared_files_and_no_other() {
+        let card = guesthouse_backend::PciAddress::parse("0000:01:00.0").unwrap();
+        let slot = crate::slot::Slot::parse(Some("1")).unwrap();
+        let needs = Needs::of_card(slot, Path::new("/project"), Path::new("/store/driver"), Some(&card));
+        let shared = needs.plan().paths.into_iter().filter(|(_, path)| path.starts_with("/dev/shm"));
+        let shared: Vec<_> = shared.map(|(grant, path)| (grant, path.display().to_string())).collect();
+        let user = guesthouse_sensors::snapshot_path().display().to_string();
+        let user = user.rsplit('-').nth(1).unwrap().to_owned();
+        assert_eq!(
+            shared,
+            [
+                (Grant::Write, format!("/dev/shm/gpupv-sensors-{user}-2-0000:01:00.0")),
+                (Grant::Write, format!("/dev/shm/gpupv-processes-{user}-1-0000:01:00.0")),
+            ]
+        );
+    }
+
     #[test]
     fn its_own_folder_is_the_only_one_it_can_change() {
         let needs = Needs {
@@ -232,6 +323,7 @@ mod tests {
             shared_files: vec!["/dev/shm/gpupv-sensors-1000-2".into()],
             devices: vec!["/dev/nvidiactl".into()],
             driver_folder: Some("/store/driver".into()),
+            read_files: Vec::new(),
         };
         let plan = needs.plan();
         let owned: Vec<_> = plan.paths.iter().filter(|(grant, _)| *grant == Grant::Own).collect();

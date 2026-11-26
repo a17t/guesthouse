@@ -4,8 +4,8 @@
 # It works from ~/.local/lib/guesthouse/manifest, so any copy of this file does the same job, and it
 # needs no network. A file goes only if it's still the one that was installed: it's left alone if its
 # hash has changed, a folder goes only once it's empty, and anything outside your own folders is refused
-# whatever the manifest says. The one exception is QEMU's bridge helper, which root put in the folder
-# named below, and root takes away. Your machines and their disks stay, unless you pass
+# whatever the manifest says. The exceptions are QEMU's bridge helper, which root put in the folder
+# named below, and the rule root added to swtpm's AppArmor profile, which root takes away. Your machines and their disks stay, unless you pass
 # --delete-machines and then type the folder's name.
 set -eu
 
@@ -14,6 +14,11 @@ TAB=$(printf '\t')
 # The same as install.sh's. This path is never read from the manifest, which you can write.
 BRIDGE_HELPER_FOLDER=/usr/local/libexec/guesthouse
 BRIDGE_HELPER=$BRIDGE_HELPER_FOLDER/qemu-bridge-helper
+SWTPM_PROFILE=/etc/apparmor.d/usr.bin.swtpm
+SWTPM_LOCAL=/etc/apparmor.d/local/usr.bin.swtpm
+SWTPM_RULE='owner /run/user/[0-9]*/guesthouse/** rwk,'
+SWTPM_SOCKET_RULE='unix (send, receive) type=stream addr=none,'
+SWTPM_COMMENT='# Guesthouse: the virtual TPM keeps its log and socket in the run folder.'
 
 DRY_RUN=no
 DELETE_MACHINES=no
@@ -94,6 +99,7 @@ find_store() {
     store=${GUESTHOUSE_STORE:-}
     if [ -z "$store" ] && [ -f "$CONFIG/store" ]; then
         store=$(sed -n '1s/^[[:space:]]*//; 1s/[[:space:]]*$//; 1p' "$CONFIG/store")
+        # shellcheck disable=SC2088 # a literal ~/ in the file, which is expanded by hand on the next line
         case $store in
             "~/"*) store=$HOME/${store#"~/"} ;;
         esac
@@ -255,6 +261,10 @@ print_plan() {
         say "The install put QEMU's bridge helper in $BRIDGE_HELPER_FOLDER. This removes it, as root:"
         say "  sudo sh -c '$(helper_command)'"
     fi
+    if swtpm_rule_is_ours; then
+        say "The install added a rule to swtpm's AppArmor profile in $SWTPM_LOCAL. This takes it out, as root:"
+        say "  sudo sh -c '$(swtpm_rule_command)'"
+    fi
 }
 
 # Only while it's still the copy the install put there. Another install of Guesthouse on this PC may
@@ -267,6 +277,20 @@ helper_is_ours() {
 
 helper_command() {
     printf 'rm -f -- "%s" && { rmdir -- "%s" 2>/dev/null || true; }' "$BRIDGE_HELPER" "$BRIDGE_HELPER_FOLDER"
+}
+
+# Another install of Guesthouse on this PC may still need the rule, as it's the same for every user. It
+# goes all the same, as it's only there for Guesthouse, and install.sh puts it back.
+swtpm_rule_is_ours() {
+    awk -F "$TAB" '$1 == "apparmor-rule" { found = 1 } END { exit !found }' "$MANIFEST" &&
+        grep -qxF -e "$SWTPM_RULE" -e "$SWTPM_SOCKET_RULE" "$SWTPM_LOCAL" 2>/dev/null
+}
+
+# The file is written over, not replaced, so it keeps its owner and mode.
+swtpm_rule_command() {
+    printf '{ { grep -vxF -e "%s" -e "%s" -e "%s" "%s" >"%s.new" || true; } && cat "%s.new" >"%s" && rm -f "%s.new" && { [ ! -f "%s" ] || apparmor_parser -r "%s"; }; }' \
+        "$SWTPM_RULE" "$SWTPM_SOCKET_RULE" "$SWTPM_COMMENT" "$SWTPM_LOCAL" "$SWTPM_LOCAL" "$SWTPM_LOCAL" "$SWTPM_LOCAL" "$SWTPM_LOCAL" \
+        "$SWTPM_PROFILE" "$SWTPM_PROFILE"
 }
 
 group_was_added() {
@@ -321,15 +345,28 @@ refresh_icons() {
     theme=$DATA_HOME/icons/hicolor
     awk -F "$TAB" -v prefix="$theme/" '$1 == "file" && index($3, prefix) == 1 { found = 1 }
         END { exit !found }' "$MANIFEST" || return 0
-    [ -d "$theme" ] || return 0
-    touch "$theme" 2>/dev/null || true
-    [ -f "$theme/icon-theme.cache" ] || return 0
+    # The last icons going can take the folder with them, and Plasma still has to hear of it.
+    if [ -d "$theme" ]; then
+        touch "$theme" 2>/dev/null || true
+        update_icon_cache "$theme"
+    fi
+    tell_kde_about_icons
+}
+
+update_icon_cache() {
+    [ -f "$1/icon-theme.cache" ] || return 0
     for tool in gtk-update-icon-cache gtk4-update-icon-cache; do
         if command -v "$tool" >/dev/null 2>&1; then
-            "$tool" -q -t -f "$theme" >/dev/null 2>&1 || true
+            "$tool" -q -t -f "$1" >/dev/null 2>&1 || true
             return 0
         fi
     done
+}
+
+# As install.sh: Plasma keeps the icons it looked up until it's told they changed.
+tell_kde_about_icons() {
+    [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] && command -v dbus-send >/dev/null 2>&1 || return 0
+    dbus-send --session --type=signal /KIconLoader org.kde.KIconLoader.iconChanged int32:0 >/dev/null 2>&1 || true
 }
 
 remove_program() {
@@ -356,6 +393,11 @@ leave_group() {
 remove_helper() {
     helper_is_ours || return 0
     sudo sh -c "$(helper_command)" </dev/tty || warn "couldn't remove $BRIDGE_HELPER."
+}
+
+remove_swtpm_rule() {
+    swtpm_rule_is_ours || return 0
+    sudo sh -c "$(swtpm_rule_command)" </dev/tty || warn "couldn't take Guesthouse's rule out of $SWTPM_LOCAL."
 }
 
 # The folders go after the manifest, as it's what lists them, and it sits in one of them.
@@ -387,6 +429,7 @@ main() {
     confirm_machines
     leave_group
     remove_helper
+    remove_swtpm_rule
     remove_program
     delete_machines
     remove_manifest

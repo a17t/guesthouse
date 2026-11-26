@@ -1,5 +1,6 @@
 use super::*;
 use crate::actions::desktop::{BOOT_LINE, SERIAL_FILE};
+use crate::actions::identity::after_failed_gpu;
 use crate::actions::tests::{machine, plain_task_context};
 use crate::agent::GuestAgent;
 use crate::agent::stand_in::ScriptedAgent;
@@ -54,7 +55,7 @@ impl Rig {
         Self { context, guest, machine }
     }
 
-    fn start(&self) -> (Result<()>, String) {
+    fn start(&self) -> (Result<Gpu>, String) {
         let host = RecordingHost::default();
         let mut task = Task::new(&self.context, &host, "start", self.machine.clone());
         let result = restart_after_switch(&mut task);
@@ -89,7 +90,7 @@ fn the_switching_start_restarts_windows_and_waits_for_its_desktop_and_gpu() {
     let scratch = Scratch::new();
     let rig = Rig::new(&scratch, switching(), true, &["restarting\r\n", DESKTOP_UP, GPU_UP]);
     let (result, error) = rig.start();
-    assert_eq!(result, Ok(()));
+    assert_eq!(result, Ok(Gpu::Working));
     assert_eq!(error, "");
     let asked = rig.asked();
     assert_eq!(asked.len(), 3);
@@ -99,7 +100,7 @@ fn the_switching_start_restarts_windows_and_waits_for_its_desktop_and_gpu() {
     assert_eq!(rig.state(), IdentityState { shown: Shown::Maker, ..IdentityState::default() });
 
     let (result, _) = rig.start();
-    assert_eq!(result, Ok(()));
+    assert_eq!(result, Ok(Gpu::Working));
     assert_eq!(rig.asked().len(), 3, "the next start doesn't restart it again");
 }
 
@@ -108,7 +109,7 @@ fn a_start_on_nvidias_number_that_has_settled_asks_nothing() {
     let scratch = Scratch::new();
     let settled = IdentityState { shown: Shown::Maker, ..IdentityState::default() };
     let rig = Rig::new(&scratch, settled.clone(), true, &[]);
-    assert_eq!(rig.start(), (Ok(()), String::new()));
+    assert_eq!(rig.start(), (Ok(Gpu::Working), String::new()));
     assert!(rig.asked().is_empty());
     assert_eq!(rig.state(), settled);
 }
@@ -121,7 +122,7 @@ fn a_fall_back_to_microsofts_number_does_not_restart_windows() {
     let task = Task::new(&rig.context, &host, "start", rig.machine.clone());
     after_failed_gpu(&task, Failure::new("no GPU"));
     assert_eq!(rig.state().shown, Shown::Microsoft);
-    assert_eq!(rig.start(), (Ok(()), String::new()));
+    assert_eq!(rig.start(), (Ok(Gpu::Working), String::new()));
     assert!(rig.asked().is_empty());
 }
 
@@ -130,7 +131,7 @@ fn a_windows_that_does_not_restart_is_said_and_not_asked_again() {
     let scratch = Scratch::new();
     let rig = Rig::new(&scratch, switching(), false, &[]);
     let (result, error) = rig.start();
-    assert_eq!(result, Ok(()));
+    assert_eq!(result, Ok(Gpu::Working));
     assert_eq!(error, DID_NOT_RESTART);
     assert_eq!(rig.asked(), [RESTART_SCRIPT]);
     assert!(!rig.state().restart_due);
@@ -152,4 +153,17 @@ fn a_gpu_gone_after_the_restart_goes_back_to_microsofts_number() {
     let (result, _) = rig.start();
     assert!(result.unwrap_err().0.contains("without its GPU"));
     assert_eq!(rig.state().shown, Shown::Microsoft);
+}
+
+#[test]
+fn an_intel_gpu_gone_after_the_restart_keeps_intels_number_and_leaves_the_vm_running() {
+    let scratch = Scratch::new();
+    let mut rig = Rig::new(&scratch, switching(), true, &["restarting\r\n", DESKTOP_UP]);
+    rig.machine.use_windows_card(crate::gpu_maker::GpuMaker::Intel, "0000:03:00.0");
+    let package_vendor = crate::gpu_identity::INTEL_RENDER.vendor;
+    write_state(&rig.context, &rig.machine, &IdentityState { package_vendor, ..switching() }).unwrap();
+    let (result, error) = rig.start();
+    assert_eq!(result, Ok(Gpu::Missing));
+    assert!(error.contains("left running") && error.contains("keeps Intel's vendor ID"), "{error}");
+    assert_eq!(rig.state().shown, Shown::Maker);
 }

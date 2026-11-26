@@ -6,6 +6,9 @@
 //! Three things vary, and each has its own place. The [`profile`] module holds a generation's classes
 //! and a driver branch's layouts, and cards themselves are read live. See `ARCHITECTURE.md`.
 
+// Linux only: it talks to the NVIDIA driver through ioctl. Other systems get an empty crate.
+#![cfg(target_os = "linux")]
+
 pub mod answers;
 pub mod channel;
 mod context_room;
@@ -29,22 +32,24 @@ mod ring_position;
 mod ring_request;
 pub mod rm;
 pub mod sensors;
+mod sked_page;
 pub mod staging;
 mod standard;
 pub mod startup;
 mod tiling;
+pub mod wakes;
 
 use answers::adapter::{AdapterAnswers, Inputs};
-use answers::nodes::{ENGINE_VIDEO_ENCODE, Node, node_list};
+use answers::nodes::{Node, node_list};
 use answers::perf_data;
 use answers::registry::AdapterRegistry;
 use channel::{ListChannel, VideoEngine};
 use encode_sessions::EncodeSessions;
 use guesthouse_backend::{
     AdapterFacts, AllocationShape, Backend, BackendError, Doorbell, DriverSurvey, GpuRange, GuestBooks,
-    HostServices, MapRequest, MemoryId, MemoryKind, PciCard, Refusal, RegistryName, RegistryValue, Setup,
-    SlotCopy, SpaceId, StagingCopy, StagingStart, StandardSurface, Status, SurfaceShape, UnmapRequest,
-    VendorQuery, Work, WorkStart,
+    HostServices, MapRequest, MemoryId, MemoryKind, PciCard, RangeView, Refusal, RegistryName, RegistryValue,
+    RingTiling, Setup, SlotCopy, SpaceId, StagingCopy, StagingStart, StandardSurface, Status, SurfaceShape,
+    UnmapRequest, VendorQuery, Work, WorkStart,
 };
 use inf::{INF_NAME, Inf, read_infs};
 use profile::{
@@ -74,14 +79,16 @@ pub(crate) const UNFINISHED_ENTRIES_LIMIT: u64 = 4000;
 
 /// What the guest's runtime says a Vulkan context is for. Vulkan's video queue families can also
 /// transfer, and it uses them for plain copies, so its contexts on video nodes get copy channels.
+/// Vulkan Video needs the engine's own channel there, which they get on a generation whose profile
+/// says it runs.
 const CLIENT_HINT_VULKAN: u32 = 4;
 
 /// A word in a video context's private data, which we set to one.
 const VIDEO_CONTEXT_WORD: usize = 0xD7C;
 
 const RECORD_QUEUE_TOKEN: usize = 0x40;
-const RECORD_QUEUE_HEAP: usize = 0x5C;
-const QUEUE_HEAP_SIZE: u64 = 1 << 32;
+/// Where the guest's driver reads the address its kernels launch work through.
+const RECORD_QUEUE_SKED_PAGE: usize = 0x5C;
 /// A queue that brings no ring of its own asks here how many entries a list it sends may have, and
 /// reads the answer from the second field. Direct3D 9 makes no device if it gets fewer than it asked.
 const QUEUE_LIST_ENTRIES_ASKED: usize = 0x14;
@@ -163,6 +170,10 @@ pub struct NvidiaBackend<R> {
     pub(crate) ring_moves: RingMoves,
     /// Where shaders' local addresses sit, from the first queue that set it.
     pub(crate) local_window: local_window::LocalWindow,
+    /// Compute drivers' own pools, for their contexts' other channels.
+    pub(crate) pool_mirror: local_window::PoolMirror,
+    /// Each address space's SKED page, and which channel's object backs it.
+    pub(crate) sked_pages: sked_page::SkedPages,
     /// The memory made last, which the private data finished next belongs to.
     last_memory: Option<MemoryId>,
     /// The host's live readings, if it has any.
@@ -177,6 +188,15 @@ impl<R: Rm> NvidiaBackend<R> {
         self.device.graphics_timeslice_micros = micros;
     }
 
+    /// How long each ring channel of a guest context with several queues may hold the GPU, for
+    /// channels made from now on. Such queues wait on each other, as a Direct3D 12 queue's do, and
+    /// each is a channel group of its own, so a channel that waits holds the GPU for its whole slice
+    /// while what it waits for sits on another. 0 leaves the RM's own choice. A slice set with
+    /// [`Self::set_graphics_timeslice`] goes before this one.
+    pub fn set_shared_context_timeslice(&mut self, micros: u64) {
+        self.device.shared_context_timeslice_micros = micros;
+    }
+
     /// Reads the card and works out everything the guest will be told. Nothing here changes the card.
     pub fn start(
         mut device: Device<R>,
@@ -189,6 +209,7 @@ impl<R: Rm> NvidiaBackend<R> {
         let failed = |error: RmError| Refusal(format!("Reading the card failed: {error}"));
         let mut card = CardReader::new(&mut device);
         let generation = card_generation(&mut card)?;
+        log::info!("the card is of the {} generation", generation.name);
         if !generation.run_on_guest_branches.contains(&guest.name) {
             log::warn!(
                 "{} cards have not been run with guest driver branch {}. This is a try, and it may fail.",
@@ -267,6 +288,8 @@ impl<R: Rm> NvidiaBackend<R> {
             guest_rings: HashMap::new(),
             ring_moves: RingMoves::default(),
             local_window: local_window::LocalWindow::default(),
+            pool_mirror: local_window::PoolMirror::default(),
+            sked_pages: sked_page::SkedPages::default(),
             last_memory: None,
             sensors: None,
             card_uuid,
@@ -280,14 +303,12 @@ impl<R: Rm> NvidiaBackend<R> {
 
     /// The video engine this work's commands are for, if they are for one.
     pub(crate) fn video_engine(&self, work: &Work<'_>) -> Option<VideoEngine> {
-        if work.client_hint == CLIENT_HINT_VULKAN {
+        if work.client_hint == CLIENT_HINT_VULKAN && !self.generation.nodes.vulkan_video_runs {
             return None;
         }
         let node = self.nodes.get(work.node as usize)?;
         let (rm_engine, instance) = node.video?;
-        let encodes = node.engine == ENGINE_VIDEO_ENCODE;
-        let generation = self.generation;
-        let class = if encodes { generation.video_encode_class } else { generation.video_decode_class };
+        let class = node.video_class(self.generation)?;
         Some(VideoEngine { rm_engine, class, instance })
     }
 
@@ -357,11 +378,15 @@ impl<R: Rm + OpenRm> Backend for NvidiaBackend<R> {
         log::info!("opened the card at {}, device instance {}", place_text(&place), device.instance);
         let mut backend = Self::start(device, host_profile, guest_profile, setup, &host, &infs)?;
         // Readings are a bonus, so a failure here only means going without.
-        match sensors::start(&backend.card_uuid) {
+        match sensors::start(&backend.card_uuid, setup.card_address.as_ref()) {
             Ok(snapshot) => backend.set_sensors(Box::new(snapshot)),
             Err(error) => log::info!("no host sensors: {error}"),
         }
         Ok(backend)
+    }
+
+    fn wake_descriptor(&self) -> Option<std::os::fd::RawFd> {
+        self.copier.as_ref().and_then(|copier| copier.channel.signal).map(|(_, _, fd)| fd)
     }
 
     fn facts(&self) -> &AdapterFacts {
@@ -377,6 +402,22 @@ impl<R: Rm + OpenRm> Backend for NvidiaBackend<R> {
         let memory = MemoryId(u64::from(handle));
         self.last_memory = Some(memory);
         Ok((memory, given))
+    }
+
+    fn allocate_spill_memory(
+        &mut self,
+        size: u64,
+        kind: MemoryKind,
+    ) -> Result<(MemoryId, u64), BackendError> {
+        let (handle, given) = self.device.alloc_spill_memory(size, kind).map_err(memory_error)?;
+        let memory = MemoryId(u64::from(handle));
+        self.last_memory = Some(memory);
+        Ok((memory, given))
+    }
+
+    fn card_memory_free(&self) -> Option<u64> {
+        let live = self.sensors.as_ref()?.latest()?;
+        Some(live.memory_total_bytes?.saturating_sub(live.memory_used_bytes?))
     }
 
     fn adopt_host_pages(&mut self, host_address: u64, size: u64) -> Result<MemoryId, BackendError> {
@@ -415,8 +456,9 @@ impl<R: Rm + OpenRm> Backend for NvidiaBackend<R> {
     }
 
     fn create_address_space(&mut self, ranges: &[GpuRange]) -> Result<SpaceId, BackendError> {
-        let space =
-            self.device.create_address_space(&context_room::without_room(ranges)).map_err(memory_error)?;
+        let mut ranges = context_room::without_room(ranges);
+        ranges.push(sked_page::SKED_RANGE);
+        let space = self.device.create_address_space(&ranges).map_err(memory_error)?;
         let id = SpaceId(self.next_space);
         self.next_space += 1;
         self.spaces.insert(id, space);
@@ -424,6 +466,8 @@ impl<R: Rm + OpenRm> Backend for NvidiaBackend<R> {
     }
 
     fn destroy_address_space(&mut self, space: SpaceId) {
+        self.pool_mirror.forget_space(space);
+        self.sked_pages.forget_space(space);
         if let Some(space) = self.spaces.remove(&space)
             && let Err(error) = self.device.destroy_address_space(&space)
         {
@@ -458,6 +502,18 @@ impl<R: Rm + OpenRm> Backend for NvidiaBackend<R> {
         page_kind::kinds_differ(self.generation.page_kinds, first, second)
     }
 
+    fn protection_for_view(&self, view: RangeView, driver_protection: u64) -> u64 {
+        if self.generation.page_kinds != page_kind::PageKinds::InEntries {
+            return driver_protection;
+        }
+        // The driver's own word on the range comes first, then the surface it described.
+        let named = page_kind::known_class(view.driver_protection);
+        match named.or_else(|| depth::view_class(view.surface)) {
+            Some(class) => page_kind::with_depth_class(driver_protection, class),
+            None => driver_protection,
+        }
+    }
+
     fn unmap(&mut self, unmap: &UnmapRequest) -> Result<(), BackendError> {
         let space = Self::space(&self.spaces, unmap.space)?;
         self.device.unmap(space, handle_of(unmap.memory), unmap.address, unmap.length).map_err(memory_error)
@@ -490,7 +546,7 @@ impl<R: Rm + OpenRm> Backend for NvidiaBackend<R> {
         }
     }
 
-    /// Each queue gets a number of its own, which can't be zero, and the guest needs a heap size.
+    /// Each queue gets a number of its own, which can't be zero, and the address of its SKED page.
     fn finish_queue_data(&mut self, queue: u32, private: &mut [u8], serial: u32) -> Result<(), BackendError> {
         let too_short = || BackendError::new("a queue's private data is too short");
         match GuestRing::of_queue(private) {
@@ -502,8 +558,9 @@ impl<R: Rm + OpenRm> Backend for NvidiaBackend<R> {
         let token = serial.wrapping_add(1).max(1);
         let field = private.get_mut(RECORD_QUEUE_TOKEN..RECORD_QUEUE_TOKEN + 4).ok_or_else(too_short)?;
         field.copy_from_slice(&token.to_le_bytes());
-        let field = private.get_mut(RECORD_QUEUE_HEAP..RECORD_QUEUE_HEAP + 8).ok_or_else(too_short)?;
-        field.copy_from_slice(&QUEUE_HEAP_SIZE.to_le_bytes());
+        let field =
+            private.get_mut(RECORD_QUEUE_SKED_PAGE..RECORD_QUEUE_SKED_PAGE + 8).ok_or_else(too_short)?;
+        field.copy_from_slice(&sked_page::SKED_PAGE_ADDRESS.to_le_bytes());
         Ok(())
     }
 
@@ -557,7 +614,7 @@ impl<R: Rm + OpenRm> Backend for NvidiaBackend<R> {
         live.and_then(|live| perf_data::answer(query, &live, out)).or_else(|| self.answers.answer(query, out))
     }
 
-    fn registry_value(&mut self, name: &RegistryName) -> Option<RegistryValue> {
+    fn registry_value(&mut self, name: &RegistryName, _asked_type: u32) -> Option<RegistryValue> {
         self.answers.registry().lookup(name)
     }
 
@@ -575,7 +632,7 @@ impl<R: Rm + OpenRm> Backend for NvidiaBackend<R> {
     }
 
     /// A context on a video node gets a one in its answer. Measured: left at zero, Direct3D 11 still
-    /// decodes, and `cuvidCreateDecoder` fails.
+    /// decodes, and `cuvidCreateDecoder` fails. The optical flow node's context has only run with it.
     fn finish_context_data(&mut self, node: u32, private: &mut [u8]) {
         if self.answers.node_is_video(node)
             && let Some(field) = private.get_mut(VIDEO_CONTEXT_WORD..VIDEO_CONTEXT_WORD + 4)
@@ -610,6 +667,17 @@ impl<R: Rm + OpenRm> Backend for NvidiaBackend<R> {
         self.poll_copy(host, now)
     }
 
+    fn wait_staging_copy(&mut self, host: &mut dyn HostServices) -> Status {
+        let started = Instant::now();
+        loop {
+            if let Some(status) = self.poll_copy(host, Instant::now()) {
+                return status;
+            }
+            // Asked each time, as a retry brings a new surface with the new channel.
+            crate::channel::copy::pause(self.wake_descriptor(), started);
+        }
+    }
+
     fn start_slot_copy(&mut self, host: &mut dyn HostServices, copy: &SlotCopy) -> StagingStart {
         self.start_frame_copy(host, copy)
     }
@@ -623,6 +691,18 @@ impl<R: Rm + OpenRm> Backend for NvidiaBackend<R> {
             return None;
         }
         tiling::surface_bytes(surface.pitch, surface.height, surface.tiling?)
+    }
+
+    /// On every generation. The tiles are only in how the copy engine and the importer address the
+    /// bytes, so plain memory holds them. Where page table entries carry a kind, the RM gives plain
+    /// memory the generic one whatever its layout (`memmgrChooseKind_TU102` in the open kernel
+    /// module, for an image with no compression), and that is the kind the modifier names. Only
+    /// Blackwell has been seen to work.
+    fn ring_tiling(&self) -> Option<RingTiling> {
+        Some(RingTiling {
+            modifier: tiling::block_linear_modifier(tiling::RING_BLOCK),
+            block: tiling::RING_BLOCK,
+        })
     }
 }
 

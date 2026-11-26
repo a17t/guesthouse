@@ -4,6 +4,7 @@ use crate::context::Context;
 use crate::daemon::is_own_daemon;
 use crate::held_memory::holders;
 use crate::machine::{Machine, sorted_names};
+use crate::macos_part::MACOS_QEMU;
 use crate::monitor::MAIN_SOCKET;
 use crate::process_stat::Seen;
 use crate::slots;
@@ -50,10 +51,13 @@ impl Qemu {
 }
 
 /// Every process of this install's QEMU, oldest first, so a VM comes before any child it has forked.
+/// A macOS guest runs on a QEMU of its own, which counts as this install's too.
 pub fn qemu_processes(context: &Context) -> Vec<Qemu> {
-    let program = context.paths.qemu.as_os_str().as_encoded_bytes();
+    let programs = [context.paths.qemu.clone(), crate::macos_part::file(&context.paths, MACOS_QEMU)];
+    let ours =
+        |words: &Words| programs.iter().any(|program| words[0] == program.as_os_str().as_encoded_bytes());
     let of_pid = |pid| {
-        let words = process_words(context, pid).filter(|words| words[0] == program)?;
+        let words = process_words(context, pid).filter(ours)?;
         Some(Qemu { seen: Seen::now(context, pid)?, words })
     };
     let mut found: Vec<Qemu> = pids(context).into_iter().filter_map(of_pid).collect();
@@ -124,7 +128,13 @@ pub fn still_running(context: &Context, qemu: Seen) -> bool {
 fn opens_disk(word: &[u8], machine: &Machine) -> bool {
     let wanted = format!("file={},", qemu_value(&machine.disk)).into_bytes();
     let found = word.windows(wanted.len()).position(|part| part == wanted);
-    found.is_some_and(|at| word.get(at + wanted.len()) != Some(&b','))
+    found.is_some_and(|at| word.get(at + wanted.len()) != Some(&b',')) || runs_throwaway_of(word, machine)
+}
+
+/// Whether this word is the note on a throwaway run's overlay, which names the machine's disk last.
+fn runs_throwaway_of(word: &[u8], machine: &Machine) -> bool {
+    let wanted = format!(",opaque={}{}", crate::vm_args::THROWAWAY_MARK, qemu_value(&machine.disk));
+    word.ends_with(wanted.as_bytes())
 }
 
 /// Whether another VM on this PC has a slot's memory. See [`crate::held_memory`]. A daemon of ours
@@ -319,6 +329,21 @@ mod tests {
             Some((2, 50))
         );
         assert!(running_machine(&context, &Machine::new("y", "y", "/d", "/v")).is_none());
+    }
+
+    #[test]
+    fn a_macos_guest_on_its_own_qemu_is_found_too() {
+        let scratch = Scratch::new();
+        let context = scratch_context(&scratch);
+        let qemu = crate::macos_part::file(&context.paths, MACOS_QEMU).display().to_string();
+        let socket = format!(
+            "unix:{}/qmp.sock,server=on,wait=off",
+            context.paths.run_folder(slots::number(1)).display()
+        );
+        let disk = "id=disk,if=none,file=/m/mac/disk.qcow2,format=qcow2";
+        fake_process(&context, 60, &[&qemu, "-drive", disk, "-qmp", &socket], &[], "");
+        let mac = Machine::new("mac", "Mac", "/m/mac/disk.qcow2", "/m/mac/OVMF_VARS.fd");
+        assert_eq!(running_machine(&context, &mac).map(|(slot, qemu)| (slot, qemu.seen.pid)), Some((1, 60)));
     }
 
     #[test]

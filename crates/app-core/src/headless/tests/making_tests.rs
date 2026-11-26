@@ -1,21 +1,25 @@
 use super::*;
+use crate::gpu_maker::GpuMaker;
 use crate::host::{RamField, physical_cores};
 use crate::iso::stand_in::{make_iso, wim};
+use crate::linux::amd::stand_in::{fake_graphics, fake_render_node};
 use crate::machine::load;
 use crate::settings::driver_folder;
 use crate::settings::read_setup;
+use crate::setup::amd::{NO_AMD_SETUP, amd_driver_folder};
+use crate::setup::amd_driver::stand_in::{IGPU, OLDER, make_installer};
 use crate::setup::cards::stand_in::{NAMES, fake_pci};
-use crate::setup::checks::{Check, CheckState};
+use crate::setup::checks::{Check, CheckState, Part};
 use crate::setup::driver::stand_in::good_installer;
 use crate::setup::driver::{WINDOWS_DRIVER, driver_problem};
 use setup::setup_after;
 use std::path::Path;
 
-fn plain_disc(scratch: &Scratch) -> String {
+pub(super) fn plain_disc(scratch: &Scratch) -> String {
     make_iso(scratch, "tiny", &[("readme.txt", b"hello")])
 }
 
-fn failure_of(result: std::result::Result<(), Problem>) -> String {
+pub(super) fn failure_of(result: std::result::Result<(), Problem>) -> String {
     match result {
         Err(Problem::Failed(failure)) => failure.0,
         other => panic!("expected a failure, got {other:?}"),
@@ -88,7 +92,7 @@ fn a_new_machine_is_refused_in_the_dialogs_words() {
 #[test]
 fn a_windows_disc_says_what_it_is_and_what_stops_it() {
     let scratch = Scratch::new();
-    let mut context = scratch_context(&scratch);
+    let mut context = with_cards(&scratch, &[("0000:01:00.0", 0x2B85)]);
     // The room an install needs depends on the disk this test runs on.
     context.install_room = Some(0);
     let data = wim(&["Windows 11 Pro"], 26300, 9);
@@ -97,6 +101,140 @@ fn a_windows_disc_says_what_it_is_and_what_stops_it() {
     assert!(out.starts_with("Windows 11 Pro, build 26300: Windows with GPU-PV."), "{out}");
     let refusal = failure_of(result);
     assert!(refusal.contains("driver"), "{refusal}");
+}
+
+/// The card is named by its address alone, as an AMD card is, so its maker has to come from the
+/// choice: an Intel card taken for AMD's would ask for AMD's driver.
+#[test]
+fn a_windows_machine_on_an_intel_card_is_made_for_intels_driver() {
+    let scratch = Scratch::new();
+    let mut context = with_cards(&scratch, &[]);
+    context.drm_class = scratch.path("drm");
+    context.install_room = Some(0);
+    crate::linux::amd::stand_in::fake_render_node(&scratch, 128, "0000:00:02.0", "0x8086", 0x64a0);
+    let data = wim(&["Windows 11 Pro"], 26300, 9);
+    let disc = make_iso(&scratch, "win", &[("sources/install.wim", &data)]);
+    let (out, result) = said(&context, &format!("new Arc --iso {disc} --amd-card 0000:00:02.0"));
+    assert!(failure_of(result).contains(crate::setup::intel::NO_INTEL_SETUP), "{out}");
+}
+
+/// A lab run names a recording of a tester's card. Then the card is offered as it would be on the
+/// tester's PC, and its driver is asked for as for any Intel card.
+#[test]
+fn a_recorded_intel_card_is_offered_when_one_is_named_and_wants_intels_driver() {
+    let scratch = Scratch::new();
+    let mut context = with_cards(&scratch, &[]);
+    context.drm_class = scratch.path("drm");
+    context.install_room = Some(0);
+    let data = wim(&["Windows 11 Pro"], 26300, 9);
+    let disc = make_iso(&scratch, "win", &[("sources/install.wim", &data)]);
+    let words = format!("new Arc --iso {disc} --amd-card 0000:03:00.0");
+    let without = failure_of(said(&context, &words).1);
+    assert!(!without.contains(crate::setup::intel::NO_INTEL_SETUP), "no Intel card unless named: {without}");
+    context.recorded_intel_card = Some(scratch.write("b580.card", crate::render_cards::tests::ARC_B580));
+    let (out, result) = said(&context, &words);
+    assert!(failure_of(result).contains(crate::setup::intel::NO_INTEL_SETUP), "{out}");
+    let nvidia = with_cards(&scratch, &[("0000:01:00.0", 0x2B85)]);
+    let refused = failure_of(said(&nvidia, &format!("new Rtx --iso {disc} --intel-driver /x.exe")).1);
+    assert_eq!(refused, "--intel-driver is for a Windows machine on an Intel card.");
+}
+
+pub(super) const AMD_IGPU: &str = "0000:7c:00.0";
+const RDNA3_GRAPHICS: u32 = 11;
+/// In GiB, for an install that no drive has the room for.
+const MORE_ROOM_THAN_ANY_DRIVE_HAS: u64 = 1 << 40;
+
+/// A PC whose only card is an AMD one GPU-PV handles.
+pub(super) fn with_an_amd_card(scratch: &Scratch) -> Context {
+    let mut context = with_cards(scratch, &[]);
+    context.drm_class = scratch.path("drm");
+    context.install_room = Some(0);
+    fake_render_node(scratch, 128, AMD_IGPU, "0x1002", IGPU);
+    fake_graphics(scratch, AMD_IGPU, RDNA3_GRAPHICS);
+    context
+}
+
+/// A PC with no desktop has no dialog to give AMD's installer to, so `new` takes it.
+#[test]
+fn a_windows_machine_on_an_amd_card_is_made_with_the_driver_from_amds_installer() {
+    let scratch = Scratch::new();
+    let context = with_an_amd_card(&scratch);
+    let data = wim(&["Windows 11 Pro"], 26300, 9);
+    let disc = make_iso(&scratch, "win", &[("sources/install.wim", &data)]);
+    let words = format!("new Win --iso {disc} --amd-card {AMD_IGPU}");
+    assert!(failure_of(said(&context, &words).1).contains(NO_AMD_SETUP), "it has no driver yet");
+    let installer = make_installer(&scratch, &[0x7550]);
+    let (out, result) = said(&context, &format!("{words} --amd-driver {installer}"));
+    assert_eq!(result, Ok(()), "{out}");
+    let folder = amd_driver_folder(&context).expect("the driver is written down");
+    assert!(out.contains("Reading AMD's installer\nTaking out the driver for AMD card 13c0\n"), "{out}");
+    assert!(out.contains(&format!("AMD's driver {OLDER} is in {}.\n", folder.display())), "{out}");
+    let machine = load(&context, "win").unwrap();
+    assert_eq!((machine.amd_gpu.as_str(), machine.windows_maker()), (AMD_IGPU, Some(GpuMaker::Amd)));
+}
+
+#[test]
+fn amds_installer_is_refused_where_it_is_no_use_and_nothing_is_made() {
+    let scratch = Scratch::new();
+    let data = wim(&["Windows 11 Pro"], 26300, 9);
+    let disc = make_iso(&scratch, "win", &[("sources/install.wim", &data)]);
+    let not_for_amd = "--amd-driver is for a Windows machine on an AMD card.";
+    let nvidia = with_cards(&scratch, &[("0000:01:00.0", 0x2B85)]);
+    let refused = failure_of(said(&nvidia, &format!("new Rtx --iso {disc} --amd-driver /x.exe")).1);
+    assert_eq!(refused, not_for_amd);
+    let plain = format!("new Tiny --iso {} --amd-driver /x.exe", plain_disc(&scratch));
+    assert_eq!(failure_of(said(&nvidia, &plain).1), not_for_amd);
+    let context = with_an_amd_card(&scratch);
+    let other_file = format!("new Win --iso {disc} --amd-card {AMD_IGPU} --amd-driver {disc}");
+    assert_eq!(failure_of(said(&context, &other_file).1), "This file is not AMD's driver installer.");
+    let installer = make_installer(&scratch, &[0x7550]);
+    let both =
+        format!("new Win --iso {disc} --amd-card {AMD_IGPU} --amd-driver {installer} --intel-driver /x.exe");
+    assert_eq!(
+        failure_of(said(&context, &both).1),
+        "--intel-driver is for a Windows machine on an Intel card."
+    );
+    assert!(amd_driver_folder(&context).is_none());
+    assert!(load_all(&nvidia).0.is_empty() && load_all(&context).0.is_empty(), "nothing was made");
+}
+
+/// Unpacking takes a while and takes the place of the driver every AMD machine here runs on, so a
+/// machine that is refused anyway must not get that far.
+#[test]
+fn a_machine_that_is_refused_anyway_leaves_amds_driver_as_it_was() {
+    let scratch = Scratch::new();
+    let mut context = with_an_amd_card(&scratch);
+    let data = wim(&["Windows 11 Pro"], 26300, 9);
+    let disc = make_iso(&scratch, "win", &[("sources/install.wim", &data)]);
+    let installer = make_installer(&scratch, &[0x7550]);
+    let words = format!("new Win --iso {disc} --amd-card {AMD_IGPU} --amd-driver {installer}");
+    let refused = |context: &Context, more: &str| failure_of(said(context, &format!("{words} {more}")).1);
+    assert_eq!(refused(&context, "--disk 1"), "The disk must be between 40 and 16384 GiB.");
+    assert_eq!(refused(&context, "--cores many"), "--cores must be a whole number.");
+    assert_eq!(refused(&context, "--ssh perhaps"), "--ssh is on or off.");
+    context.install_room = Some(MORE_ROOM_THAN_ANY_DRIVE_HAS);
+    let no_room = refused(&context, "");
+    assert!(no_room.starts_with("An install needs"), "{no_room}");
+    assert!(amd_driver_folder(&context).is_none(), "the installer was not unpacked");
+    assert!(load_all(&context).0.is_empty(), "nothing was made");
+}
+
+/// A file that isn't Intel's installer is only found out when it is read, so the sizes being said
+/// first shows that it wasn't.
+#[test]
+fn a_machine_that_is_refused_anyway_does_not_read_intels_installer() {
+    let scratch = Scratch::new();
+    let mut context = with_cards(&scratch, &[]);
+    context.drm_class = scratch.path("drm");
+    context.install_room = Some(0);
+    fake_render_node(&scratch, 128, "0000:00:02.0", "0x8086", 0x64a0);
+    let data = wim(&["Windows 11 Pro"], 26300, 9);
+    let disc = make_iso(&scratch, "win", &[("sources/install.wim", &data)]);
+    let words = format!("new Arc --iso {disc} --amd-card 0000:00:02.0 --intel-driver {disc}");
+    let refused = |more: &str| failure_of(said(&context, &format!("{words} {more}")).1);
+    assert_eq!(refused("--disk 1"), "The disk must be between 40 and 16384 GiB.");
+    assert_eq!(refused(""), "This file is not Intel's driver installer.");
+    assert!(load_all(&context).0.is_empty(), "nothing was made");
 }
 
 #[test]
@@ -141,7 +279,13 @@ fn a_machine_whose_disk_is_elsewhere_is_only_forgotten() {
 }
 
 fn passing(title: &str) -> Check {
-    Check { title: title.into(), state: CheckState::Ok, text: "fine".into(), fix: String::new() }
+    Check {
+        title: title.into(),
+        state: CheckState::Ok,
+        text: "fine".into(),
+        fix: String::new(),
+        part: Part::Pc,
+    }
 }
 
 fn with_cards(scratch: &Scratch, cards: &[(&str, u32)]) -> Context {
@@ -164,6 +308,31 @@ fn setup_stops_at_a_check_that_failed_and_says_which() {
     assert!(result.unwrap_err().0.starts_with("Windows with GPU-PV cannot run yet."));
     let said = String::from_utf8(out).unwrap();
     assert_eq!(said, "ok       KVM: fine\nfailed   NVIDIA card: fine\n         Plug one in.\n");
+}
+
+#[test]
+fn setup_on_a_pc_with_only_an_intel_card_has_nothing_to_do() {
+    let scratch = Scratch::new();
+    let context = with_cards(&scratch, &[]);
+    let intel = Check { part: Part::Intel, state: CheckState::Warning, ..passing("Intel card") };
+    let mut out = Vec::new();
+    setup_after(&context, &[passing("KVM"), intel], None, None, &mut out).unwrap();
+    let said = String::from_utf8(out).unwrap();
+    assert!(said.ends_with(&format!("{}\n", crate::setup::checks::INTEL_NEEDS_NO_SETUP)), "{said}");
+}
+
+#[test]
+fn setup_on_a_pc_with_only_an_amd_card_has_nothing_to_do() {
+    let scratch = Scratch::new();
+    let mut context = with_cards(&scratch, &[]);
+    context.drm_class = scratch.path("drm");
+    crate::linux::amd::stand_in::fake_render_node(&scratch, 128, "0000:7c:00.0", "0x1002", 0x13C0);
+    let amd = Check { part: Part::Amd, ..passing("AMD card") };
+    let mut out = Vec::new();
+    setup_after(&context, &[passing("KVM"), amd.clone()], None, None, &mut out).unwrap();
+    assert!(String::from_utf8(out).unwrap().contains("needs no setup"));
+    let old = Check { state: CheckState::Failed, ..amd };
+    assert!(setup_after(&context, &[passing("KVM"), old], None, None, &mut Vec::new()).is_err());
 }
 
 #[test]
@@ -209,4 +378,18 @@ fn setup_takes_the_card_it_was_told_on_a_pc_with_two() {
     assert!(String::from_utf8(out).unwrap().contains("at 0000:02:00.0."));
     let refusal = setup_after(&context, &[passing("KVM")], None, Some("0000:09:00.0"), &mut Vec::new());
     assert_eq!(refusal.unwrap_err().0, "There is no NVIDIA card at 0000:09:00.0.");
+}
+
+#[test]
+fn remote_desktop_and_ssh_are_chosen_only_for_windows_and_only_on_or_off() {
+    let scratch = Scratch::new();
+    let mut context = with_cards(&scratch, &[("0000:01:00.0", 0x2B85)]);
+    context.install_room = Some(0);
+    let plain = plain_disc(&scratch);
+    let refused = failure_of(said(&context, &format!("new Tiny --iso {plain} --remote-desktop on")).1);
+    assert_eq!(refused, "--remote-desktop is only for a Windows machine with GPU-PV.");
+    let data = wim(&["Windows 11 Pro"], 26300, 9);
+    let windows = make_iso(&scratch, "win", &[("sources/install.wim", &data)]);
+    let refused = failure_of(said(&context, &format!("new Win --iso {windows} --ssh maybe")).1);
+    assert_eq!(refused, "--ssh is on or off.");
 }

@@ -21,8 +21,9 @@ pub struct GpuRange {
 
 /// The ranges every address space covers. There is a hole around 4 GiB, where real drivers keep
 /// something of their own, and the ranges are big because one process can reserve gigabytes. They
-/// stop at 1 TiB because a ring entry can't reach past it. The core hands addresses out of these,
-/// and a backend may tell the guest's driver about them.
+/// stop at 1 TiB because an NVIDIA ring entry can't reach past it. The core hands addresses out of
+/// these, and a backend may tell the guest's driver about them. A backend whose card reaches further
+/// can let the guest place its own mappings past them, with `Backend::guest_placed_gpu_ranges`.
 pub const GPU_RANGES: [GpuRange; 2] = [
     GpuRange { start: 0x400_0000, end: 0x1_0000_0000 },
     GpuRange { start: 0x1_4000_0000, end: 0x100_0000_0000 },
@@ -208,6 +209,20 @@ impl MemoryKind {
     pub const PLAIN: Self = Self(0);
 }
 
+/// What the guest said of a range of addresses when it set the range aside.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RangeView {
+    /// The kind of the surface the range is for, or plain if the guest described none.
+    pub surface: MemoryKind,
+    /// The driver's own word on the range, as the vendor defines it, or zero if it gave none.
+    pub driver_protection: u64,
+}
+
+impl RangeView {
+    /// A range nothing was said of.
+    pub const NONE: Self = Self { surface: MemoryKind::PLAIN, driver_protection: 0 };
+}
+
 /// What an allocation's private data asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AllocationShape {
@@ -229,6 +244,9 @@ pub struct VendorQuery<'a> {
     pub data: &'a [u8],
     /// The asking process is 32-bit, and so needs the 32-bit user-mode driver.
     pub process_is_32_bit: bool,
+    /// The program the asking process runs, by its file name, as `dwm.exe`, or empty when the guest
+    /// didn't say.
+    pub program: &'a str,
 }
 
 /// A registry value. `value_type` is `None` for the driver paths, which have no type to match.
@@ -245,6 +263,15 @@ pub enum WorkSource {
     Context,
 }
 
+/// Where a submission's commands are, as the guest's message gave them: a GPU address in the
+/// submission's space, and a length in bytes. A backend whose driver's private data names its
+/// commands itself has no use for this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandBuffer {
+    pub address: u64,
+    pub length: u32,
+}
+
 /// A submission, as the core understood it.
 #[derive(Debug, Clone, Copy)]
 pub struct Work<'a> {
@@ -255,8 +282,12 @@ pub struct Work<'a> {
     pub node: u32,
     /// What the guest said its context is for.
     pub client_hint: u32,
+    /// How many queues the queue's context has right now, this one included.
+    pub context_queues: u32,
     /// The vendor driver's private data.
     pub private: &'a [u8],
+    /// The commands the message itself names, for a message that names any.
+    pub commands: Option<CommandBuffer>,
     pub fence: u64,
     pub fence_gpu_address: u64,
     pub fence_value: u64,
@@ -288,8 +319,15 @@ pub enum WorkStart {
 pub enum Doorbell {
     /// The work is on its way to the GPU.
     Rung,
+    /// The work is on the GPU and runs until the guest ends it, as a ring fed from user mode does.
+    /// Its fence comes only then, so it is neither waited for nor a sign of a hang.
+    RungToStay,
     /// The driver refused it for now. Nothing changed, and the same doorbell should be rung again.
     NotYet,
+    /// The backend won't let it run before this time. Nothing changed. The core rings the same
+    /// doorbell again once the time has come, holding the queue's later work behind it, and isn't
+    /// in a hurry meanwhile: the queue's other work and every other message go on as usual.
+    NotBefore(std::time::Instant),
 }
 
 /// Where a GPU address lies in memory shared with the guest.
@@ -332,6 +370,20 @@ pub struct SlotCopy {
     pub height: u32,
     /// The daemon's own address space, where the two addresses above are.
     pub own_space: SpaceId,
+    /// The slot's block height, as [`SurfaceShape::tiling`] has it, when the slot is laid out in the
+    /// card's tiles rather than in rows. See [`RingTiling`].
+    pub slot_tiling: Option<u32>,
+}
+
+/// A tiled layout the backend can lay a viewer's frames out in, for a compositor that can't take
+/// them in rows. NVIDIA's EGL takes 10-bit frames in rows only as external images, which GNOME can't
+/// draw, but takes its own tiles as plain textures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RingTiling {
+    /// The DRM format modifier that names the layout to the viewer and its compositor.
+    pub modifier: u64,
+    /// The block height, as [`SurfaceShape::tiling`] has it.
+    pub block: u32,
 }
 
 /// A frame to copy to a staging surface.

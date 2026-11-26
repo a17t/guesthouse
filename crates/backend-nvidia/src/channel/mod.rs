@@ -13,7 +13,10 @@ pub use area::Area;
 pub use copy::{COPY_AREA_EXTRA, COPY_WINDOW, CopyChannel};
 pub use list::{LIST_AREA, ListChannel, ListFull};
 
-use crate::local_window::{COMPUTE_SUBCHANNEL, SET_LOCAL_MEMORY_ADDRESS, SET_LOCAL_MEMORY_WINDOW};
+use crate::local_window::{
+    COMPUTE_SUBCHANNEL, GuestPool, SET_LOCAL_MEMORY_ADDRESS, SET_LOCAL_MEMORY_SIZE, SET_LOCAL_MEMORY_UNITS,
+    SET_LOCAL_MEMORY_WINDOW,
+};
 use crate::profile::{Generation, HostBranch};
 use crate::pushbuffer::{increasing, ring_entry};
 use crate::rm::classes::{
@@ -91,10 +94,9 @@ const SCHEDULE_ENABLED: [u8; 3] = [1, 0, 0];
 pub const LOCAL_MEMORY_BYTES: u64 = 32 << 20;
 /// The pool's GPU address is aligned to this.
 pub const LOCAL_MEMORY_ALIGN: u64 = 2 << 20;
-/// How many SMs share the pool. The guest replaces this when it sends its own count.
+/// The most units the pool is split between. The size the GPU is given is per unit (a TPC, as in
+/// the open class headers and Mesa's NVK), so each unit gets the pool over this.
 const LOCAL_MEMORY_SMS: u32 = 0x100;
-const SET_LOCAL_MEMORY_SIZE: u32 = 0x2E4;
-const SET_LOCAL_MEMORY_SMS: u32 = 0x2EC;
 /// A pool given to a channel that is already running goes here, with its own cache invalidate
 /// after it. Well past the prelude, which is a few dozen words.
 const LATE_POOL: usize = PRELUDE + 0x800;
@@ -115,7 +117,7 @@ pub enum Engine {
     Video(VideoEngine),
 }
 
-/// One of the card's video decoders or encoders.
+/// One of the card's video engines: a decoder, an encoder or an optical flow engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoEngine {
     /// The RM's engine number.
@@ -153,6 +155,8 @@ pub struct Channel {
     channel: Handle,
     /// The object that runs deferred controls, which graphics channels have.
     deferred_api: Option<Handle>,
+    /// The compute object, which graphics channels have. The RM maps it as a SKED page.
+    compute: Option<Handle>,
     token: u32,
     ring_entries: u32,
     /// Words before the cache invalidate. Local memory setup stays out of the invalidate, so a
@@ -183,8 +187,7 @@ pub(crate) fn l2_invalidate_words() -> Vec<u32> {
 
 /// After scheduling and before any work, as this can force a channel off the GPU. The channel runs
 /// fine on the RM's own slice, so a refusal only costs some speed.
-fn set_timeslice<R: Rm>(device: &mut Device<R>, group: Handle) {
-    let micros = device.graphics_timeslice_micros;
+fn set_timeslice<R: Rm>(device: &mut Device<R>, group: Handle, micros: u64) {
     if micros != 0
         && let Err(error) = device.control(group, CONTROL_SET_TIMESLICE, &mut micros.to_le_bytes())
     {
@@ -240,6 +243,7 @@ impl Channel {
         let channel = device.alloc(group, generation.channel_class, &mut params)?;
 
         let mut deferred_api = None;
+        let mut compute = None;
         let mut bind_with = Vec::with_capacity(classes.len());
         for (class, params) in &mut classes {
             let object = device.alloc(channel, *class, params)?;
@@ -248,6 +252,9 @@ impl Channel {
                 deferred_api = Some(object);
                 binding = class_engine_id(device, channel, object).unwrap_or(*class);
             }
+            if *class == generation.compute_class {
+                compute = Some(object);
+            }
             bind_with.push(binding);
         }
         let mut token = [0; 4];
@@ -255,7 +262,7 @@ impl Channel {
         let mut schedule = SCHEDULE_ENABLED;
         device.control(group, CONTROL_SCHEDULE_CHANNEL_GROUP, &mut schedule)?;
         if engine == Engine::Graphics {
-            set_timeslice(device, group);
+            set_timeslice(device, group, device.graphics_timeslice_micros);
         }
 
         let first = match engine {
@@ -279,6 +286,7 @@ impl Channel {
             group,
             channel,
             deferred_api,
+            compute,
             token: u32::from_le_bytes(token),
             ring_entries: place.ring_entries,
             setup_words,
@@ -286,6 +294,17 @@ impl Channel {
             local_memory: None,
             late_pool_words: None,
         })
+    }
+
+    /// The compute object, for a graphics channel.
+    pub fn compute_object(&self) -> Option<Handle> {
+        self.compute
+    }
+
+    /// A slice of its own for this channel's group. Only before the channel has been given work, as
+    /// for the slice set when it was made.
+    pub fn set_timeslice<R: Rm>(&self, device: &mut Device<R>, micros: u64) {
+        set_timeslice(device, self.group, micros);
     }
 
     /// Maps a shader local-memory pool and names it in the prelude, ahead of the cache invalidate.
@@ -325,6 +344,22 @@ impl Channel {
         Ok(())
     }
 
+    /// Points a running channel at a pool the guest's driver made, ahead of its next submission.
+    /// Comes after a pool of ours that hasn't gone yet, so the guest's wins.
+    pub(crate) fn add_late_pool_methods(&mut self, pool: &GuestPool) {
+        if self.engine != Engine::Graphics {
+            return;
+        }
+        let mut words = match self.late_pool_words {
+            Some(count) => self.area.load_words(LATE_POOL, count as usize),
+            None => Vec::new(),
+        };
+        words.extend(local_memory_methods(pool));
+        words.extend(l2_invalidate_words());
+        self.area.store_words(LATE_POOL, &words);
+        self.late_pool_words = Some(words.len() as u32);
+    }
+
     /// Allocates and maps the pool, and gives the methods that name it. `None` if this channel
     /// takes no pool.
     fn map_local_memory<R: Rm>(
@@ -356,7 +391,13 @@ impl Channel {
         }
         self.local_memory = Some((handle, address, given));
         log::info!("shader local memory {given:#x} bytes at {address:#x}");
-        Ok(Some(local_memory_methods(address, given, window)))
+        let pool = GuestPool {
+            address,
+            per_unit: given / u64::from(LOCAL_MEMORY_SMS),
+            units: LOCAL_MEMORY_SMS,
+            window,
+        };
+        Ok(Some(local_memory_methods(&pool)))
     }
 
     /// Whether this channel has a pool, in its prelude or still to come.
@@ -387,6 +428,11 @@ impl Channel {
     /// How far through the ring the GPU says it has got.
     pub fn gp_get(&self) -> u32 {
         self.area.load(CONTROL_BLOCK + GP_GET)
+    }
+
+    /// The channel's own handle, for anything that binds to the channel.
+    pub fn handle(&self) -> Handle {
+        self.channel
     }
 
     /// The ring entry that runs the prelude, in the same form as the guest's entries.
@@ -466,18 +512,24 @@ impl Channel {
     }
 }
 
-/// The compute methods that point a channel at its local-memory pool.
-fn local_memory_methods(address: u64, size: u64, window: u64) -> Vec<u32> {
+/// The compute methods that point a channel at a local-memory pool. The size is per unit, so the
+/// GPU takes `per_unit` times the units it has, up to `units`.
+pub(crate) fn local_memory_methods(pool: &GuestPool) -> Vec<u32> {
     let subchannel = COMPUTE_SUBCHANNEL;
+    let GuestPool { address, per_unit, units, window } = *pool;
     let mut words = Vec::with_capacity(11);
     words.extend([
         increasing(subchannel, SET_LOCAL_MEMORY_ADDRESS, 2),
         (address >> 32) as u32,
         address as u32,
     ]);
-    words.extend([increasing(subchannel, SET_LOCAL_MEMORY_SIZE, 2), (size >> 32) as u32, size as u32]);
+    words.extend([
+        increasing(subchannel, SET_LOCAL_MEMORY_SIZE, 2),
+        (per_unit >> 32) as u32,
+        per_unit as u32,
+    ]);
     words.extend([increasing(subchannel, SET_LOCAL_MEMORY_WINDOW, 2), (window >> 32) as u32, window as u32]);
-    words.extend([increasing(subchannel, SET_LOCAL_MEMORY_SMS, 1), LOCAL_MEMORY_SMS]);
+    words.extend([increasing(subchannel, SET_LOCAL_MEMORY_UNITS, 1), units]);
     words
 }
 
@@ -624,6 +676,39 @@ mod tests {
     }
 
     #[test]
+    fn our_pool_is_split_between_its_units() {
+        let (mut device, space) = device();
+        let mut channel = channel(&mut device, &space, Engine::Graphics);
+        channel.add_late_local_memory(&mut device, &space, 0x5000_0000, WINDOW).unwrap();
+        let ahead = RingEntry::parse(channel.entry_ahead().to_le_bytes());
+        let words = channel.area().load_words((ahead.address - AREA_ADDRESS) as usize, ahead.length as usize);
+        let per_unit = LOCAL_MEMORY_BYTES / u64::from(LOCAL_MEMORY_SMS);
+        let size = [increasing(COMPUTE_SUBCHANNEL, SET_LOCAL_MEMORY_SIZE, 2), 0, per_unit as u32];
+        assert!(words.windows(3).any(|three| three == size), "{words:x?}");
+        let units = [increasing(COMPUTE_SUBCHANNEL, SET_LOCAL_MEMORY_UNITS, 1), LOCAL_MEMORY_SMS];
+        assert!(words.windows(2).any(|two| two == units), "{words:x?}");
+        channel.close(&mut device, &space).unwrap();
+    }
+
+    #[test]
+    fn a_guest_pool_goes_after_ours_and_before_the_invalidate() {
+        let (mut device, space) = device();
+        let mut channel = channel(&mut device, &space, Engine::Graphics);
+        channel.add_late_local_memory(&mut device, &space, 0x5000_0000, WINDOW).unwrap();
+        let pool = GuestPool { address: 0x5_0580_0000, per_unit: 0x3F_0000, units: 0x55, window: WINDOW };
+        channel.add_late_pool_methods(&pool);
+        let ahead = RingEntry::parse(channel.entry_ahead().to_le_bytes());
+        let words = channel.area().load_words((ahead.address - AREA_ADDRESS) as usize, ahead.length as usize);
+        let theirs = local_memory_methods(&pool);
+        let at =
+            words.windows(theirs.len()).rposition(|run| run == theirs.as_slice()).expect("the guest's pool");
+        assert!(at > 0, "ours comes first");
+        assert!(words[at + theirs.len()..].ends_with(&l2_invalidate_words()));
+        channel.entry_ahead_placed();
+        channel.close(&mut device, &space).unwrap();
+    }
+
+    #[test]
     fn a_channel_takes_one_pool_only() {
         let (mut device, space) = device();
         let mut channel = channel(&mut device, &space, Engine::Graphics);
@@ -700,6 +785,14 @@ mod tests {
         let (mut device, space) = device();
         channel(&mut device, &space, Engine::Graphics);
         assert!(timeslices_asked_for(&device).is_empty());
+    }
+
+    #[test]
+    fn a_channel_can_be_given_a_slice_of_its_own_once_made() {
+        let (mut device, space) = device();
+        let channel = channel(&mut device, &space, Engine::Graphics);
+        channel.set_timeslice(&mut device, 250);
+        assert_eq!(timeslices_asked_for(&device), [250]);
     }
 
     #[test]

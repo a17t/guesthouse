@@ -112,7 +112,8 @@ impl AdapterAnswers {
         self.engines.get(node as usize) == Some(&ENGINE_VIDEO_ENCODE)
     }
 
-    /// Whether a node is one of the card's video decoders or encoders that can run.
+    /// Whether a node's contexts get a channel on a video engine: a decoder or an encoder that can
+    /// run, or an optical flow engine that takes contexts.
     pub fn node_is_video(&self, node: u32) -> bool {
         self.video_nodes.get(node as usize) == Some(&true)
     }
@@ -198,7 +199,7 @@ mod tests {
     }
 
     fn query(kind: u32, size: usize, data: &[u8]) -> VendorQuery<'_> {
-        VendorQuery { kind, size, data, process_is_32_bit: false }
+        VendorQuery { kind, size, data, process_is_32_bit: false, program: "" }
     }
 
     #[test]
@@ -243,7 +244,7 @@ mod tests {
     #[test]
     fn a_32_bit_process_gets_the_32_bit_driver() {
         let mut out = Vec::new();
-        let query = VendorQuery { kind: 1, size: 8, data: &[0; 8], process_is_32_bit: true };
+        let query = VendorQuery { kind: 1, size: 8, data: &[0; 8], process_is_32_bit: true, program: "" };
         answers().answer(&query, &mut out);
         let name: Vec<u16> =
             out[4..].as_chunks::<2>().0.iter().map(|unit| u16::from_le_bytes(*unit)).collect();

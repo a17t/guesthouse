@@ -1,10 +1,13 @@
 //! What the compositor says each monitor expects, through the Wayland colour management protocol. A
-//! monitor in HDR expects PQ, the transfer function HDR10 is sent in. KWin, Mutter 48 and others offer
-//! it, so this works on any desktop that has it, where Mutter's D-Bus only works on GNOME.
+//! monitor in HDR either expects PQ, the transfer function HDR10 is sent in, or has room above SDR
+//! white: KWin 6.8 describes an HDR monitor as gamma 2.2 in BT.2020 with its peak above its reference
+//! white. KWin, Mutter 48 and others offer the protocol, so this works on any desktop that has it,
+//! where Mutter's D-Bus only works on GNOME.
 //!
 //! Like the pointer lock, this lives on GTK's own connection with a queue of its own. GTK goes on
 //! reading the socket for everyone, and `catch_up` takes in what landed on this queue.
 
+use crate::viewer::own_surface_takes_hdr;
 use gdk_wayland::prelude::*;
 use gdk_wayland::{WaylandDisplay, WaylandMonitor};
 use gtk::gdk;
@@ -17,7 +20,7 @@ use wayland_protocols::wp::color_management::v1::client::wp_color_management_out
     self, WpColorManagementOutputV1,
 };
 use wayland_protocols::wp::color_management::v1::client::wp_color_manager_v1::{
-    TransferFunction, WpColorManagerV1,
+    self, Feature, Primaries, RenderIntent, TransferFunction, WpColorManagerV1,
 };
 use wayland_protocols::wp::color_management::v1::client::wp_image_description_info_v1::{
     self, WpImageDescriptionInfoV1,
@@ -26,9 +29,10 @@ use wayland_protocols::wp::color_management::v1::client::wp_image_description_v1
     self, WpImageDescriptionV1,
 };
 
-/// Version 1 has all this needs. Later ones say `ready2` where 1 says `ready`, and both are handled.
-const OLDEST_VERSION: u32 = 1;
-const NEWEST_VERSION: u32 = 3;
+/// The version GTK 4.24 binds, so that this is told what GTK is told. A compositor answers each
+/// version in its own terms: Mutter 51 names sRGB's transfer function to version 1 and the compound
+/// power curve in its place to version 2, and GTK looks for the first.
+const GTK_VERSION: u32 = 1;
 /// An output's description takes two round trips: one for it to be ready, one for what it says.
 const ROUND_TRIPS_TO_SETTLE: usize = 3;
 
@@ -41,11 +45,22 @@ enum Seen {
     Failed,
 }
 
-/// What a whole description says. One that names no transfer function is an ICC profile's, and those
-/// are for SDR screens.
-fn seen_in(transfer: Option<WEnum<TransferFunction>>) -> Seen {
-    match transfer {
+/// What a description has said so far.
+#[derive(Debug, Clone, Copy, Default)]
+struct Reading {
+    transfer: Option<WEnum<TransferFunction>>,
+    /// The peak and the reference white, in cd/m².
+    luminances: Option<(u32, u32)>,
+}
+
+/// What a whole description says. One that names no transfer function and no luminances is an ICC
+/// profile's, and those are for SDR screens. A peak at the reference white leaves HDR no room, which is
+/// how a monitor in HDR looks with its SDR brightness all the way up.
+fn seen_in(reading: Reading) -> Seen {
+    let headroom = reading.luminances.is_some_and(|(peak, reference)| peak > reference);
+    match reading.transfer {
         Some(WEnum::Value(TransferFunction::St2084Pq)) => Seen::Hdr,
+        _ if headroom => Seen::Hdr,
         _ => Seen::Sdr,
     }
 }
@@ -63,6 +78,45 @@ fn answer_from(seen: impl IntoIterator<Item = Option<Seen>>) -> ScreenHdr {
     if any_said { ScreenHdr::Cannot } else { ScreenHdr::CantTell }
 }
 
+/// What the compositor's colour manager says it can do, as far as GTK's choice depends on it.
+#[derive(Debug, Clone, Copy, Default)]
+struct Offered {
+    parametric: bool,
+    set_primaries: bool,
+    srgb_transfer: bool,
+    pq_transfer: bool,
+    srgb_primaries: bool,
+    perceptual: bool,
+}
+
+impl Offered {
+    /// GTK uses the compositor's colour management only with all of these, and without it, it turns
+    /// HDR frames into SDR itself (`gdk_wayland_color_set_color_manager`'s checks in GTK 4.24's
+    /// gdkwaylandcolor.c). KWin 6.8 has no named sRGB transfer function, so GTK goes without there.
+    fn gtk_takes_it(self) -> bool {
+        self.parametric
+            && self.srgb_transfer
+            && (self.srgb_primaries || self.set_primaries)
+            && self.perceptual
+    }
+
+    /// The viewer's own surface describes HDR frames itself, as PQ in parametric terms.
+    fn own_surface_could_take_it(self) -> bool {
+        self.parametric && self.pq_transfer && self.perceptual
+    }
+
+    /// What becomes of a screen's answer on the way through the toolkit. `own_surface` is whether
+    /// the viewer's own surface is there to pass HDR on, as far as anyone has seen.
+    fn passed_on(self, answer: ScreenHdr, own_surface: bool) -> ScreenHdr {
+        match answer {
+            ScreenHdr::Shows if self.gtk_takes_it() => ScreenHdr::Shows,
+            ScreenHdr::Shows if own_surface && self.own_surface_could_take_it() => ScreenHdr::ShowsDirect,
+            ScreenHdr::Shows => ScreenHdr::ToolkitCant,
+            answer => answer,
+        }
+    }
+}
+
 /// Tells one output's objects from another's. A plain number, as the protocol's objects carry it.
 type OutputKey = u32;
 
@@ -70,8 +124,8 @@ struct Output {
     key: OutputKey,
     monitor: gdk::Monitor,
     colour: WpColorManagementOutputV1,
-    /// The transfer function of the description being read now.
-    reading: Option<WEnum<TransferFunction>>,
+    /// The description being read now.
+    reading: Reading,
     seen: Option<Seen>,
 }
 
@@ -79,6 +133,7 @@ struct Output {
 struct Outputs {
     list: Vec<Output>,
     next_key: OutputKey,
+    offered: Offered,
 }
 
 impl Outputs {
@@ -99,16 +154,43 @@ impl Dispatch<WlRegistry, GlobalListContents> for Outputs {
     }
 }
 
-/// The manager only lists what the compositor supports, and outputs don't need any of it.
+/// The manager lists what the compositor supports, which says whether GTK will use it.
 impl Dispatch<WpColorManagerV1, ()> for Outputs {
     fn event(
-        _: &mut Self,
+        outputs: &mut Self,
         _: &WpColorManagerV1,
-        _: <WpColorManagerV1 as Proxy>::Event,
+        event: wp_color_manager_v1::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        let offered = &mut outputs.offered;
+        match event {
+            wp_color_manager_v1::Event::SupportedFeature { feature: WEnum::Value(feature) } => {
+                match feature {
+                    Feature::Parametric => offered.parametric = true,
+                    Feature::SetPrimaries => offered.set_primaries = true,
+                    _ => {}
+                }
+            }
+            wp_color_manager_v1::Event::SupportedTfNamed { tf: WEnum::Value(TransferFunction::Srgb) } => {
+                offered.srgb_transfer = true;
+            }
+            wp_color_manager_v1::Event::SupportedTfNamed { tf: WEnum::Value(TransferFunction::St2084Pq) } => {
+                offered.pq_transfer = true;
+            }
+            wp_color_manager_v1::Event::SupportedPrimariesNamed {
+                primaries: WEnum::Value(Primaries::Srgb),
+            } => {
+                offered.srgb_primaries = true;
+            }
+            wp_color_manager_v1::Event::SupportedIntent {
+                render_intent: WEnum::Value(RenderIntent::Perceptual),
+            } => {
+                offered.perceptual = true;
+            }
+            _ => {}
+        }
     }
 }
 
@@ -140,7 +222,7 @@ impl Dispatch<WpImageDescriptionV1, OutputKey> for Outputs {
         match event {
             wp_image_description_v1::Event::Ready { .. } | wp_image_description_v1::Event::Ready2 { .. } => {
                 if let Some(output) = outputs.get(*key) {
-                    output.reading = None;
+                    output.reading = Reading::default();
                 }
                 description.get_information(handle, *key);
             }
@@ -167,8 +249,13 @@ impl Dispatch<WpImageDescriptionInfoV1, OutputKey> for Outputs {
     ) {
         let Some(output) = outputs.get(*key) else { return };
         match event {
-            wp_image_description_info_v1::Event::TfNamed { tf } => output.reading = Some(tf),
-            wp_image_description_info_v1::Event::Done => output.seen = Some(seen_in(output.reading.take())),
+            wp_image_description_info_v1::Event::TfNamed { tf } => output.reading.transfer = Some(tf),
+            wp_image_description_info_v1::Event::Luminances { max_lum, reference_lum, .. } => {
+                output.reading.luminances = Some((max_lum, reference_lum));
+            }
+            wp_image_description_info_v1::Event::Done => {
+                output.seen = Some(seen_in(std::mem::take(&mut output.reading)));
+            }
             _ => {}
         }
     }
@@ -187,7 +274,7 @@ impl OutputColours {
         let backend = display.wl_display()?.backend().upgrade()?;
         let connection = Connection::from_backend(backend);
         let (globals, queue) = registry_queue_init::<Outputs>(&connection).ok()?;
-        let manager = globals.bind(&queue.handle(), OLDEST_VERSION..=NEWEST_VERSION, ()).ok()?;
+        let manager = globals.bind(&queue.handle(), GTK_VERSION..=GTK_VERSION, ()).ok()?;
         Some(Self { manager, queue: RefCell::new(queue), outputs: RefCell::default() })
     }
 
@@ -213,7 +300,13 @@ impl OutputColours {
             outputs.next_key += 1;
             let colour = self.manager.get_output(&wayland, &handle, key);
             colour.get_image_description(&handle, key);
-            outputs.list.push(Output { key, monitor: monitor.clone(), colour, reading: None, seen: None });
+            outputs.list.push(Output {
+                key,
+                monitor: monitor.clone(),
+                colour,
+                reading: Reading::default(),
+                seen: None,
+            });
         }
         let _ = queue.flush();
     }
@@ -241,7 +334,7 @@ impl OutputColours {
     pub fn answer(&self, on: &[gdk::Monitor]) -> ScreenHdr {
         let outputs = self.outputs.borrow();
         let shown = outputs.list.iter().filter(|output| on.is_empty() || on.contains(&output.monitor));
-        answer_from(shown.map(|output| output.seen))
+        outputs.offered.passed_on(answer_from(shown.map(|output| output.seen)), own_surface_takes_hdr())
     }
 }
 
@@ -249,14 +342,60 @@ impl OutputColours {
 mod tests {
     use super::*;
 
+    fn named(transfer: TransferFunction, luminances: Option<(u32, u32)>) -> Reading {
+        Reading { transfer: Some(WEnum::Value(transfer)), luminances }
+    }
+
     #[test]
-    fn pq_is_hdr_and_anything_else_is_not() {
-        assert_eq!(seen_in(Some(WEnum::Value(TransferFunction::St2084Pq))), Seen::Hdr);
+    fn pq_is_hdr_and_anything_else_without_headroom_is_not() {
+        assert_eq!(seen_in(named(TransferFunction::St2084Pq, None)), Seen::Hdr);
         for other in [TransferFunction::Gamma22, TransferFunction::Srgb, TransferFunction::Hlg] {
-            assert_eq!(seen_in(Some(WEnum::Value(other))), Seen::Sdr, "{other:?}");
+            assert_eq!(seen_in(named(other, None)), Seen::Sdr, "{other:?}");
+            assert_eq!(seen_in(named(other, Some((80, 80)))), Seen::Sdr, "{other:?}");
         }
-        assert_eq!(seen_in(Some(WEnum::Unknown(99))), Seen::Sdr);
-        assert_eq!(seen_in(None), Seen::Sdr);
+        assert_eq!(seen_in(Reading { transfer: Some(WEnum::Unknown(99)), luminances: None }), Seen::Sdr);
+        assert_eq!(seen_in(Reading::default()), Seen::Sdr);
+    }
+
+    #[test]
+    fn kwins_hdr_monitor_is_gamma_22_with_room_above_sdr_white() {
+        // As KWin 6.8 describes a monitor with HDR on: BT.2020, gamma 2.2, peak 508, reference 265.
+        assert_eq!(seen_in(named(TransferFunction::Gamma22, Some((508, 265)))), Seen::Hdr);
+        // The same monitor with its SDR brightness at the peak has no room left.
+        assert_eq!(seen_in(named(TransferFunction::Gamma22, Some((400, 400)))), Seen::Sdr);
+    }
+
+    #[test]
+    fn hdr_gtk_cant_pass_on_needs_the_own_surface() {
+        let kwin = Offered {
+            parametric: true,
+            set_primaries: true,
+            pq_transfer: true,
+            perceptual: true,
+            ..Offered::default()
+        };
+        assert_eq!(kwin.passed_on(ScreenHdr::Shows, true), ScreenHdr::ShowsDirect);
+        assert_eq!(kwin.passed_on(ScreenHdr::Shows, false), ScreenHdr::ToolkitCant, "refused, or kept off");
+        let no_pq = Offered { pq_transfer: false, ..kwin };
+        assert_eq!(no_pq.passed_on(ScreenHdr::Shows, true), ScreenHdr::ToolkitCant);
+        let mutter = Offered { srgb_transfer: true, ..kwin };
+        assert_eq!(mutter.passed_on(ScreenHdr::Shows, false), ScreenHdr::Shows, "GTK passes it on itself");
+        assert_eq!(kwin.passed_on(ScreenHdr::Cannot, true), ScreenHdr::Cannot);
+    }
+
+    #[test]
+    fn gtk_goes_without_on_kwin_68() {
+        // What KWin 6.8 offers: parametric, set_primaries, perceptual, but no named sRGB transfer.
+        let kwin = Offered {
+            parametric: true,
+            set_primaries: true,
+            srgb_primaries: true,
+            perceptual: true,
+            ..Default::default()
+        };
+        assert!(!kwin.gtk_takes_it());
+        assert!(Offered { srgb_transfer: true, ..kwin }.gtk_takes_it());
+        assert!(!Offered { srgb_transfer: true, perceptual: false, ..kwin }.gtk_takes_it());
     }
 
     #[test]

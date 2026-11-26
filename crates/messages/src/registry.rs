@@ -24,6 +24,7 @@ const TRANSLATED_PATH_ROOM: usize = 0x10;
 
 /// The value types the guest distinguishes.
 pub const TYPE_STRING: u32 = 1;
+pub const TYPE_BINARY: u32 = 3;
 pub const TYPE_NUMBER: u32 = 4;
 pub const TYPE_STRING_LIST: u32 = 7;
 
@@ -134,6 +135,18 @@ mod tests {
         let mut out = Vec::new();
         RegistryQuery::parse(&bytes).unwrap().answer(b"abcd", &mut out).unwrap();
         assert_eq!(u32_at(&out, OUTPUT_SIZE), Ok(4 + TRANSLATED_PATH_ROOM as u32));
+    }
+
+    #[test]
+    fn a_service_key_value_is_found_by_name_and_gets_no_path_room() {
+        // How NGX asks for its folder: kind 0, no translate flag.
+        let bytes = buffer(0, 0, "NGXCore\\NGXPath", 2);
+        let query = RegistryQuery::parse(&bytes).unwrap();
+        assert_eq!(query.name, RegistryName::Value("NGXCore\\NGXPath".into()));
+        let mut out = Vec::new();
+        query.answer(b"abcd", &mut out).unwrap();
+        assert_eq!(u32_at(&out, OUTPUT_SIZE), Ok(4));
+        assert_eq!(u32_at(&out, OUTPUT_STATUS), Ok(STATUS_OVERFLOW));
     }
 
     #[test]

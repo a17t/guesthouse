@@ -1,0 +1,81 @@
+# Formatting, lints and tests for the Rust workspace. None of it needs a GPU.
+# It runs in the same Fedora image packaging/Containerfile builds the app in, as the app needs GTK 4.16.
+name: Checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  rustfmt:
+    name: rustfmt
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    container: registry.fedoraproject.org/fedora:44
+    steps:
+      - name: Install Rust
+        run: dnf -y install git rust cargo rustfmt
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: cargo fmt --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container: registry.fedoraproject.org/fedora:44
+    steps:
+      # The packages are packaging/Containerfile's, plus clippy, tar and zstd for the cache.
+      - name: Install what the build needs
+        run: dnf -y install gcc git xz findutils which binutils pkgconf-pkg-config rust cargo clippy gtk4-devel libadwaita-devel tar zstd
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: fedora-44
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
+  tests:
+    name: tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container:
+      image: registry.fedoraproject.org/fedora:44
+      # Docker's default filter blocks personality(), which the jail's tests use through setarch, and
+      # what bubblewrap needs for its namespaces. The runner is a throwaway machine.
+      options: --security-opt seccomp=unconfined
+    steps:
+      # The build's packages, and the tools the app's tests run for real on disk images and ISOs.
+      - name: Install what the build and the tests need
+        run: |
+          dnf -y install gcc git xz findutils which binutils pkgconf-pkg-config rust cargo gtk4-devel \
+            libadwaita-devel tar zstd qemu-img p7zip p7zip-plugins genisoimage swtpm openssl \
+            openssh-clients bubblewrap util-linux shadow-utils
+          # Some tests check that a file with no permissions can't be read, which root can do. The tests
+          # run as an ordinary user, as they do on a PC.
+          useradd --create-home tester
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: fedora-44-tests
+          cache-directories: /home/tester/.cargo
+      - name: Test
+        run: |
+          chown -R tester:tester "$GITHUB_WORKSPACE" /home/tester
+          runuser -u tester -- env HOME=/home/tester cargo test --locked --workspace

@@ -2,7 +2,7 @@
 
 The Windows numbers here are from the Python prototype unless I say otherwise. The Linux numbers are from the device in this repo.
 
-The NVIDIA numbers were all measured on one machine: Ryzen 9 9950X3D, RTX 5090, Fedora 45, NVIDIA 615.78.08 on the host and 617.42 in Windows. Host driver 620 works for Windows guests too, and Linux guests still need 615.
+The NVIDIA numbers were all measured on one machine: Ryzen 9 9950X3D, RTX 5090, Fedora 45, NVIDIA 615.78.08 on the host and 617.42 in Windows. Host driver 620 works for Windows guests too, and 620.70.06 for Linux guests.
 
 ### Windows guests
 
@@ -21,7 +21,7 @@ Direct3D 12, Direct3D 11, Vulkan and OpenGL all run on the real card, along with
 
 Once work reaches the card it runs at full speed. Getting it there costs a few µs more than on the host. The prototype took 240 µs for that round trip.
 
-**How fast is a real program?** Superposition at 1080p Extreme in Direct3D 11 scores about **21,850** in Windows on 0.4.0, over five runs with no viewer open. The Windows build through Proton on the same PC's Linux host gets 24,606, so that's about 89%. The card is 98% busy, and I have no lead on the rest, so I take it as about what running through a VM costs. OpenGL is further behind, about 12,400 against 22,810 on the host, so about 54% ([#122](https://github.com/xnixy/guesthouse/issues/122)).
+**How fast is a real program?** Superposition at 1080p Extreme in Direct3D 11 scores about **21,850** in Windows on 0.4.0, over five runs with no viewer open. The Windows build through Proton on the same PC's Linux host gets 24,606, so that's about 89%. The card is 98% busy, and I have no lead on the rest, so I take it as about what running through a VM costs. OpenGL is further behind, about 12,400 against 22,810 on the host, so about 54%. That gap was NVIDIA's driver presenting OpenGL through a copy of every frame in memory ([#122](https://github.com/ruxnhq/guesthouse/issues/122)). It presents through DXGI now, as below, and I haven't run Superposition again since.
 
 I used to compare with the lowest 5090 on Unigine's leaderboard, around 31,000, and call it two thirds. That was other people's cards on native Windows, so it wasn't a fair comparison.
 
@@ -31,9 +31,15 @@ I used to compare with the lowest 5090 on Unigine's leaderboard, around 31,000, 
 
 *Dumps of the guest's real screen from an earlier version, shrunk for this page. The running shot is from an earlier run at the same settings. The result screen says "GPU: NVIDIA" because the launcher can't read the card's name yet, and its RAM line is wrong: the VM had 16 GB.*
 
-A heavy Godot test scene at 1280x720 does about 690 fps natively. In the VM the prototype does about 196 on Vulkan and 158–186 on Direct3D 12, and the Rust daemon about 240 and 333. GPU time per frame is the same as native, about 1.2 ms, so that gap isn't the GPU either. In Direct3D 12 it's the program's queues waiting on each other ([#175](https://github.com/xnixy/guesthouse/issues/175)).
+Godot's test scenes in Direct3D 12 run at about 850 fps for the light one and about 390 for the heavy one, on 0.6.1 with host driver 620. Before 0.6.1 they did about 590 and 320. A program's Direct3D 12 queues take turns on the card, and since 0.6.1 each gets a shorter slice, so that wait is shorter and not gone ([#175](https://github.com/ruxnhq/guesthouse/issues/175)).
 
-**For the best speed, run games fullscreen, and pick Direct3D 12 where a game offers it.** In a window, Direct3D 11 and OpenGL games, and Vulkan with vsync off, present through a copy the CPU has to wait on. That can cost up to half the frame rate. Fullscreen Direct3D 11 and Direct3D 12 don't, and neither does Vulkan with vsync on. [#123](https://github.com/xnixy/guesthouse/issues/123) tracks a proper fix.
+**Vulkan and OpenGL on NVIDIA present without a copy.** By default NVIDIA's driver presents OpenGL, and Vulkan with vsync off, through a copy of every frame the CPU has to wait on, and in the VM that can cost up to half the frame rate. With **Faster programs in a window** on, the machine sets three of the driver's own settings in its global profile at every start, so both present through DXGI on the card. My test window went from about 1,000 frames a second to about 1,300 in Vulkan and 2,000 in OpenGL, and fullscreen from about 750 to 1,350 and 2,200, with the picture the same to the pixel. Under a heavy load Vulkan matches Direct3D 12. A program with its own NVIDIA profile value keeps it, and so does a value you set in the global profile yourself.
+
+Our display used to carry the name of Microsoft's remote desktop display, as NVIDIA's OpenGL and Vulkan driver only found its GPU through a display like that. Once Windows sees NVIDIA's vendor number on the render device, the driver finds the GPU without it, and the name only got in the way: OpenGL was composed through a copy of its window, and no Vulkan program could import memory from Direct3D or another Vulkan device, which capture tools and interop need. So on NVIDIA machines that show NVIDIA's number, the display is now called "Guesthouse Display", from the start after the one that names it.
+
+Direct3D 11 in a window had the same copy, because Windows only spares it for programs it counts as games. A machine's **Faster programs in a window** setting, which is on unless you turn it off, tells Windows to treat every program outside the Windows folder that way. My test window went from about 1,150 frames a second to 4,300 with it, and windowed Superposition stopped copying. It goes by folder, one entry for each folder at the top of a drive, so a program in a folder made since the machine last started waits for the next start. A program you gave its own "Optimizations for windowed games" choice in Windows' graphics settings keeps the copy. Turn the setting off if a program's window flickers or stays blank, and Windows and the driver's profile get back exactly what they had. The display's name below isn't part of the setting, as it helps whatever the setting says.
+
+**Copies wait on the card's interrupt.** On NVIDIA, the daemon's own copies, such as each frame for the viewer, used to keep a CPU core spinning until they ended. Now they spin for 200 µs and then sleep until the card's interrupt says the copy is done. A tester with an RTX 5090 found games and video smoother with it, and in a game far fewer submissions had to wait for room, 0.5% against 3.9%. I haven't measured it on my own card yet. If copies seem slow or a machine stutters, set `GUESTHOUSE_WAKES=0` in the environment the app or `guesthouse-vm` starts the machine from, and the copies spin as before. If the driver can't set it up, the daemon goes back to spinning by itself and says so in its log.
 
 **Is the picture right?** I don't judge that by eye. These tests compare exact values, and the Vulkan and OpenGL ones check the final screen pixel by pixel:
 
@@ -47,9 +53,11 @@ A heavy Godot test scene at 1280x720 does about 690 fps natively. In the VM the 
 
 Encoding through ffmpeg comes out clean too: 300 frames each of H.264, HEVC and AV1, with 0 errors, and the worst frame around 43 dB against the source. NVENC stops at the card's session limit, the same as it does natively.
 
+A program that asks Media Foundation for a hardware encoder finds NVIDIA's too. The driver's INF registers them on a PC, and a guest never installs it, so each start registers what that INF asks for the machine's card. With them registered, ffmpeg's `h264_mf` and `hevc_mf` encoded on an RTX 3080 Ti with driver 617.42 in Windows, 60 frames of 60.
+
 ### Windows on AMD
 
-This is experimental. These numbers are from the integrated RDNA2 Radeon in the same Ryzen, with AMD's driver 32.0.21045.20006 in Windows. The same pixel tests pass there: the Direct3D 11 triangle matches WARP exactly, and Vulkan and OpenGL windows come out with 0 wrong pixels. My present test does about 63 fps on Vulkan and 35 on OpenGL, where each frame still waits on its copy to the screen. There's no hardware video decode yet. On a tester's RX 9070 XT, Superposition at 720p Low reaches 65% of the same card on the host, and 4K Optimized 72%. That's on main, in the next release. More in [AMD](amd.md).
+This is experimental. These numbers are from the integrated RDNA2 Radeon in the same Ryzen, with AMD's driver 32.0.21045.20006 in Windows. The same pixel tests pass there: the Direct3D 11 triangle matches WARP exactly, and Vulkan and OpenGL windows come out with 0 wrong pixels. There's no hardware video decode yet. On a tester's RX 9070 XT, Superposition at 720p Low went from 21,920 to 36,903 with the speed work in 0.5.2, and 4K Optimized reaches 72% of the same card on the host. More in [AMD](amd.md).
 
 ### Linux guests
 
@@ -63,7 +71,7 @@ Linux takes a different route. The guest runs NVIDIA's real Linux driver and its
 
 That's `nvidia-smi` and a small CUDA test of mine, on the guest's own desktop. The load and memory it shows are for the whole card, because other VMs were using it at the time.
 
-In theory this route isn't tied to the 5090 the way the Windows one is. It forwards the real driver's calls, so it should work on anything NVIDIA's open driver supports, from the 20 series up, as long as its tables get rebuilt for that driver version. That's only theory for now: it has run on my 5090, on driver 615.78.08, with an AMD CPU, and nothing else.
+In theory this route isn't tied to the 5090 the way the Windows one is. It forwards the real driver's calls, so it should work on anything NVIDIA's open driver supports, from the 20 series up, as long as its tables get rebuilt for that driver version. That's only theory for now: it has run on my 5090, on drivers 615.78.08 and 620.70.06, with an AMD CPU, and nothing else.
 
 Delay is where it's behind. A simple app takes about 20 to 30 ms from key press to picture, against about 11.5 on the host, and Godot takes 40 to 100 ms, more on Vulkan than OpenGL.
 

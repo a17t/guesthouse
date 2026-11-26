@@ -22,10 +22,12 @@ guesthouse-app-core.workspace = true
 # The UI. These are the oldest that do: what Ubuntu 24.04 has.
 adw = { package = "libadwaita", version = "0.9", features = ["v1_5"] }
 gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
+# The icon in the desktop's tray, over D-Bus. GTK has nothing for one.
+ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
 # Progress from a thread to GTK's main loop, which glib no longer has a channel for.
 async-channel = "2"
 # Local time for snapshot dates.
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+jiff = { version = "1", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 # The slot type that names a VM.
 guesthouse-daemon.workspace = true
 # Locking the pointer, and asking whether a monitor is in HDR: GTK has no API for the Wayland
@@ -37,6 +39,9 @@ wayland-protocols = { version = "0.32", features = ["client", "staging", "unstab
 guesthouse-frame-socket.workspace = true
 # Reading a shared buffer and passing QEMU a socket, without `unsafe`.
 rustix = { version = "1", features = ["fs", "net"] }
+# App windows let go of what they hold down in the guest on SIGTERM and SIGINT.
+# glib's own main loop takes the signals, as nothing else here may install a handler.
+glib-unix = "0.22"
 # What the app remembers is a small JSON file.
 serde_json = "1"
 

@@ -1,0 +1,159 @@
+//! A rectangle of the guest's frame shown in a host window or popup with no copy: the frame's own
+//! buffer goes on a surface of this view's own over GTK's (`OwnSurface`), its viewport's source the
+//! rectangle and its destination the place `CellPicture` says. GTK draws none of it. Every consumer
+//! of a part of the frame (an app window, a popup, the secure desktop's window) shows it this way.
+
+use super::cell_picture::CellPicture;
+use super::hub::Hub;
+use crate::viewer::own_surface::{NotShown, OwnSurface};
+use crate::viewer::slot_hold::HeldFrame;
+use gtk::gdk;
+use gtk::prelude::*;
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
+
+pub struct Framed {
+    /// For the log.
+    name: String,
+    picture: CellPicture,
+    /// The surface the frames go on, over GTK's surface it was made for.
+    own: RefCell<Option<(gdk::Surface, OwnSurface)>>,
+    /// The newest frame is still to be shown here: the surface wasn't there yet, the compositor
+    /// hadn't made its buffer, or the window was out of sight.
+    behind: Cell<bool>,
+    /// The picture was taken off while the window is out of sight, so it holds no slot.
+    hidden: Cell<bool>,
+    /// GTK's surface the compositor couldn't put a surface of the view's own over: not asked again
+    /// until GTK makes another, as each try waits on the compositor.
+    refused_on: RefCell<Option<gdk::Surface>>,
+    /// The reasons a frame could never be shown that the log has had, each said once.
+    said: RefCell<HashSet<NotShown>>,
+}
+
+impl Framed {
+    pub fn new(name: &str, picture: &CellPicture) -> Self {
+        Self {
+            name: name.to_owned(),
+            picture: picture.clone(),
+            own: RefCell::default(),
+            behind: Cell::new(true),
+            hidden: Cell::new(false),
+            refused_on: RefCell::default(),
+            said: RefCell::default(),
+        }
+    }
+
+    /// Puts the frame's buffer on the own surface, cut to the rectangle. A window out of sight shows
+    /// none and holds no slot: the compositor would keep the buffer of a surface it never draws.
+    pub fn show(&self, hub: &Hub, frame: &HeldFrame, sdr_white_nits: Option<u32>, out_of_sight: bool) {
+        if out_of_sight {
+            self.behind.set(true);
+            if !self.hidden.replace(true)
+                && let Some((_, own)) = self.own.borrow_mut().as_mut()
+            {
+                own.hide();
+            }
+            return;
+        }
+        self.hidden.set(false);
+        let Some(((x, y, width, height), crop)) = self.picture.picture_place() else {
+            self.behind.set(true);
+            return;
+        };
+        if !self.own_surface(hub) {
+            self.behind.set(true);
+            return;
+        }
+        let mut own = self.own.borrow_mut();
+        let Some((_, own)) = own.as_mut() else { return };
+        own.place(x, y, width, height);
+        let _ = own.set_crop(Some(crop));
+        match own.show(frame.for_reader(), sdr_white_nits) {
+            Ok(()) => self.behind.set(false),
+            Err(not_shown) => {
+                self.behind.set(not_shown.may_later());
+                if !not_shown.may_later() && self.said.borrow_mut().insert(not_shown) {
+                    hub.note(&format!("{}: the window stays empty, as {}", self.name, not_shown.why()));
+                }
+            }
+        }
+        for note in own.take_notes() {
+            hub.trace(&format!("{}: {note}", self.name));
+        }
+    }
+
+    /// Takes in what the compositor gave back, follows a new place under a still guest, and shows
+    /// `newest` if this is behind or back in sight.
+    pub fn tick(
+        &self,
+        hub: &Hub,
+        newest: Option<&HeldFrame>,
+        sdr_white_nits: Option<u32>,
+        out_of_sight: bool,
+    ) {
+        // GTK made another surface for the picture, or has none now (the widget left its window):
+        // the own surface goes with the one it was made for, before anything is sent to it. A popup
+        // put down and up again keeps its surface (GTK 4.24 swaps only its xdg_popup, measured).
+        let current = self.picture.native().and_then(|native| native.surface());
+        let gone = self.own.borrow().as_ref().is_some_and(|(made_for, _)| current.as_ref() != Some(made_for));
+        if gone {
+            self.end();
+        }
+        if let Some((_, own)) = self.own.borrow_mut().as_mut() {
+            own.catch_up();
+            if !self.hidden.get()
+                && let Some(((x, y, width, height), crop)) = self.picture.picture_place()
+            {
+                own.place(x, y, width, height);
+                if own.set_crop(Some(crop)) {
+                    self.behind.set(true);
+                }
+            }
+        }
+        let back_in_sight = self.hidden.get() && !out_of_sight;
+        if (self.behind.get() || back_in_sight)
+            && let Some(frame) = newest
+        {
+            self.show(hub, frame, sdr_white_nits, out_of_sight);
+        }
+    }
+
+    /// Lets go of the own surface, before GTK's goes or is taken down. The next frame or tick makes
+    /// another if GTK's is up again.
+    pub fn end(&self) {
+        if self.own.borrow_mut().take().is_some() {
+            self.behind.set(true);
+        }
+    }
+
+    /// The own surface over GTK's, made when GTK's is there, and again if GTK made another.
+    fn own_surface(&self, hub: &Hub) -> bool {
+        let Some(surface) = self.picture.native().and_then(|native| native.surface()) else { return false };
+        if !surface.is_mapped() {
+            return false;
+        }
+        let mut own = self.own.borrow_mut();
+        if own.as_ref().is_some_and(|(made_for, _)| *made_for == surface) {
+            return true;
+        }
+        own.take();
+        if self.refused_on.borrow().as_ref() == Some(&surface) {
+            return false;
+        }
+        match OwnSurface::new_above(&surface.display(), &surface) {
+            Ok(mut made) => {
+                made.set_cut_buffers(true);
+                *own = Some((surface, made));
+                true
+            }
+            Err(why) => {
+                hub.note(&format!(
+                    "{}: the window stays empty, as {why}: the program's picture needs it",
+                    self.name
+                ));
+                self.refused_on.replace(Some(surface));
+                false
+            }
+        }
+    }
+}

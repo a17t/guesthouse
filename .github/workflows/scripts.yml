@@ -1,0 +1,46 @@
+# Lints for the shell and PowerShell in the repo.
+name: Scripts
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scripts-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check every shell script
+        run: |
+          shellcheck --version
+          git ls-files -z '*.sh' | xargs -0 shellcheck --severity=warning
+
+  psscriptanalyzer:
+    name: PSScriptAnalyzer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check every PowerShell script
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+          $found = git ls-files '*.ps1' | ForEach-Object {
+            Invoke-ScriptAnalyzer -Path $_ -Settings .github/PSScriptAnalyzerSettings.psd1
+          }
+          $found | Format-Table -AutoSize -Wrap | Out-String -Width 200 | Write-Host
+          if ($found) { exit 1 }

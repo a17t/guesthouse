@@ -1,0 +1,12 @@
+# The workflow passes --severity=warning. The notes are mostly flags split on purpose, and sudo with a
+# redirect from the terminal, and rewriting scripts for them is not worth it.
+
+# Variables a script gets from the file that sources it, or from the test runner.
+disable=SC2154
+# Variables the sourcing script uses.
+disable=SC2034
+# Files that are sourced and not run, so they have no shebang.
+disable=SC2148
+# Helpers that take an argument some of the time. Shellcheck says it for the ones called with none.
+disable=SC2119
+disable=SC2120

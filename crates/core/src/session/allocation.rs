@@ -3,10 +3,10 @@
 use super::{Handled, Session, answer_status};
 use crate::deferred::{DeferredAction, FreedAllocation};
 use crate::gpu_addresses::ADDRESSES_END;
-use crate::pending::QueueAction;
-use crate::tables::{Allocation, Queue};
+use crate::tables::Allocation;
 use guesthouse_backend::{
-    AllocationShape, Backend, GuestMemory, MapRequest, MemoryKind, SurfaceShape, UnmapRequest,
+    AllocationShape, Backend, BackendError, GuestMemory, MapRequest, MemoryId, MemoryKind, SurfaceShape,
+    UnmapRequest,
 };
 use guesthouse_messages::address::PAGE_SIZE;
 use guesthouse_messages::allocation::{
@@ -50,6 +50,14 @@ fn standard_shape(record: &StandardRecord) -> AllocationShape {
 }
 
 impl<B: Backend, M: GuestMemory> Session<B, M> {
+    /// Lets the GPU reach guest memory mapped in this process, by its file where the memory has one.
+    fn adopt_guest_pages(&mut self, host_address: u64, size: u64) -> Result<MemoryId, BackendError> {
+        match self.memory.file_pages(host_address, size) {
+            Some(pages) => self.backend.adopt_file_pages(host_address, size, &pages),
+            None => self.backend.adopt_host_pages(host_address, size),
+        }
+    }
+
     fn shape_of(&mut self, private: &[u8]) -> AllocationShape {
         match self.standard_shape_of(private) {
             Some(shape) => shape,
@@ -85,16 +93,56 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
         Ok(())
     }
 
-    /// Guest memory does not count: it is not on the card.
-    fn over_video_cap(&self, cap: u64, wanted: u64) -> bool {
-        let used = self
-            .allocations
-            .values()
-            .filter(|allocation| {
-                allocation.memory.is_some() && allocation.guest_address.is_none() && allocation.view.is_none()
-            })
-            .map(|allocation| allocation.size);
-        used.fold(wanted, u64::saturating_add) > cap
+    /// The video memory the guest's allocations hold. Guest memory does not count: it is not on
+    /// the card.
+    pub(super) fn video_in_use(&self) -> u64 {
+        let on_card =
+            self.allocations.values().filter(|allocation| holds_memory(allocation) && !allocation.spilled);
+        on_card.map(|allocation| allocation.size).fold(0, u64::saturating_add)
+    }
+
+    /// The system memory allocations hold that the card had no room for.
+    pub(super) fn spilled_in_use(&self) -> u64 {
+        let spilled =
+            self.allocations.values().filter(|allocation| holds_memory(allocation) && allocation.spilled);
+        spilled.map(|allocation| allocation.size).fold(0, u64::saturating_add)
+    }
+
+    /// Video memory for an allocation, or, when the card refuses, system memory the card reaches,
+    /// up to a share of the guest's RAM as Windows shares system memory with a card. Says which.
+    pub(super) fn card_or_spill_memory(
+        &mut self,
+        size: u64,
+        kind: MemoryKind,
+    ) -> Result<(MemoryId, u64, bool), BackendError> {
+        let refused = match self.backend.allocate_video_memory(size, kind) {
+            Ok((memory, given)) => return Ok((memory, given, false)),
+            Err(error) => error,
+        };
+        let room = self.config.limits.system_budget / SPILL_SHARE;
+        if self.spilled_in_use().saturating_add(size) > room {
+            log::warn!(
+                "the card refused {size:#x} bytes, and system memory for the card is full too: {refused}"
+            );
+            return Err(refused);
+        }
+        match self.backend.allocate_spill_memory(size, kind) {
+            Ok((memory, given)) => {
+                if std::mem::replace(&mut self.spill_noted, true) {
+                    log::debug!("{size:#x} bytes went to system memory, as the card refused: {refused}");
+                } else {
+                    log::warn!(
+                        "the card is full ({refused}), so {size:#x} bytes went to system memory, and more may. \
+                         Programs run slower like this, as on Windows when a card fills up"
+                    );
+                }
+                Ok((memory, given, true))
+            }
+            Err(error) => {
+                log::warn!("the card refused {size:#x} bytes, and system memory refused too: {error}");
+                Err(refused)
+            }
+        }
     }
 
     /// Whether memory the guest is yet to list would be more than it has. Each page waiting for its
@@ -113,7 +161,14 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
         }
         let wanted = shapes.iter().map(|shape| shape.size).fold(0, u64::saturating_add);
         let too_large = shapes.iter().any(|shape| shape.size > ADDRESSES_END);
-        let over_cap = self.config.limits.video_cap.is_some_and(|cap| self.over_video_cap(cap, wanted));
+        let over_cap = self.config.limits.video_cap.is_some_and(|cap| {
+            let used = self.video_in_use();
+            let over = used.saturating_add(wanted) > cap;
+            if over {
+                log::warn!("{}", cap_warning(cap, used, wanted));
+            }
+            over
+        });
         (too_large || over_cap).then_some(Status::NO_VIDEO_MEMORY)
     }
 
@@ -162,12 +217,13 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
                 let pages = shape.exact_size.div_ceil(PAGE_SIZE) as usize;
                 allocation.pending_pages = Some(vec![None; pages]);
             } else {
-                let (memory, size) = self.backend.allocate_video_memory(shape.size, shape.kind)?;
+                let (memory, size, spilled) = self.card_or_spill_memory(shape.size, shape.kind)?;
                 allocation.memory = Some(memory);
                 allocation.size = size;
+                allocation.spilled = spilled;
             }
             log::debug!(
-                "allocation {handle:#x}: {:#x} bytes, guest backed {guest_backed}, primary {}",
+                "allocation {handle:#x} in process {owner:#x}: {:#x} bytes, guest backed {guest_backed}, primary {}",
                 allocation.size,
                 allocation.primary
             );
@@ -198,6 +254,17 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
             }
             self.allocations.insert(handle, allocation);
             self.resources.get_mut(&resource).expect("made above").push(handle);
+            // Only the newest allocation can be the description of the range asked for next.
+            match shape.kind {
+                MemoryKind::PLAIN => {
+                    self.described_surfaces.remove(&owner);
+                    self.newest_description = None;
+                }
+                kind => {
+                    self.described_surfaces.insert(owner, (handle, kind));
+                    self.newest_description = Some((owner, handle, kind));
+                }
+            }
         }
         CreateAllocationAnswer::finish(out);
         Ok(())
@@ -236,8 +303,18 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
         let mut handles: Vec<u32> = request.handles.iter().filter(|handle| !held_elsewhere(handle)).collect();
         handles.extend(self.resources.remove(&resource).unwrap_or_default());
         self.run_deferred();
+        self.free_allocations(handles);
+        Ok(())
+    }
+
+    /// Frees each allocation once the GPU is done with what it was given, as the guest destroyed it.
+    pub(super) fn free_allocations(&mut self, handles: Vec<u32>) {
         for handle in handles {
             self.allocation_going(handle);
+            if self.newest_description.is_some_and(|(_, described, _)| described == handle) {
+                // Its kind stays for the ranges asked for next, which the description was made for.
+                log::debug!("the description {handle:#x} is destroyed before the next allocation");
+            }
             let Some(allocation) = self.allocations.remove(&handle) else { continue };
             self.leave_resource(allocation.resource, handle);
             let Some(memory) = allocation.memory else { continue };
@@ -249,7 +326,6 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
             };
             self.defer(DeferredAction::FreeAllocation(freed));
         }
-        Ok(())
     }
 
     /// Keeps the priorities for the allocations named, or for the whole resource if none is. The
@@ -315,25 +391,6 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
         Ok(())
     }
 
-    /// Holds a first lock until the queues in its address spaces get to where they are now, if they
-    /// aren't there. Moving an allocation under an engine that's using it loses what the engine
-    /// writes, which shows up as damage here and there in encoded video.
-    fn wait_for_first_lock(&mut self, handle: u32, message: &[u8]) -> bool {
-        let mappings = &self.allocations[&handle].mappings;
-        let in_use = |queue: &Queue| mappings.iter().any(|mapping| mapping.space == queue.space);
-        let queues: Vec<u32> =
-            self.queues.iter().filter(|(_, queue)| in_use(queue)).map(|(&handle, _)| handle).collect();
-        if self.queues_idle(queues.iter().copied()) {
-            return false;
-        }
-        self.first_locks_waited.insert(handle);
-        let action =
-            QueueAction::Retry { message: message.to_vec(), ticket: self.ticket, started: Instant::now() };
-        self.after_queues(queues.iter().copied(), action);
-        self.hold_reply();
-        true
-    }
-
     /// Gives the guest's CPU access. The first lock moves the allocation from video memory to pages
     /// shared with the guest, at the same GPU addresses.
     pub(super) fn lock_for_cpu(&mut self, message: &[u8], out: &mut Vec<u8>) -> Handled {
@@ -369,19 +426,23 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
             lock_answer(Status::NO_MEMORY, 0, out);
             return Ok(());
         };
-        if used_before {
+        // Video memory nothing has written holds zeroes, and so do zeroed pages, without the copy.
+        let untouched = preserve && self.backend.new_video_memory_is_zero() && self.never_written(handle);
+        let started = Instant::now();
+        if used_before || untouched {
             // Another allocation's data must not reach this one.
             self.memory.zero(address, size)?;
         }
         let pages_size = align_up(size, PAGE_SIZE);
         let host_address = self.memory.host_address(address, pages_size)?;
-        let shared = self.backend.adopt_host_pages(host_address, pages_size)?;
+        let shared = self.adopt_guest_pages(host_address, pages_size)?;
         let has_mappings = !self.allocations[&handle].mappings.is_empty();
         let own = if has_mappings { Some(self.own_space()?) } else { None };
-        if let (true, Some(own)) = (preserve, own) {
+        if let (true, false, Some(own)) = (preserve, untouched, own) {
             let host = &mut super::services!(self);
             self.backend.preserve_contents(host, own, memory, shared, size)?;
         }
+        let copied = started.elapsed();
         for mapping in &self.allocations[&handle].mappings {
             self.log_unmap_in_flight("a first lock", mapping.address, mapping.length);
         }
@@ -413,6 +474,14 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
         allocation.memory = Some(shared);
         allocation.guest_address = Some(address);
         self.backend.release_memory(memory);
+        if preserve {
+            log::debug!(
+                "first lock of {handle:#x}: {size:#x} bytes {} in {:.1} ms, {:.1} ms in all",
+                if untouched { "left as zeroes, as nothing had written them" } else { "copied" },
+                copied.as_secs_f64() * 1000.0,
+                started.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
         lock_answer(Status::SUCCESS, address, out);
         Ok(())
     }
@@ -439,11 +508,36 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
         let pages: Vec<u64> = pending.iter().flatten().copied().collect();
         let allocation = self.allocations.get_mut(&request.allocation).expect("found above");
         allocation.pending_pages = None;
-        let view = self.memory.map_pages(&pages).map_err(|error| {
-            guesthouse_backend::BackendError::new(format!("mapping guest pages: {error}"))
-        })?;
+        let view = self
+            .memory
+            .map_pages(&pages)
+            .map_err(|error| BackendError::new(format!("mapping guest pages: {error}")))?;
         allocation.view = Some(view);
-        allocation.memory = Some(self.backend.adopt_host_pages(view.host_address, view.size)?);
+        let memory = self.adopt_guest_pages(view.host_address, view.size)?;
+        self.allocations.get_mut(&request.allocation).expect("found above").memory = Some(memory);
         Ok(())
     }
+}
+
+/// Windows lets a card use up to half the system's memory.
+const SPILL_SHARE: u64 = 2;
+
+/// Whether an allocation holds memory of its own, rather than the guest's pages or a lock's.
+fn holds_memory(allocation: &Allocation) -> bool {
+    allocation.memory.is_some() && allocation.guest_address.is_none() && allocation.view.is_none()
+}
+
+/// What the log says when the machine's video memory cap refuses an allocation. The guest's
+/// driver usually gives the device up straight after, and a game then crashes in its own code,
+/// so this line is what says why.
+pub(super) fn cap_warning(cap: u64, used: u64, wanted: u64) -> String {
+    const MIB: u64 = 1 << 20;
+    format!(
+        "the machine's video memory cap of {} MiB refused {} MiB more, with {} MiB in use. \
+         The program that asked will likely fail. Raise the cap or set it to automatic in the \
+         machine's settings",
+        cap / MIB,
+        wanted.div_ceil(MIB),
+        used.div_ceil(MIB)
+    )
 }

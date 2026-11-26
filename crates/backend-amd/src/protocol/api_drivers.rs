@@ -101,7 +101,7 @@ mod tests {
     }
 
     fn opengl_answer(process_is_32_bit: bool) -> Vec<u8> {
-        let query = VendorQuery { kind: QUERY_OPENGL, size: 528, data: &[], process_is_32_bit };
+        let query = VendorQuery { kind: QUERY_OPENGL, size: 528, data: &[], process_is_32_bit, program: "" };
         let mut out = Vec::new();
         write_opengl_info(&query, &mut out);
         out

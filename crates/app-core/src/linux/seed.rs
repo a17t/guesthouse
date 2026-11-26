@@ -9,6 +9,7 @@ use crate::failure::{Failure, Result};
 use crate::iso::iso_maker;
 use crate::machine::Machine;
 use crate::snapshots::copy_tree;
+use crate::writable_copy::copy_writable;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -18,8 +19,12 @@ use std::process::{Command, Stdio};
 /// A random password's size, before base64.
 const PASSWORD_BYTES: &str = "12";
 const PRIVATE: u32 = 0o600;
-/// The folder's mode becomes that of `/usr/lib/nvfwd`, which the desktop's user must enter.
+/// The modes the guest's scripts get, as `/usr/lib/nvfwd` and what's in it are read by the desktop's
+/// user. A copy keeps the host's modes, and a host whose umask is 077 unpacked these as its own only.
 const OPEN_FOLDER: u32 = 0o755;
+const OPEN_PROGRAM: u32 = 0o755;
+const OPEN_FILE: u32 = 0o644;
+const ANY_EXECUTE: u32 = 0o111;
 
 pub fn seed_folder(context: &Context, machine: &Machine) -> PathBuf {
     machine.folder(context).join("seed")
@@ -78,12 +83,12 @@ fn make_payload(sources: &Path, folder: &Path) -> Result<PathBuf> {
     let payload = folder.join("payload");
     let _ = fs::remove_dir_all(&payload);
     copy_tree(&sources.join(GUEST_SETUP), &payload)?;
-    fs::set_permissions(&payload, fs::Permissions::from_mode(OPEN_FOLDER))?;
     // These two are needed before any driver image has been seen.
     for name in FIRST_BOOT_FILES {
         let file = Path::new(name).file_name().unwrap_or_default();
         fs::copy(sources.join(name), payload.join(file))?;
     }
+    open_up(&payload)?;
     let archive = folder.join("nvfwd-guest.tar");
     output(
         Command::new("tar")
@@ -95,6 +100,22 @@ fn make_payload(sources: &Path, folder: &Path) -> Result<PathBuf> {
     )?;
     let _ = fs::remove_dir_all(&payload);
     Ok(archive)
+}
+
+fn open_up(path: &Path) -> Result<()> {
+    let metadata = fs::metadata(path)?;
+    let mode = if metadata.is_dir() {
+        for entry in fs::read_dir(path)? {
+            open_up(&entry?.path())?;
+        }
+        OPEN_FOLDER
+    } else if metadata.permissions().mode() & ANY_EXECUTE != 0 {
+        OPEN_PROGRAM
+    } else {
+        OPEN_FILE
+    };
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    Ok(())
 }
 
 /// Writes the seed disc, and returns where it is.
@@ -109,7 +130,7 @@ pub fn make_seed(context: &Context, machine: &Machine, kernel_package: &str) -> 
     let answers = fill_template(&template, machine.account(), &hash, &key, kernel_package);
     fs::write(&user_data, answers + "\n")?;
     let meta_data = folder.join("meta-data");
-    fs::copy(sources.join(META_DATA), &meta_data)?;
+    copy_writable(sources.join(META_DATA), &meta_data)?;
     let archive = make_payload(&sources, &folder)?;
     let disc = seed_disc(context, machine);
     output(
@@ -174,6 +195,32 @@ mod tests {
         let listing = Command::new("tar").args(["-tf"]).arg(&tar).output().unwrap().stdout;
         let listing = String::from_utf8_lossy(&listing);
         assert!(listing.contains("./first-boot.sh") && listing.contains("./Xwayland"));
+    }
+
+    #[test]
+    fn the_scripts_can_be_read_by_everyone_whatever_the_host_unpacked_them_as() {
+        let scratch = Scratch::new();
+        let context = scratch_context(&scratch);
+        with_sources(&scratch);
+        let session = scratch.write("program/linux/setup/guest/desktop-session.sh", "#!/bin/sh\n");
+        fs::set_permissions(&session, fs::Permissions::from_mode(0o700)).unwrap();
+        let note = scratch.write("program/linux/setup/guest/units/nvfwd-desktop.service", "[Unit]\n");
+        fs::set_permissions(&note, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(note.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+        let disc = make_seed(&context, &machine(&context), "linux-image-7.0.0-38-generic").unwrap();
+        let tar = scratch.path("guest.tar");
+        fs::write(&tar, on_disc(&disc, "/nvfwd-guest.tar")).unwrap();
+        let listing = Command::new("tar").args(["-tvf"]).arg(&tar).output().unwrap().stdout;
+        let listing = String::from_utf8_lossy(&listing);
+        let mode_of = |name: &str| {
+            let line =
+                listing.lines().find(|line| line.ends_with(name)).unwrap_or_else(|| panic!("{listing}"));
+            line.split_whitespace().next().unwrap().to_owned()
+        };
+        assert_eq!(mode_of("./desktop-session.sh"), "-rwxr-xr-x");
+        assert_eq!(mode_of("./units/nvfwd-desktop.service"), "-rw-r--r--");
+        assert_eq!(mode_of("./units/"), "drwxr-xr-x");
+        assert_eq!(mode_of("./"), "drwxr-xr-x");
     }
 
     #[test]

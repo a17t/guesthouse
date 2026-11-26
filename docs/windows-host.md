@@ -1,0 +1,348 @@
+# A Windows host
+
+This is the first step of Guesthouse on Windows: Windows 11 and Ubuntu VMs with GPU-PV, run through Windows' Host Compute System with only the Virtual Machine Platform feature on. Hyper-V isn't needed, so Windows 11 Home can do it, and none of Hyper-V's tools are used. The rest of Guesthouse, the daemon and the GTK app, still runs on Linux only. On Windows the daemon's crates build empty, so `cargo test` builds the workspace, but the GTK app doesn't build on Windows at all.
+
+`tools/hcs-boot` is the program. `crates/host-windows` is the work it does, which the Guesthouse service will share, and `crates/hcs` is the calls into Windows underneath. `crates/app-windows` is the window that will drive the service, as [the app](#the-app) says.
+
+## What it needs
+
+- Windows 11, Home or Pro, with Virtual Machine Platform on. WSL 2 turns it on, so it's often on already.
+- A card whose driver offers GPU-PV. `guesthouse-hcs-boot gpus` lists them.
+- A Windows 11 ISO, or its `install.wim` or `install.esd`, or an Ubuntu Server ISO. Ubuntu 26.04 is the one aimed at.
+- An elevated prompt for `prepare` and `boot`, as HCS, its network and attaching a disk all need one.
+- For an Ubuntu guest's CUDA and `nvidia-smi`, WSL installed on the host, as `libdxcore.so` comes with it.
+
+To see whether Virtual Machine Platform is on, in an elevated PowerShell:
+
+```powershell
+Get-WindowsOptionalFeature -Online -FeatureName VirtualMachinePlatform
+```
+
+If it says `Disabled`, turn it on and restart:
+
+```powershell
+dism.exe /online /enable-feature /featurename:VirtualMachinePlatform /all /norestart
+```
+
+## Trying all of it at once
+
+`tools/hcs-boot/try-on-this-pc.ps1` runs every step in order in an elevated PowerShell. It checks the PC and builds the program. Then it makes and boots a Windows guest, and makes, installs and boots an Ubuntu guest. Each boot has a time limit, a failed step doesn't stop the next, and everything goes to `guesthouse-try.log` in the folder you give:
+
+```powershell
+.\tools\hcs-boot\try-on-this-pc.ps1 -Folder D:\vms -WindowsIso D:\iso\Win11.iso -UbuntuIso D:\iso\ubuntu-26.04-live-server-amd64.iso
+```
+
+## Building
+
+```powershell
+cargo build --release -p guesthouse-hcs-boot
+```
+
+## Using it
+
+`gpus` needs no elevation. It lists each card with its partition adapter's path, which is how HCS takes a card, and its driver's folder:
+
+```powershell
+.\target\release\guesthouse-hcs-boot.exe gpus
+```
+
+`document` prints what `boot` would send to HCS, without sending it, and needs no elevation either.
+
+`prepare` makes a disk from the ISO, and tells a Windows ISO from an Ubuntu one by what's on it. It never writes over a file that's there. The guest's administrator and a new password go in a file beside the disk.
+
+```powershell
+.\target\release\guesthouse-hcs-boot.exe prepare --image D:\iso\Win11.iso --disk D:\vms\win11.vhdx
+```
+
+`boot` copies the card's driver again if the host's changed, plugs the machine into a network, starts it, and then gives it the card. The guest has no screen anyone can see yet, so at every start it says on its serial port what it sees of its card, and `boot` prints that:
+
+```powershell
+.\target\release\guesthouse-hcs-boot.exe boot --disk D:\vms\win11.vhdx
+```
+
+Ctrl+C asks the guest to shut down, and a second Ctrl+C stops it at once. `--for-minutes N` does the same by itself after N minutes. The machine stops too if the program does, as HCS stops a machine when its last handle closes.
+
+Without `--gpu`, a guest gets the card with the most memory of its own, which on a PC with an integrated card too is the discrete one, NVIDIA, AMD or Intel. `--gpu TEXT` picks the card whose name holds TEXT, and `--no-gpu` boots with none. `--memory-mb`, `--cpus`, `--no-network` and `--no-tpm` do what they say. `--no-nvapi-wrapper` boots an NVIDIA guest with NVIDIA's own NVAPI in System32 rather than Guesthouse's wrapper, for a game whose anti-cheat refuses the wrapper.
+
+### A Windows guest
+
+A guest's first boot sets it up with no card, and every boot after that has the card. The host's card reset twice while a guest with GPU-PV was setting up or shutting down, and setup doesn't need the card. A Windows guest counts as set up once its first report arrives, and an Ubuntu guest once its install is done.
+
+`prepare` makes a new VHDX, partitions it with diskpart, applies the edition with DISM, and writes the boot files with bcdboot. Then it adds the card's driver, an answer file and a small report. The report writes to the guest's serial port, and to a file on its disk, which `boot` prints once the machine has stopped, in case the serial port said nothing. The first start takes a few minutes, as Windows sets itself up. Lines like these are what to look for, the first saying the guest has the card and its driver:
+
+```
+guest: guesthouse: card: NVIDIA GeForce RTX 5090, driver 32.0.16.xxxx, status OK
+guest: guesthouse: nvidia-smi: GPU 0: NVIDIA GeForce RTX 5090 (UUID: ...)
+guest: guesthouse: address: 172.24.80.12
+```
+
+With a Pro guest, Remote Desktop to the address it prints shows its screen.
+
+### An Ubuntu guest
+
+`prepare` makes an empty disk for Ubuntu's installer, and a small FAT disk beside it, the files disk, labelled `CIDATA`. The files disk does three jobs:
+
+- It boots the installer. Its UEFI fallback is the ISO's own Shim and GRUB, with a menu that starts the installer with no questions and its console on the serial port.
+- It's the installer's answer file, which cloud-init finds by its label.
+- It keeps the host's GPU files, which the guest mounts at `/usr/lib/wsl` as WSL does. These are WSL's own DXCore and D3D12 libraries, the libraries the driver puts in `lxss\lib`, and the driver's folder from the driver store.
+
+The first `boot` installs Ubuntu. That takes a while, and the machine turns itself off when it's done. `boot` sees the guest say so, and stops attaching the installer. The next `boot` starts the installed system. The installer speaks on the serial port only when the files disk's menu started it, so an install boot that's silent for five minutes started something else, and `boot` stops it and says so.
+
+Stop and Ctrl+C ask an Ubuntu guest to shut down by writing `guesthouse: shutdown` on its serial port, as a Windows guest does. HCS's own request needs Hyper-V's integration services, which this guest doesn't have. `guesthouse-shutdown.service` reads the port at every start, for as long as the guest runs, and powers the guest off when the line comes. It masks the serial getty on that port, so nothing else reads it. A guest installed before the service existed gets it from the files disk at its next start, with no reinstall.
+
+At every start a service in the guest mounts the GPU files and loads `dxgkrnl`, the guest's half of GPU-PV. Then it reports on the serial port. A distro's kernel has no `dxgkrnl`, as it's only in Microsoft's WSL kernel. So on its first start, and after a kernel update, the guest builds it. It downloads the build tools from Ubuntu and `dxgkrnl`'s source from Microsoft's WSL kernel on GitHub, which Guesthouse never keeps a copy of. The guest's Secure Boot is off, as that module isn't signed. Lines like these are what to look for:
+
+```
+guest: guesthouse: dxg: present
+guest: guesthouse: host driver: nv_dispi.inf_amd64_...
+guest: guesthouse: nvidia-smi: GPU 0: NVIDIA GeForce RTX 5090 (UUID: ...)
+```
+
+SSH to the address it prints, with the account in the file beside the disk, or [with no network at all](#ssh-over-a-hyper-v-socket).
+
+### The jail
+
+What a guest writes to its serial port is the one thing on a Windows host that a Guesthouse program reads from a guest. The machine itself runs in Windows' own worker process, which Windows already keeps apart. So `boot` hands the port to `guesthouse-serial-relay`, which sits beside it and runs jailed, as QEMU does on Linux:
+
+- In an AppContainer with no capabilities, it can open none of your files, and it has no network, not even loopback. That does what Landlock does on Linux.
+- Process mitigations block every win32k call, code made at run time, and DLLs from a share or a low-integrity file. That does what seccomp does.
+- Its job lets it start no process, keeps it off the desktop and the clipboard, caps its memory, and stops it when `boot` ends. That does what no new privileges does.
+
+The jail's test reads four of these back from Windows inside the jailed process: the AppContainer, and that win32k calls, dynamic code and child processes are refused. The rest are set and not yet read back. The relay shows any control character, an escape sequence included, as a code, so a guest can't drive your terminal. `boot` never reads the port unjailed unless `--no-jail` asks it to. Windows keeps the relay's AppContainer under the name `guesthouse.serial-relay`. The first start lets that container read and run the relay's own file, and nothing else.
+
+## The service
+
+HCS needs an administrator, and Guesthouse's app runs as you, so the app never touches a machine itself. It asks the Guesthouse service, `guesthouse-service`, which runs as the system, on the pipe `\\.\pipe\guesthouse`, in the words of `crates/control`. The service does the same work `guesthouse-hcs-boot` does, and keeps every rule itself:
+
+- It answers the system, an elevated administrator, and the user signed in at the console. Anyone else is refused and written in its log.
+- It keeps the machines in `%ProgramData%\Guesthouse\machines`, a folder each, which it makes its own, so only the system and administrators can open them. A folder that's there already and wasn't made by an administrator is refused rather than taken over. Its log is `%ProgramData%\Guesthouse\service.log`.
+- It opens the ISO you name as you first, and refuses one you couldn't read yourself, or one on a share.
+- A machine's name, memory, processors and disk size are held to limits, and one machine is made at a time.
+- A machine's memory, processors, card, DLSS switch, TPM, network and shared folder can be changed once it's made, only while it's off, and to the same limits as a new machine's. A card asked for by name has to be one of this PC's, and an Ubuntu guest's card stays as it was made. They're kept in the machine's folder, and the next start gives it them. A stopped machine's disk can grow, and never shrinks.
+- A machine's port forwards are held to the rules in Networking below, and so is bridging.
+- A guest's user is up to 20 lowercase letters, digits, - and _, starting with a letter, and not one of Windows' own accounts, as both systems take that. An edition is named with letters, digits and spaces.
+- A folder is shared only if the user asking could read it, write it unless it's shared read-only, and change who may open it, as sharing it lets the machine's own account in, which the service does as the system. That's asked when it's chosen, and again as whoever starts the machine at every start, as the folder could have been put in a link's place since. It must be the folder by its own path: a junction or other link, or a path through one, is refused. The folder is held open while the machine runs, so it can't be moved for a link to take its place. A start whose share fails the check boots without it and says why. A folder on a share is refused.
+- A Linux guest is given a copy of its installer in its folder, as each boot changes the permissions of every disk it's given, and the service mustn't do that to your file. The copy goes once the guest has installed.
+- A machine's disks can be kept in a folder you choose, and moved later, and each is held to the rules in Where a machine is kept below.
+- Machines are HCS's `guesthouse-NAME`, so no other program's machines are touched. One left running when the service last stopped is stopped when it starts.
+- When the service stops, or Windows shuts down, each running guest is asked to shut down, and stopped if it hasn't in a minute.
+
+To try it without installing it, in an elevated prompt:
+
+```powershell
+cargo build --release -p guesthouse-service -p guesthouse-host-windows
+.\target\release\guesthouse-service.exe run
+```
+
+It serves until Ctrl+C. The relay must sit beside it, as `boot` looks for it there, which a release build does.
+
+## The app
+
+`crates/app-windows` is the app for all of this, `guesthouse-app.exe`, a WinUI 3 window made with Microsoft's windows-reactor. It runs as you, with no elevation, and does nothing to a machine itself: it asks the Guesthouse service on its pipe, `\\.\pipe\guesthouse`, in the words in `crates/control`. The service runs as the system, as HCS needs, and keeps every rule. Without it the window says the service isn't running, and asks again every two seconds.
+
+```powershell
+cargo build --release -p guesthouse-app-windows
+.\target\release\guesthouse-app.exe
+```
+
+The first build on a PC downloads the Windows App Runtime from NuGet, and every build copies it beside the exe, so the app needs nothing installed. Copy the whole folder to move it. Every Windows program here carries its C runtime inside it, as `.cargo/config.toml` says, so none needs Visual C++'s runtime on the PC either.
+
+On the left is each machine, with its system and a dot for where it stands: green running, amber on its way, grey stopped. A machine's page has Start and Stop at its top, and Delete under More. Stop asks the guest to shut down, and while it does, the button says Stop now, which turns it off at once. Delete asks first, and only a stopped machine can go. Below that are its Status, Connect and Settings. Settings has its memory, processors, card, TPM, nested virtualization, network and shared folder, which can be changed while it's stopped, and Save asks the service, which says why if it won't. An Ubuntu guest keeps its card, as its files disk was made only as large as that card's driver needed. Its disk can grow there too, with Grow, which is asked for on its own as it can't be undone. Its Location, in Status, says where its disks are, and moves them. Under Settings are its snapshots, to take, go back to and delete. A Windows guest with an NVIDIA card has a DLSS switch there too. On, the guest gets Guesthouse's NVAPI in place of NVIDIA's, as NVIDIA's won't tell DLSS which card it's on in a virtual machine. Guesthouse's isn't signed, and some games' anti-cheat refuses to start with it, so turning DLSS off puts NVIDIA's back at the machine's next start. Status says whether the machine is set up: its first boot sets it up without the card, and every boot after that has it. Connect shows the guest's administrator and password when asked, opens a Windows guest's screen in remoteman's viewer once it's set up (Open screen) or Remote Desktop on its address, and gives an Ubuntu guest's `ssh` lines: the one for the port on this PC's loopback, and the one for its address when it has one. Open console shows any running machine's own screen, as HCS serves it on the machine's console pipe, in a window of its own through Windows' Remote Desktop control (`src/console.rs`), from the firmware on; closing it leaves the machine running, and a machine that stops has its console closed. It doesn't connect yet: the console's pipe hangs up on the control, which says it hit an internal error. `cargo run -p guesthouse-app-windows --example console-window -- NAME` tries it without the app. Under that is its log, as the service sends it, with problems marked in red. New machine makes one from an image, and shows the service's progress as it goes. It also takes the guest's user, `guesthouse` unless another is named, and a Windows image's edition: with none chosen it's Pro if the image has it and the image's first edition if not, so an image of Home alone works. A machine has a TPM and a network unless they're turned off, and can share a folder of this PC's. Under Network, Connects through chooses the shared network or an adapter to bridge onto, which is only there where Hyper-V is on, and Port forwards lists its forwards, a row of two ports each; see Networking.
+
+A build with the `preview` feature shows made-up machines instead of the service's, so each of the window's states can be looked at, light or dark, with no service and no GPU. It never reaches the service. `src/app/preview.rs` lists the states:
+
+```powershell
+cargo build -p guesthouse-app-windows --features preview
+$env:GUESTHOUSE_APP_PREVIEW = "running"; $env:GUESTHOUSE_APP_THEME = "light"
+.\target\debug\guesthouse-app.exe
+```
+
+An installed app, one beside the installer's `uninstall.exe`, asks the file drop for `guesthouse-windows-latest.json` when it starts, the file a Windows release publishes last (`crates/control/src/updates.rs`). When that names a newer version than the app's, a card at the top of each page says so, with Download, which opens the installer in the browser, and Not now, which puts it aside until the app next starts. It's fetched with the `curl.exe` Windows has, over HTTPS only, in 20 seconds at most, and no larger than 4 KB, and nothing is said when it can't be had. Only a link to an installer on the file drop is ever offered, whatever the file says. A build of the repo never asks, and `GUESTHOUSE_UPDATE_CHECK=0` turns it off. The preview's `update` state shows the card.
+
+Closing the window ends the app, and the machines go on as they were. A panic leaves its words in `guesthouse-app\panic.txt` in your temporary folder, as the app has no console.
+
+## Installing
+
+`scripts/windows-setup.ps1` builds the service, the serial relay and `hcs-boot`, and packs them into one file. It adds the app if it finds it, and says so if it doesn't. It adds remoteman too, for [a Windows guest's screen](#a-windows-guests-screen):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\windows-setup.ps1
+```
+
+It leaves two files in `target\installer\`, the folder to publish for testers at `https://files.ruxn.com/p/guesthouse/`: `guesthouse-setup-VERSION.exe`, where VERSION is the Windows host's, in `windows/version.txt`, and `guesthouse-setup-VERSION.exe.sha256` beside it, its SHA-256 as `sha256sum` writes one (`<hex>  <file>`), so `sha256sum -c` checks a download. The script publishes nothing. `scripts/windows-release.ps1` releases it, as [RELEASING.md](../RELEASING.md#the-windows-host) says.
+
+remoteman isn't built here. The installer carries remoteman's own release files, the version `windows/remoteman.json` pins: remoteman's host's installer, `remoteman-host-setup-V.exe`, and its Windows viewer, `remoteman-viewer-windows-V.zip`. The pin names each file and its SHA-256, and the place they're published, `https://files.ruxn.com/p/remoteman/`, where each has its `.sha256` beside it. The script downloads both into `target\remoteman-cache\V\` and checks each against the pin. A file that doesn't match is refused and not kept, and a cached file that doesn't match is downloaded again. With no network and nothing cached, the build stops and says so: it never builds an installer without the screen unless asked. In the payload, and so in the install folder:
+
+- `screen\remoteman-host-setup.exe` is the host's installer as it is. The service runs it in each Windows guest.
+- `viewer\` is the viewer's zip unpacked, `remoteman.exe` in it, with FFmpeg's DLLs, the Windows App Runtime, remoteman's licence and FFmpeg's. The runtime is the same as the app's, so the installer carries it once.
+- `GPL-3.0.txt`, from `windows\installer\`, is the GPL 3 that FFmpeg's LGPL 3 builds on.
+- The end of the installed `THIRD-PARTY.md` says which remoteman the installer carries and which licence files came with it.
+
+`-RemotemanFrom FOLDER` takes the two files from a folder instead of downloading them, still checked against the pin. `-RemotemanUnpinned` skips the check, for trying a local build of remoteman only, so it works only with `-RemotemanFrom`, never on a download or the cache. It says so at the start and the end of the build and in the installed `THIRD-PARTY.md`, and it takes the newest `remoteman-host-setup-*.exe` and `remoteman-viewer-windows-*.zip` when the pin's names aren't there. Never hand such an installer to anyone. `-NoScreen` builds without remoteman. An installer without it still installs everything else, and installed over one with it, it removes the earlier screen's files.
+
+The app starts the viewer as `viewer\remoteman.exe` in the install folder, `C:\Program Files\Guesthouse\viewer\remoteman.exe`. From the app's own `C:\Program Files\Guesthouse\app\guesthouse-app.exe` that's `..\viewer\remoteman.exe`.
+
+Opening the file asks for an administrator once, then shows each step. It copies the files into `C:\Program Files\Guesthouse`, which only administrators can write to, and `setup.ps1` does the rest:
+
+- It checks for Windows 11, and for Virtual Machine Platform. If that's off it turns it on, and the last page says Windows has to restart before a machine can run. It never turns on Hyper-V.
+- It registers the service `Guesthouse`, which starts with Windows, as the system. Windows is told to wait up to 90 s for it at shutdown, so it has time to ask each machine to shut down. It's started again if it ends.
+- The app gets a shortcut in Start, and the uninstaller is in Settings > Apps.
+
+An install over an earlier one stops the service first, which asks each running machine to shut down and can take a minute. remoteman's viewer is closed if it's open from the install folder, as the app is. `app\`, `viewer\` and `screen\` keep only the new install's files: what the earlier one had there and this one doesn't is deleted. It never ends the service by force, as that would cut a machine off while it's shutting down. If the service doesn't stop in 90 s, the step fails and says why.
+
+The uninstaller, in Settings > Apps or `uninstall.exe` in the install folder, removes the service and the files, remoteman's with them. What remoteman's host installed in a guest stays in the guest. Your machines in `%ProgramData%\Guesthouse` stay, so installing again finds them, unless you tick Also delete my machines. Virtual Machine Platform stays on.
+
+`--silent` has no pages, `--uninstall --delete-machines` deletes the machines too, and `--dry-run` shows every page and walks every step with no administrator and no change to the PC. Its log is `%TEMP%\guesthouse-setup.log`, and the install's own is `setup.log` in the install folder. `crates/installer-windows/test/walk.ps1` drives the pages in a dry run and takes a picture of each.
+
+## A Windows guest's screen
+
+A Windows guest's screen is [remoteman](https://github.com/ruxnhq/remoteman)'s: its host runs in the guest and encodes the guest's desktop on the guest's card, and its viewer runs on this PC. Guesthouse holds both ends, so it pairs them itself, and nobody is asked to:
+
+- `boot` looks for remoteman's host's installer, `screen\remoteman-host-setup.exe` from remoteman's release, beside itself, beside the service or `guesthouse-hcs-boot`. When it's there, every boot puts it on the guest's disk with `guest/screen.ps1`, and the guest's report runs that script as SYSTEM. The script runs the installer unattended: `remoteman-host-setup.exe --silent --trust FILE --encoder NAME --no-pair --log FILE`, again whenever the installer, the viewer to trust or the encoder changes. remoteman's installer does all of remoteman's own work: where its files go, its service and its command line, its trust list. Run again, it keeps the host's identity, so its fingerprint stays the same.
+- The viewer's identity is made on the host, as remoteman makes its own, beside the machine's disk in `NAME.screen`. The guest's installer is told to trust only that, and `--no-pair` leaves its host no way to pair anyone else. The guest asks its host for its fingerprint with `remoteman-host.exe fingerprint --state C:\ProgramData\remoteman\host`.
+- The guest says its host's fingerprint on its serial port, and `boot` keeps it in the machine's record. The service's `Screen` answer gives the app the guest's address and fingerprint and the viewer's identity, and the app writes the identity into a state folder of the user's and starts the viewer with remoteman's `connect` command, which takes the address, the fingerprint to expect, the identity, `--placement main` and `--sound`.
+- The guest signs in to its own account by itself at every start, as remoteman's host shows a sign-in screen otherwise. Its password is kept in its own registry, where Windows keeps an automatic sign-in's, and it has no lock screen and doesn't lock when idle. That starts from the boot after the first one with the installer.
+- The guest's sound, clipboard (text and pictures) and files come through remoteman's viewer, and are on. remoteman's host keeps its clipboard and files off unless told, so at every start the guest's script merges `files` and `clipboard` into the host's saved switches, `C:\ProgramData\remoteman\host\allowed.json`, which it reads when it starts, and once the host is up runs `remoteman-host.exe ctl --port 7791 allow clipboard on` and `allow files on` (trying for about a minute) so the running host has them too. Guests set up before this get them at their next start, and the guest's log says what happened. The host's `--no-pair` keeps its door shut to everyone but the viewer it trusts, so nobody else can use them. On this PC, the `connect` command carries `--sound`, and the app also sets the sound and the clipboard on in the viewer's settings in that state folder (`viewer-settings`, and the guest's own entry in `viewer-computers`), keeping whatever else the viewer saved there. Files need no switch in the viewer.
+- remoteman's host picks NVIDIA's encoder itself. AMD's and Intel's encoders for Media Foundation aren't registered in a guest, so with their cards it's told to use Direct3D 12's video encoding, which both have.
+
+The installer puts remoteman's release in place, as [Installing](#installing) says: the host's installer at `screen\remoteman-host-setup.exe` beside the service, and the viewer at `viewer\remoteman.exe`, with FFmpeg's DLLs and the Windows App Runtime beside it.
+
+The app's Open screen does all of that. It starts the viewer at `viewer\remoteman.exe` in the folder above its own, as the installer lays them out, or at `GUESTHOUSE_VIEWER` when that's set, as when trying the app from a build. Without the app, with the service running:
+
+```powershell
+cargo run -p guesthouse-control --example screen -- NAME "C:\Program Files\Guesthouse\viewer\remoteman.exe"
+```
+
+A viewer from remoteman's own `target\release` needs FFmpeg's DLLs beside it or on `PATH`. The viewer isn't jailed yet, though it decodes what the guest sends: that's next for it.
+
+## Shared folders
+
+A machine can share up to 8 folders of this PC's, each read-only or not, listed in its Settings with a row each (a new machine's form takes one, and more are added in Settings). The service refuses more than 8, or one folder twice, whatever its letters' case. Each is a Plan 9 share of its own on the one port, named by its place in the settings: `shared` for the first, as when there could be only one, then `shared2` to `shared8`. A folder refused at a start, or gone, is left out of that boot and leaves its name unused, so the others keep theirs. In a Windows guest `share.txt` has a line each, and `report.ps1` gives each its own task, log and shortcut, the first's as below and the Nth's numbered: `Guesthouse shared folder 2`, `C:\Guesthouse\share\share2.log`, `Shared folder 2.lnk`. Each folder's program is run with `--prefer` its own letter, the first S: and the Nth the Nth letter from S:, and takes the next free drive only when that one is taken, so the folders keep their drives whichever of their tasks Windows starts first at boot. The report puts every task right before it starts any, so one still running as it was can't hold a letter another prefers now, then starts them in the settings' order and waits a minute for them all, not a minute each. The program mounts its drive through the Mount Manager (mount point `\\.\S:`), so it's a volume of the system's: a plain drive letter, which the first test had, was dropped from This PC by Explorer the next time it listed the drives, though it was still there. A folder is mounted when its log was written since the guest started and its last line is `mounted at X:`, so a log from an earlier boot can't name a drive another folder has now. The task and shortcut of a folder no longer given go. In Ubuntu, `gpu.sh` mounts each at `/mnt/NAME`, `/mnt/shared` then `/mnt/shared2` and on, from the file's lines of name, port and mode, and unmounts any of these the file doesn't name. A machine kept with one `share` from before reads as a list of it, and so does a change from an older app. Several shares on one port, each attached by its name, is how hcsshim gives a Linux guest its; and a Windows guest has had three.
+
+A machine's first folder is given as follows, and each after it the same way under its own names. The share's settings are those hcsshim, Microsoft's own code for HCS, gives its Plan 9 shares. Both systems are given it by Plan 9 over a Hyper-V socket: an Ubuntu guest on the host's port 564, as the Linux guests HCS runs for containers have theirs, with the 9p client the kernel has, and `gpu.sh` mounts it at `/mnt/shared` at each start; a Windows guest on port 50001, which App Sandbox's Windows guests use for theirs, as HCS boots them the same way, and the share is read-only (flag `ReadOnly`) when the machine's is. Windows has no 9p client, so a program of Guesthouse's own in the guest, `guesthouse-guest-share.exe`, speaks it and mounts the share as a drive with [WinFsp](https://github.com/winfsp/winfsp) (WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos). WinFsp is under the GNU General Public License, version 3, and Guesthouse passes its installer on under the GPLv3's own terms, not WinFsp's exception for free software, as the installer also carries Microsoft's Windows App Runtime, which isn't free software: each release publishes WinFsp's source, the archive of its tag that `windows/winfsp.json` pins, beside the installer at files.ruxn.com and in the GitHub release, and the installer's THIRD-PARTY.md says where. `guesthouse-guest-share.exe`, which loads WinFsp's DLL, is GPL-2.0-or-later, and passed on under the GPLv3. Virtual SMB, which Windows Sandbox's mapped folders use, was tried first and doesn't work in a machine HCS makes: the guest said `\\?\VMSMB\...` wasn't reachable. The schema's types for it are kept, and a guest isn't given it. At each boot of a machine with a share the service writes `C:\Guesthouse\share.txt` in the guest, one line of the share's name, its port and `rw` or `ro` (`shared 50001 rw`), and copies `guest\guesthouse-guest-share.exe` and `guest\winfsp.msi`, both beside the service (the installer carries them, WinFsp's pinned in `windows/winfsp.json` and checked by its SHA-256), to `C:\Guesthouse\share\`, when they differ from what's there. A file the service doesn't have is a line in the machine's log and the guest boots without a drive. `report.ps1` then installs WinFsp's core feature, quietly and with no restart (`msiexec /i winfsp.msi /qn /norestart ADDLOCAL=F.Main,F.User`) if its registry key says it isn't installed, registers a scheduled task `Guesthouse shared folder` that runs `guesthouse-guest-share.exe --port 50001 --share shared [--read-only] --log C:\Guesthouse\share\share.log` as SYSTEM at every start, with no time limit, not stopped on battery, and restarted every minute up to 999 times if it ends, and starts it. It waits up to a minute for the program's log to say `mounted at S:` (the drive is S: or the next free letter), puts a shortcut named Shared folder to that drive on the common desktop, and says `share: at S:` in the report, or why not with the log's last lines. So the guest gets WinFsp, the program and its log in `C:\Guesthouse\share`, the task and the shortcut. WinFsp is installed once and not upgraded by a newer installer. Each boot lets the machine's own account into the folder, as it does the machine's disks, so the folder's permissions gain that account. Backup privilege, which would let the guest past the folder's own permissions, is never asked for. A folder that has gone by the time the machine boots is left out of that boot, which says so. Without a share, the task, the drive and the link go from a Windows guest, and only the link is deleted, and Ubuntu unmounts it.
+
+## Networking
+
+By default a machine is on Windows' own shared network for its machines (Internet Connection Sharing, HCN's `ICS` type, which WSL's network is too). The guest gets a private address, 172.x, that only this PC reaches, and its traffic goes out through this PC's. That needs only Virtual Machine Platform, and it's all the Windows editions without Hyper-V have. To be reached from other devices on your network there are two options, in a machine's Settings, which can be changed while it's off. Both are untried on a real network.
+
+### Port forwards, on every edition
+
+A machine has up to 16 forwards, each a TCP port of this PC's and a port of the guest's. While the machine runs, and once its guest has said its address, the service makes each one with `netsh`, run as `%SystemRoot%\System32\netsh.exe` with fixed arguments, no shell, no window and a 20 second limit:
+
+```
+netsh interface portproxy add v4tov4 listenport=<host> listenaddress=0.0.0.0 connectport=<guest> connectaddress=<guest's address>
+netsh advfirewall firewall add rule name="Guesthouse <machine> <host>" dir=in action=allow protocol=TCP localport=<host> remoteip=localsubnet profile=any
+```
+
+The rule is made first, so a rule is there whenever an entry is. When the machine stops they go in the other order, before it counts as stopped. The rule lets in only this PC's own subnet (`remoteip=localsubnet`), on every network profile. That is narrower than a plain inbound rule: another subnet, and a VPN's or Tailscale's addresses, are let in only if you widen the rule in Windows Firewall yourself, and the service puts the narrow one back the next time it makes the forward. The guest's address is the one it reported this run, not the one kept from the last, and it's parsed and written out by the service, never passed on as the guest wrote it. If the guest's address changes while it runs, its forwards are made again. Port forwards need Windows' IP Helper service (`iphlpsvc`), which listens for every entry. If it isn't running, the machine's log says so.
+
+An app from before forwards sends none in its changes, so saving a machine's settings from one resets its forwards and its network to none and shared, as it does its shared folder. The service refuses ports outside 1 to 65535, more than 16 forwards, and a port of this PC's used twice, in one machine or across machines. A forward that can't be made when the machine starts, because another program has the port (the service tries to listen on it, and reads `portproxy show v4tov4`), because something else already forwards it, or because `netsh` refused, is a line in the machine's log, and the machine boots anyway. A service that stopped without its machines stopping leaves rules and entries behind: when it starts, on a thread of its own so as not to keep the service manager waiting, and before any machine's forwards are made, it looks for firewall rules named `Guesthouse <machine> <port>` and takes away each, and the entry listening on its port. Entries without such a rule, which other tools such as WSL's setups make, are never touched. Nothing is made while a machine is bridged.
+
+Why `netsh portproxy` and not HCN's own port mapping: hcsshim's `PortMapping` endpoint policy is documented there as "Port Mapping (NAT)", and nothing in `hcn/hcnpolicy.go`, `hcn/hcnendpoint.go` or `internal/hns/hnspolicy.go` says an ICS network takes it. It works for NAT networks. With that unclear, and no machine here to try it on, portproxy is the one that's known to work for any address, on any edition. A portproxy listener also runs for as long as the entry is there, apart from the machine, which is why the service takes them away itself.
+
+### Bridged, where Hyper-V is on
+
+A machine can join this PC's own network, with an address of its own from your router by DHCP, so other devices reach it directly and it needs no forwards. That's an HCN network of type `Transparent`, bound to one of this PC's physical adapters, which is the same switch Hyper-V calls an external one. The service makes one per adapter, named `guesthouse-bridged-<adapter>` with an ID derived from the adapter's name, when the first machine boots on it, and finds it again for every later boot. Its document is:
+
+```json
+{"SchemaVersion":{"Major":2,"Minor":0},"Name":"guesthouse-bridged-Ethernet","Type":"Transparent","Flags":8,
+ "Policies":[{"Type":"NetAdapterName","Settings":{"NetworkAdapterName":"Ethernet"}}]}
+```
+
+The flag is hcsshim's `EnableNonPersistent`, so HCN doesn't keep the switch across a restart of this PC: without it the switch, which takes the adapter's place on the host, would stay bound with nothing in Guesthouse to remove it. It has no address space: the router's DHCP is meant to serve the guest. That is a guess from hcsshim's `Ipam.Type` comment, which lists `Static` and `DHCP`, and nothing in what was read says a Transparent network takes none, or that it takes a flag of 8. If HCN refuses either, the boot fails with its words, and either is one line to change in `crates/hcs/src/schema/network.rs`.
+
+Status says whether bridging is on offer. It is when Hyper-V's virtual machine management service, `vmms`, is installed: a service-manager lookup, so it's cheap and needs no administrator, and that service comes with the Hyper-V feature that Windows Pro, Education and Enterprise have and Home doesn't. Hyper-V's own tools aren't needed to run a machine, only its switch for this. The adapters offered come from Windows' interface table (`GetIfTable2`): Ethernet and Wi-Fi, up, with real hardware behind them and not a filter driver's layer, which keeps out the virtual switches, VPNs, VirtualBox and VMware's adapters that call themselves Ethernet too.
+
+Risks. Binding the switch to the adapter can drop this PC's own network for a few seconds, and the app asks before the first save that bridges a machine. Many Wi-Fi adapters, and routers, refuse a second address on one connection, so a machine on Wi-Fi may not start or may get no address: the app and the log say so, and a boot that can't have its network fails with HCN's own words and doesn't fall back to the shared one. The switch stays bound to the adapter after the machine stops, so the next boot doesn't drop the network again, until this PC restarts, or you remove it. To remove it, in an elevated prompt with every bridged machine stopped, `hnsdiag list networks` shows each network with its ID and name, and `hnsdiag delete networks <id>` deletes the one named `guesthouse-bridged-...`. Windows can drop this PC's network for a few seconds again as the adapter takes its own place back. A bridged machine is as exposed on your network as any device on it, so give its guest the firewall it needs.
+## SSH over a Hyper-V socket
+
+An Ubuntu guest can be reached by SSH with no network: a machine made with Network off has no address, and one that has it may not be reachable from where you are. While the machine runs, the service listens on a port of this PC's own loopback, and relays each connection to the guest's sshd over a Hyper-V socket, as App Sandbox does for its guests. The app's Connect section shows the line, with Copy, beside the one for the guest's address when it has one:
+
+```
+ssh -p 2201 guesthouse@127.0.0.1
+```
+
+How it's built:
+
+- **In the guest**, `guesthouse-ssh.socket` listens on vsock port 22 (`ListenStream=vsock::22`, `Accept=no`), and `guesthouse-ssh.service` runs `/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:22` on each connection, which hands it to sshd. `/etc/modules-load.d/guesthouse-hv_sock.conf` loads `hv_sock`, the guest's half of Hyper-V sockets, before sockets start. `install.sh` puts the three files in a new guest, and `gpu.sh`, which the host rewrites on the files disk at every start, puts them in a guest installed before them, or updates them, and says `ssh: listening on vsock port 22` on the serial port, or why not. Nothing needs doing by hand in the guest. Ubuntu 26.04 is the one aimed at; its `systemd-socket-proxyd` is at the path above, which Ubuntu 24.04 has too.
+- **On the host**, `crates/host-windows/src/ssh.rs` listens on `127.0.0.1:PORT` only, with TCP, and for each connection opens an AF_HYPERV socket to the machine: its VM ID is the runtime ID HCS gives the running machine in its properties, and its service ID is the vsock template with the port in its first four bytes, `{00000016-facb-11e6-bd58-64006a7986d3}` for port 22 (`crates/hcs/src/hvsock`). Two threads copy each direction, and either side closing closes both. At most 32 connections are open at once. The relay stops, closing every connection and freeing the port, when the machine stops. The socket calls are `crates/hcs/src/hvsock/socket.rs`, with windows-sys, and the relay reaches the guest only through a `Dial` trait, so its tests use a TCP server for a guest.
+- **The port** is chosen by the service for each Ubuntu guest, from 2201 up, as soon as the machine is made, and kept in its settings (`ssh_port` in `machine.json`) from then on, so the line in your notes stays right. No two machines share one. If another program has taken a machine's port by the time it starts, the service chooses another, says so in the machine's log and in `service.log`, and keeps that. A Windows guest has none. Only a guest that's installed gets its port listened on, as an install has no sshd to reach.
+
+Loopback means anyone on this PC can reach the guest's sshd: the port is on the loopback, so other PCs can't reach it, but any user signed in to this PC can connect to it. What they find is the guest's own sshd, which still asks for the guest's own user and password, or key, so it's only as open as the guest's own SSH is to anyone who can reach its address. A guest with a weak password is as open to this PC's other users as it would be to its network, so give it a strong one.
+
+What hasn't been tried:
+
+- No machine has booted with it: the code builds and type-checks for Windows and is tested with a TCP server standing in for the guest, but HCS's runtime ID being what AF_HYPERV takes as `VmId` for a machine HCS made, and `hv_sock` and `systemd-socket-proxyd` in a real Ubuntu 26.04 guest answering on port 22, are still to be seen. The service needs to be the system, as it is, for a Hyper-V socket to a machine.
+- Whether `hv_sock` is in the kernel Ubuntu installs for such a guest, rather than needing its extra modules package, isn't known. `gpu.sh` says on the serial port when the socket isn't listening.
+- A guest that restarts its own sshd or the socket while a connection is open drops that connection, as expected, and the next connection is made afresh.
+
+## Nested virtualization
+
+Each machine has a Nested virtualization switch in its Settings, off unless turned on. On, the guest may run virtual machines of its own: WSL 2, Docker's, Windows Sandbox or the Android emulator in a Windows guest, and KVM in an Ubuntu one. Like the other settings it's changed only while the machine is off, kept in the machine's folder, and given at the next start. An Ubuntu guest needs nothing done in it.
+
+It's one field of the machine's document, `ExposeVirtualizationExtensions: true` on the processor, beside its `Count`. Microsoft's hcsshim, the Go code that drives HCS for containers, doesn't have the field in its schema (`internal/hcs/schema2/virtual_machine_processor.go` has `Count`, `Limit`, `Weight`, `Reservation`, `CpuGroup` and `NumaProcessorsSettings`). WSL's own code names it, as `Processor::ExposeVirtualizationExtensions` in `src/windows/common/hcs_schema.h` in microsoft/WSL, which sets it from its `nestedVirtualization` option, and so does App Sandbox. The document leaves the field out entirely when the switch is off.
+
+What it needs:
+
+- A CPU and a host that can nest. Intel needs VT-x with EPT, and AMD's Ryzen and EPYC need AMD-V. HCS refuses the document when the host can't, and the machine doesn't start; the service's log and the machine's events say HCS's own words. App Sandbox and WSL ask the host first, with `HcsGetServiceProperties` and the `ProcessorCapabilities` query, whose answer lists `NestedVirt` when the host can. Guesthouse doesn't ask yet.
+- Memory and processors for two layers of machines.
+
+What hasn't been tried:
+
+- No machine has booted with it yet: the document is tested, and HCS's answer to it isn't known.
+- With it on, a Windows guest with Secure Boot and a TPM may turn on memory integrity (core isolation), which runs Windows' hypervisor inside the guest. How that sits with GPU-PV hasn't been tried yet.
+- Whether a guest's own virtual machines get its card, and how fast they run, hasn't been tried.
+
+## Where a machine is kept
+
+A machine's own folder is always `%ProgramData%\Guesthouse\machines\NAME`. It holds `machine.json`, its settings, and `events.log`, as the service writes those as the system and they should never be anywhere a user can reach. Its disks, the record and the guest's account beside them, the installer's copy and `snapshots\` are in that folder too, unless the machine was given a place: then they're in a folder of the machine's name in the folder you chose, such as `D:\vms\NAME`, and the machine's own folder holds `location.json`, which says where (`crates/service-windows/src/store.rs`). It's written through a file of its own renamed over it, so a machine is always in one place. New machine has a Location field with Browse, and empty keeps the machine where machines were always kept. An older app sends none, which is the same. A stopped machine's page shows where its disks are, and Move… asks for a folder and moves them. Default place moves them back to the machine's own folder, which is what an empty folder means to `Move`. It's found again at every start from the machine's own folder.
+
+The folder is somewhere a user chose, and the service works in it as the system, so it's held to rules, and the user's are asked as the user:
+
+- The user asking must be able to list the folder and make a folder in it, which the service tries by opening it as them, as it does for a shared folder. It must be the folder itself, by its own path: not a link or a junction, and not reached through one. It must be on a fixed drive of this PC, not removable, a network drive or a share, and not the service's own folder or in it.
+- The machine's folder in it is made by the service in one step, owned by the administrators, with the system and administrators the only ones who may open it or anything made in it, as the root's folders are by inheriting it. It must not be there already, and nothing else is made: not the folder you named, and not its parents.
+- You may own the folder it's in, so you could rename the machine's folder away and put a link in its place, which the service would then write through as the system. So the service holds each such folder open as it runs, without letting anyone delete or rename it, which also stops the folders it's in from being renamed. It only holds a folder that is a folder by its own path, not a link, and owned by the system or administrators, which a folder you made yourself isn't, and holds it again, which checks that again, at every start of the service and each time the app asks how the machines stand, and before anything is done to a stopped machine, so a drive that goes while the service runs is a problem at once, and another drive's folder at the same letter isn't trusted. A place that can't be trusted isn't read at all: Status, Account and a bug report don't open a file in it. A machine whose folder fails that, or isn't there, as its drive is off, is listed with the reason, and can't be started, grown, snapshotted or moved. Its settings are still there, and it's looked for again each time the app asks, so it's back with its drive. Delete forgets it and leaves the folder, which isn't trusted to be deleted.
+
+Move copies, checks, switches, and only then deletes:
+
+1. The machine must be stopped and not busy, the target must be a place as above with no folder of the machine's name in it, not the place it's in and not inside it, and the target's drive must have room for every file with 64 MiB to spare.
+2. It's done on a thread of its own, with the machine busy meanwhile as for a snapshot, and says what it's doing in the machine's log: how many files and how many GB, and each file of 64 MiB or more as it's copied. A single large disk's copy has no progress inside it.
+3. The machine's folder in the target is made as above and held. Everything in the machine's disks' folder is copied but `machine.json`, `location.json` and the events, which stay where they are. A link in it is refused, not followed.
+4. The copy is checked: the same files at the same sizes, and no others. It isn't checked byte for byte.
+5. A differencing disk stores where its parent is, and a copy still reads from the old copy until it's told. So each disk made on another, which `snapshots::links` finds from the index (the machine's disk, each snapshot's, deleted and branched ones' included), is opened without its parents and told its parent's new path with `SetVirtualDiskInformation`, which is `SET_VIRTUAL_DISK_INFO_PARENT_PATH_WITH_DEPTH` with a depth of 1 and, if Windows refuses that, plain `SET_VIRTUAL_DISK_INFO_PARENT_PATH`. Each is then opened with its parents and asked where its parent is (`GET_VIRTUAL_DISK_INFO_PARENT_LOCATION`), and the move fails if that isn't the new path, as a disk still reading the old copy would open until the old copy is deleted. A relative path in the disk can't be relied on, as taking, merging and reverting a snapshot rename disks between `NAME.vhdx` and `snapshots\ID.vhdx`. The installer a Linux guest's record names, in this folder, is rewritten in the machine's record and in each snapshot's.
+6. `location.json` is replaced, and the new place becomes the machine's. Only then is the old copy deleted, emptied while it's held and its folder removed after. If that fails, the disks are already moved, and the machine's log says the old copy is left.
+7. Any failure before that deletes the copy and leaves the machine as it was.
+
+## Snapshots
+
+A stopped machine that has been set up can have up to 32 snapshots, taken, gone back to and deleted from its page. They're a chain of disks, in `snapshots\` in the machine's folder (`crates/host-windows/src/snapshots.rs`). Taking one moves the machine's disk there, to stay as it is from then on, and gives the machine a new disk made on it, which holds only what's written after. Going back to one gives the machine a new disk made on that one. The firmware's state, with the TPM's, and the record beside the disk go into each snapshot as copies and come back with it. A Linux guest's files disk isn't in them, as every boot writes it afresh.
+
+The machine always has a disk: a new one is made under another name and renamed over the old. Taking a snapshot moves the disk before the new one can be made, so the index says what's being done first, and a crash in between is put right when the service or `boot` next starts. Merging a disk can take minutes, so the service does the work on a thread of its own, with the machine busy meanwhile, and the app shows what it's doing. The service makes each snapshot's ID itself and takes only one its index has.
+
+A deleted snapshot is only hidden while another disk is made on it. When the machine's own disk is all that is, the machine's disk is merged into it and takes its place, so deleting the newest snapshot gives its space back at once. A disk made on snapshots can't grow, deleted ones' included, until they've all gone.
+
+## A disk that grows
+
+A stopped machine's disk can be let grow, and never shrinks, as the guest's partitions sit at its start. The guest's last partition takes the room at its next start: `report.ps1` grows C: in Windows, and `gpu.sh` runs `growpart` and `resize2fs` on the root partition in Ubuntu. The service keeps each machine's size in its settings, and reads it from the disk once for a machine from before that.
+
+## Reporting a bug
+
+In the app, Report a problem is in the navigation under New machine, and on the page that says the service can't be reached. Pick the machine it's about, if any, and the kind of problem, say what went wrong, and press Prepare. The page then lists every file in the report with its size, and every part that isn't in it with why. Nothing is sent until you press Send. Save… puts a copy of the archive where you choose, to attach to an issue yourself. Once it's sent, the page shows the report's ID with Copy, and Open an issue, which opens a new issue holding only the ID and the summary's facts (version, Windows build, card, kind, and the machine's system), as an issue is public.
+
+The app does all of it as the user. The service runs as the system, and the user can't read `%ProgramData%\Guesthouse`, so it only hands files over: `ReportFiles` on its pipe answers each file's text in pieces of at most 32 KiB a line, or why a file is missing, from a fixed list. The service's log with the lines about refused requests left out (they may name other users), the installer's `setup.log`, `windows.txt` (the edition and build), `services.txt` (`vmcompute`, `hns` and Guesthouse), `virtual-machine-platform.txt`, `hyper-v-events.txt` (only the events that name a `guesthouse-` machine), `crashes.txt`, `wsl.txt`, and `machines.txt` (each machine's name, system, state and whether it's set up). For a machine you name, only its `machine.json`, its record, `snapshots/index.json` and its events, the last 2 MiB of each. Never the folder's other files: the guest's account and password, the viewer's private key, the disks and the TPM's state. The service writes each machine's events to `events.log` in its folder as one line each, with the time in UTC, and keeps the file's older half in `events.1.log` once it passes 1 MiB, so a report has what happened before the app was open.
+
+The app adds `app.txt` (its version, and whether it's installed) and `panic.txt` if the app crashed. A report is still made when the service is down or says no: the app sends its own part and lists the service's files as missing. Each file is scrubbed in the app, which takes out the user name, the PC's name, the home folder, the machines' names, email addresses, SIDs, MAC addresses and GUIDs, as a best effort on free text, so read the list before you send. Each file is cut to its last 4 MiB, which is halved, up to six times, if the archive is over the 50 MB the report server takes. The archive is `guesthouse-report-DATE-TIME.tar.gz`, made with `tar.exe` in `%TEMP%\guesthouse-app\reports`, and sent with `curl.exe`, both Windows' own, to the same server as the Linux host's reports. It's read by the developer and their automation tools, and deleted after 30 days. `summary.json` and the `X-Report-Summary` header carry the few facts that sort a report, never a machine's name. `GUESTHOUSE_REPORT_ADDRESS` sends somewhere else, for a test.
+
+## What it doesn't do yet
+
+- Snapshots have been tried by their tests, with the disk work in a stand-in, and making, moving and merging a chain of real disk files by a test on Windows. Whether a snapshot keeps what the guest wrote, and whether HCS boots a machine from a disk made on another, haven't been tried, as both need a machine or an elevated prompt.
+- Port forwards and bridging have been tried only by their tests, with `netsh` and HCN behind a stand-in, and the Windows code only built and its tests run. Only `netsh`'s reading was tried against a real PC, by a read-only look: `show rule` takes a name with spaces, and `show rule name=all` prints each rule's name, then a line of dashes, as the parser reads it. Whether `netsh` takes the rule's name with its spaces as Rust passes it for an add, whether an entry for an address in the shared network reaches the guest, whether HCN makes a `Transparent` network with only that policy and gives the guest the router's address, and what a Wi-Fi adapter does, are all still to be seen.
+- Growing a disk has been tried by its tests and by a test on a real VHDX, and the guests' side of it hasn't run in a machine yet. Shared folders have run on a real PC: an Ubuntu guest mounted one with 9p, and a Windows guest mounted three at once, through WinFsp, which it installed quietly with no one signed in. They came up at S:, T: and U:, the third read-only, were seen in the signed-in user's session and by the desktop shortcuts, and stayed through browsing in and out of them in Explorer. Still untried are several folders in an Ubuntu guest, a machine going from several folders to fewer, and what a Windows guest's programs make of the files' times and sizes beyond Explorer's listing.
+
+- Choosing where a machine is kept, and moving it, have been tried by their tests, with the work and the pipe in stand-ins, and the Windows code only built. Nothing has been run on a real Windows host: not the folder's owner and rules, holding it open (a test for that is there and runs only elevated), the check for a link, a junction or a drive that isn't fixed, the free space, or re-pointing a snapshot chain's disks. That `SET_VIRTUAL_DISK_INFO_PARENT_PATH_WITH_DEPTH` takes a depth of 1 on a disk opened without its parents, and that the parent's place reads back as the resolved path, are read from the documentation, and the readback is there so a disk that doesn't follow fails the move. Moving a machine from one drive to another, or a machine whose drive is off, hasn't been seen in the app.
+- A move cut short by a crash or a power cut leaves its copy in the target, which only the system and administrators can delete, and which stops the move being asked again to the same folder until an administrator deletes it. The machine is where it was. Disks left in a machine's own folder, if a move back to it is cut short, stop another move back there in the same way. A fixed drive that's FAT or exFAT has no owner or rules for the service to make, so a machine can't be kept there: the service refuses it, saying it can't read who owns the folder.
+- The installer has installed the service for real, by its pages and with `--silent`, and the service has run as one on a real PC, starting, stopping and changing machines there. Uninstalling, and an update over an older version while a machine runs, have been tried only by their tests.
+- A Windows guest gets only the driver's folder in the driver store. That's what Direct3D needs. The files a driver also puts in `System32`, which some programs look for there, aren't placed yet.
+- An Ubuntu guest without WSL on the host has no `libdxcore.so`, so `nvidia-smi` and CUDA won't run in it.
+- A Windows guest's console, its own display before it's set up or when its network is down, isn't in the app yet. An Ubuntu guest has no screen but SSH.
+- When it fails, HCS's own answer is printed with the document that was sent. That answer names what it refused.

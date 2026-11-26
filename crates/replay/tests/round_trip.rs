@@ -1,5 +1,7 @@
 //! A recording made from the core's own answers must replay clean, and a change must be caught.
 
+#![cfg(target_os = "linux")]
+
 use guesthouse_backend::Backend;
 use guesthouse_backend_standin::{SparseMemory, StandIn};
 use guesthouse_core::{Config, MemoryLimits, ReplyTicket, Session};
@@ -29,6 +31,7 @@ fn settings() -> Vec<(&'static str, String)> {
         ("video_budget", (6u64 << 30).to_string()),
         ("guest_ram", (16u64 << 30).to_string()),
         ("async_messages", "0".into()),
+        ("keep_cpu_views", "1".into()),
         ("window_size", WINDOW_SIZE.to_string()),
     ]
 }

@@ -98,6 +98,7 @@ mod tests {
                     pci: "0000:02:00.0".into(),
                     minor: 0,
                     render_node: None,
+                    memory_mib: None,
                 },
             };
             let boot = Boot::OwnLinux { iso: String::new(), gpu };

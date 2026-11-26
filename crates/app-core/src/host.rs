@@ -4,7 +4,7 @@ use crate::context::Context;
 use crate::failure::Result;
 use crate::guest_memory::NO_ROOM_WORDS;
 use crate::held_memory::used_by_others;
-use crate::machine::{Machine, sorted_names};
+use crate::machine::{MIN_RAM_GIB, Machine, sorted_names};
 use guesthouse_daemon::slot::Slot;
 use rustix::fs::statvfs;
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,11 +21,20 @@ pub const IO_SPACE_GIB: u64 = 2;
 const HOST_SHARE_DIVISOR: u64 = 4;
 /// A desktop with a browser and Steam open, and the viewer and the daemon beside them.
 pub const HOST_KEEPS_LEAST_GIB: u64 = 6;
+/// What the host can get by on, with little open beside the viewer and the daemon. It keeps this little
+/// only when keeping its share would leave no room for a GPU machine of the least size, and the start
+/// still checks what is free then.
+pub const HOST_KEEPS_FLOOR_GIB: u64 = 3;
 /// What the host always kept, which on a large PC is plenty.
 pub const HOST_KEEPS_MOST_GIB: u64 = 16;
+/// What a GPU guest's IO space is counted at when it starts. It's empty then, and fills only as far as
+/// the guest's locked allocations go, so this is several times what a Windows desktop takes. The limit
+/// on what a machine can be given still counts it at [`IO_SPACE_GIB`].
+pub const IO_AT_START_GIB: u64 = 1;
 /// What has to stay free when a GPU machine starts, beside its RAM and IO space, so the host isn't left
-/// with nothing the moment the guest's RAM is claimed.
-pub const FREE_AT_START_GIB: u64 = 2;
+/// with nothing the moment the guest's RAM is claimed. Free swap counts toward it, as what sits idle on
+/// the host can go there. On a 16 GiB PC every GiB kept here is one a program can't have open.
+pub const FREE_AT_START_GIB: u64 = 1;
 const KIB: u64 = 1024;
 
 /// The numbers of `cpuN` folders.
@@ -99,9 +108,25 @@ impl RamOffer {
         Self { total, keeps: host_keeps(total), others }
     }
 
-    /// The most RAM a GPU machine can have, in GiB.
+    /// The most RAM a GPU machine can have, in GiB. On a PC that's short of its share, that's still
+    /// the least a machine runs on, if the host can keep its floor beside it.
     pub fn limit_gib(&self) -> u64 {
-        self.total.saturating_sub(self.keeps + IO_SPACE_GIB * GIB + self.others) / GIB
+        let least = u64::from(MIN_RAM_GIB);
+        let comfortable = self.after_keeping(self.keeps);
+        if comfortable < least && self.tight(least) { least } else { comfortable }
+    }
+
+    /// What's left for a GPU machine, in GiB, when the host keeps `keeps` bytes.
+    fn after_keeping(&self, keeps: u64) -> u64 {
+        self.total.saturating_sub(keeps + IO_SPACE_GIB * GIB + self.others) / GIB
+    }
+
+    /// Whether a machine of `least` GiB fits only by the host keeping less than its share. Not while other
+    /// VMs hold RAM: stopping one is the better way to make room.
+    pub fn tight(&self, least: u64) -> bool {
+        self.others < GIB / 2
+            && self.after_keeping(self.keeps) < least
+            && self.after_keeping(HOST_KEEPS_FLOOR_GIB * GIB) >= least
     }
 
     /// Where the RAM goes, as a sentence.
@@ -120,6 +145,14 @@ impl RamOffer {
     /// What a RAM setting says under it, for a machine that needs at least `least` GiB.
     pub fn explanation(&self, least: u64) -> String {
         let limit = self.limit_gib();
+        if self.tight(least) {
+            let keeps = self.total / GIB - least - IO_SPACE_GIB;
+            return format!(
+                "{least} GiB, the least a GPU machine runs on. This PC has {} GiB of RAM, so it keeps only about \
+                 {keeps} GiB for itself while the machine runs, not the {HOST_KEEPS_LEAST_GIB} GiB it would like.",
+                self.total / GIB
+            );
+        }
         if limit >= least {
             return format!("Up to {limit} GiB. {}", self.reasons());
         }
@@ -202,8 +235,24 @@ pub fn fits_now(context: &Context, ram_bytes: u64) -> Option<String> {
         return None;
     }
     let available = available_ram(context);
-    let needed = ram_bytes + (IO_SPACE_GIB + FREE_AT_START_GIB) * GIB;
-    (needed > available).then(|| short_now(ram_bytes, available))
+    let swap = meminfo_bytes(context, "SwapFree");
+    (!room_for(ram_bytes, available, swap)).then(|| short_now(ram_bytes, available))
+}
+
+/// Whether the guest's RAM and IO space fit in RAM, with what has to stay free beside them in RAM
+/// or swap.
+fn room_for(ram_bytes: u64, available: u64, swap: u64) -> bool {
+    let claimed = ram_bytes + IO_AT_START_GIB * GIB;
+    let kept = FREE_AT_START_GIB * GIB;
+    available >= claimed && available + swap.min(kept) >= claimed + kept
+}
+
+/// The most RAM, in GiB, a GPU machine that wants `wanted_gib` can start with now, if that's less
+/// than it wants but still enough for Windows. `None` if all of it fits, or if not even the least does.
+pub fn smaller_start(context: &Context, wanted_gib: u32) -> Option<u32> {
+    // All of it fits, so there's nothing smaller to offer.
+    fits_now(context, u64::from(wanted_gib) * GIB)?;
+    (MIN_RAM_GIB..wanted_gib).rev().find(|gib| fits_now(context, u64::from(*gib) * GIB).is_none())
 }
 
 pub fn short_now(ram_bytes: u64, available: u64) -> String {
@@ -213,7 +262,7 @@ pub fn short_now(ram_bytes: u64, available: u64) -> String {
          again. Or give it less RAM.",
         ram_bytes.div_ceil(GIB),
         available / GIB,
-        IO_SPACE_GIB + FREE_AT_START_GIB,
+        IO_AT_START_GIB + FREE_AT_START_GIB,
     )
 }
 
@@ -335,6 +384,20 @@ mod tests {
     }
 
     #[test]
+    fn a_pc_short_of_its_share_keeps_less_so_the_least_machine_fits() {
+        let issue_197 = RamOffer::new(11 * GIB + GIB / 2, 0);
+        assert!(issue_197.tight(4));
+        assert_eq!(issue_197.limit_gib(), 4);
+        let said = issue_197.explanation(4);
+        assert!(said.starts_with("4 GiB, the least") && said.contains("keeps only about 5 GiB"), "{said}");
+        let field = RamField::new(issue_197.limit_gib(), 4, 16, said);
+        assert_eq!((field.fits, field.value), (true, 4));
+        assert!(!RamOffer::new(sold_with(8), 0).tight(4), "an 8 GB PC can't keep its floor beside 4 GiB");
+        assert!(!RamOffer::new(sold_with(16), 0).tight(4), "a 16 GB PC has room with its share");
+        assert!(!RamOffer::new(16 * GIB, 6 * GIB).tight(4), "another VM's RAM still counts");
+    }
+
+    #[test]
     fn a_setting_never_offers_a_machine_that_cant_start() {
         let short = RamField::new(2, 4, 16, "why".into());
         assert_eq!((short.lower, short.upper, short.value, short.fits), (4, 4, 4, false));
@@ -363,14 +426,40 @@ mod tests {
         context.ram_limit = None;
         context.meminfo = scratch.write("meminfo", "MemTotal: 31457280 kB\nMemAvailable: 26214400 kB\n");
         assert_eq!(fits_now(&context, 12 * GIB), None);
-        assert_eq!(fits_now(&context, 21 * GIB), None, "25 GiB free holds 21 with 4 to spare");
-        let short = fits_now(&context, 22 * GIB).unwrap();
+        assert_eq!(fits_now(&context, 23 * GIB), None, "25 GiB free holds 23 with 2 to spare");
+        let short = fits_now(&context, 24 * GIB).unwrap();
         assert!(
-            short.starts_with("This machine needs 22 GiB of RAM, and 25 GiB is free right now"),
+            short.starts_with("This machine needs 24 GiB of RAM, and 25 GiB is free right now"),
             "{short}"
         );
         assert!(short.contains("Close some programs"), "{short}");
         assert!(crate::guest_memory::is_no_room(&crate::Failure(short)));
+    }
+
+    #[test]
+    fn a_16_gib_pc_starts_6_gib_beside_7_gib_of_programs() {
+        let scratch = Scratch::new();
+        let mut context = crate::testing::scratch_context(&scratch);
+        context.ram_limit = None;
+        // 15 GiB the kernel offers, of which 7.5 GiB is free.
+        context.meminfo = scratch.write("meminfo", "MemTotal: 15728640 kB\nMemAvailable: 7864320 kB\n");
+        assert!(fits_now(&context, 6 * GIB).is_some(), "with no swap, 1 GiB has to stay free in RAM");
+        assert_eq!(smaller_start(&context, 6), Some(5), "but 5 GiB starts");
+        let with_swap = "MemTotal: 15728640 kB\nMemAvailable: 7864320 kB\nSwapFree: 4194304 kB\n";
+        context.meminfo = scratch.write("meminfo", with_swap);
+        assert_eq!(fits_now(&context, 6 * GIB), None, "swap holds what stays free");
+        assert_eq!(smaller_start(&context, 6), None, "all of it fits");
+        assert!(fits_now(&context, 7 * GIB).is_some(), "the guest's RAM itself never counts on swap");
+    }
+
+    #[test]
+    fn a_start_too_short_for_the_least_is_refused() {
+        let scratch = Scratch::new();
+        let mut context = crate::testing::scratch_context(&scratch);
+        context.ram_limit = None;
+        context.meminfo = scratch.write("meminfo", "MemTotal: 15728640 kB\nMemAvailable: 5242880 kB\n");
+        assert_eq!(smaller_start(&context, 6), None, "5 GiB free can't hold 4 with 2 beside it");
+        assert!(fits_now(&context, 4 * GIB).is_some());
     }
 
     #[test]

@@ -2,46 +2,78 @@
 //! the app watches the small file it leaves.
 
 mod amd_files;
+mod amd_package;
 mod amd_start;
+pub mod android;
+mod api_stage;
+pub(crate) mod copy_identity;
 mod desktop;
+mod diagnose;
 mod display;
+mod driver_store;
 mod gpu_check;
 mod guest_files;
 mod guest_upload;
+mod hardware_desktop;
 mod identity;
 mod identity_restart;
 mod identity_switch;
 mod install;
+mod intel_device;
+mod intel_files;
+mod late_watch;
+mod lean;
+mod macos;
+mod macos_install;
+mod nvme_move;
 mod own_linux;
+mod recipe;
+mod remote_access;
+mod scan_exclusions;
 mod ubuntu;
+mod window_speed;
 
 use amd_files::{bring_amd_driver_up_to_date, complete_host_driver};
+use amd_package::register_amd_package;
 pub use desktop::{apply_share, boots, rebooted};
 use desktop::{note_boot, set_up_desktop, wait_for_desktop};
-use gpu_check::check_gpu;
-use guest_files::{place_driver_files, place_profile_store};
-use identity::{after_failed_gpu, set_up_identity};
+pub use diagnose::{API_FILE, GATHERED_FOLDER, PROBE_FILE, REPORT_FILE};
+use gpu_check::{Gpu, confirm_gpu};
+use guest_files::{
+    name_display, place_amd_runtime, place_driver_files, place_nvapi_wrapper, place_profile_store,
+    place_system_files, register_media_transforms, write_device_key,
+};
+use identity::set_up_identity;
+pub(crate) use identity::will_stage;
 use identity_restart::restart_after_switch;
 use identity_switch::{new_vm_needed, stop_for_new_identity};
 pub use install::{
     INSTALL_STEPS, answer_disc_path, answer_file, install, install_step, make_answer_disc, wait_for_setup,
 };
+use intel_files::complete_intel_driver;
+pub(crate) use nvme_move::{pending as nvme_pending, state_files as nvme_state_files};
+use remote_access::apply_remote_access;
+use window_speed::apply_window_speed;
 
+use crate::auto_snapshot::{self, AutoStart};
 use crate::context::Context;
 use crate::disk_image::disk_size_gib;
 use crate::failure::{Failure, Result};
 use crate::gpu_identity::{PciIdentity, read_state};
+use crate::gpu_maker::GpuMaker;
 use crate::guest_memory::is_no_room;
-use crate::host::{GIB, cpu_list, fits_now, ram_limit_for, vcache_cpus};
+use crate::host::{GIB, cpu_list, fits_now, ram_limit_for, smaller_start, vcache_cpus};
+use crate::kept_logs;
 use crate::library::MAX_DISK_GIB;
 use crate::log::{clock_text, write_log};
 use crate::machine::{Kind, Machine, load};
 use crate::monitor::Command as Qmp;
 use crate::network_settings::other_machines;
 use crate::processes::qemu_pid;
-use crate::settings::max_vram_gib;
+use crate::screen_gpu::setup_card;
+use crate::settings::max_vram_gib_for;
 use crate::snapshots::{delete_snapshot, go_back, take_snapshot};
-use crate::start_checks::{start_problems, video_cap};
+use crate::start_checks::{card_mates, start_problems, video_cap};
 use crate::tasks::{TaskRecord, write_task};
 use crate::text::shell_quote;
 use crate::vm_args::{Boot, VmPlan};
@@ -63,6 +95,12 @@ const SIGTERM_WAIT_SECONDS: u64 = 20;
 const SIGKILL_WAIT_SECONDS: u64 = 10;
 const FORCE_POLL: Duration = Duration::from_millis(200);
 pub(crate) const KEY_POLL: Duration = Duration::from_millis(500);
+/// Runs a machine's recipe again, as its settings ask.
+pub const RECIPE_TASK: &str = "recipe";
+/// Makes a lean machine lean again, as its settings ask.
+pub const LEAN_TASK: &str = "lean";
+/// Has Defender scan the folders a machine left out, as its settings ask.
+pub const SCAN_ALL_TASK: &str = "scan_all";
 
 /// The running side of a task: reports steps, and holds what the actions need.
 pub struct Task<'a> {
@@ -71,11 +109,39 @@ pub struct Task<'a> {
     pub action: String,
     pub machine: Machine,
     pub error: String,
+    /// The RAM a GPU machine starts with this time, when less than its own is free. The machine keeps
+    /// its own, so the next start asks for all of it again.
+    pub ram_this_run: Option<u32>,
+    /// The desktop on the card is still to be watched once the start is reported done.
+    watch_after_start: bool,
+    /// What a start's snapshot before it has to finish, and tell.
+    pub(crate) auto: AutoStart,
+    /// Every step said, in order, as the log has them.
+    #[cfg(test)]
+    pub(crate) said: std::sync::Mutex<Vec<String>>,
 }
 
 impl<'a> Task<'a> {
     pub fn new(context: &'a Context, host: &'a dyn VmHost, action: &str, machine: Machine) -> Self {
-        Self { context, host, action: action.to_owned(), machine, error: String::new() }
+        Self {
+            context,
+            host,
+            action: action.to_owned(),
+            machine,
+            error: String::new(),
+            ram_this_run: None,
+            watch_after_start: false,
+            auto: AutoStart::default(),
+            #[cfg(test)]
+            said: std::sync::Mutex::default(),
+        }
+    }
+
+    /// The machine as it starts this time.
+    fn machine_this_run(&self) -> Machine {
+        let mut machine = self.machine.clone();
+        machine.ram_gib = self.ram_this_run.unwrap_or(machine.ram_gib);
+        machine
     }
 
     fn record(&self, pid: u32, step: &str) -> TaskRecord {
@@ -90,6 +156,8 @@ impl<'a> Task<'a> {
 
     pub fn step(&self, text: &str) {
         println!("{} {} {text}", clock_text(), self.action);
+        #[cfg(test)]
+        self.said.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(text.to_owned());
         // A step that can't be written costs the user a line of progress, and the task goes on.
         let _ = write_task(self.context, None, &self.record(std::process::id(), text));
     }
@@ -119,10 +187,13 @@ impl<'a> Task<'a> {
     }
 }
 
+pub use android::card_of as android_card_of;
+pub use macos::start_refusal as macos_start_refusal;
+
 /// The plan for this machine, in this task's slot, as things stand on the PC now.
 pub fn plan_for(context: &Context, machine: &Machine, boot: Boot) -> VmPlan {
-    let others = other_machines(context);
-    let cap = video_cap(machine, &others, max_vram_gib(context));
+    let mates = card_mates(machine, &other_machines(context), &setup_card(context));
+    let cap = video_cap(machine, &mates, max_vram_gib_for(context, machine));
     let mut plan = VmPlan::new(context, machine, boot, context.slot, cap);
     if machine.vcache_pin {
         plan.pin = Some(cpu_list(&vcache_cpus(&context.cpus)));
@@ -134,7 +205,7 @@ pub fn plan_for(context: &Context, machine: &Machine, boot: Boot) -> VmPlan {
 /// still short after that, the start says so.
 fn wait_for_memory(task: &Task) {
     let end = task.now() + MEMORY_WAIT;
-    let ram = u64::from(task.machine.ram_gib) * GIB;
+    let ram = u64::from(task.machine_this_run().ram_gib) * GIB;
     while fits_now(task.context, ram).is_some() && task.now() < end {
         task.sleep(KEY_POLL);
     }
@@ -147,6 +218,12 @@ pub fn start(task: &mut Task) -> Result<()> {
     if task.machine.own_linux_gpu() {
         return own_linux::start(task);
     }
+    if task.machine.macos() {
+        return macos::start(task);
+    }
+    if task.machine.android() {
+        return android::start(task);
+    }
     let machine = task.machine.clone();
     if machine.has_gpu() {
         wait_for_memory(task);
@@ -157,20 +234,40 @@ pub fn start(task: &mut Task) -> Result<()> {
     if machine.has_gpu()
         && let Some(short) = fits_now(task.context, u64::from(machine.ram_gib) * GIB)
     {
-        return Err(Failure(short));
+        // Less than it wants is better than not starting at all.
+        task.ram_this_run = Some(smaller_start(task.context, machine.ram_gib).ok_or(Failure(short))?);
     }
     if !machine.has_gpu() {
         task.step("Starting the VM");
         let plan = plan_for(task.context, &machine, Boot::Plain { iso: machine.iso.clone() });
         return task.host.start(&plan, &machine);
     }
-    boot(task)
+    auto_snapshot::before_start(task);
+    boot(task)?;
+    auto_snapshot::start_succeeded(task);
+    if !task.auto.note.is_empty() {
+        task.error = [task.auto.note.as_str(), &task.error].join(" ").trim().to_owned();
+    }
+    if let Some(gib) = task.ram_this_run {
+        let note = smaller_start_note(gib, machine.ram_gib);
+        task.error = [note.as_str(), &task.error].join(" ").trim().to_owned();
+    }
+    Ok(())
+}
+
+/// What a machine that started with less RAM than its own is told.
+pub fn smaller_start_note(gib: u32, own: u32) -> String {
+    format!(
+        "Only room for {gib} GiB of RAM, so Windows has {gib} GiB this time, not {own}. Close some programs \
+         before the next start to give it all {own}."
+    )
 }
 
 /// Starts a GPU machine. One that fails leaves nothing running, and says why.
 fn boot(task: &mut Task) -> Result<()> {
     task.step("Starting the VM");
     let shown = start_gpu_vm(task)?;
+    crate::token_change::finish_token_change(task.context, &task.machine, task.context.agent_port(None));
     let ready = get_ready(task, shown);
     if ready.is_err() {
         turn_off_after_failed_start(task);
@@ -178,10 +275,29 @@ fn boot(task: &mut Task) -> Result<()> {
     ready
 }
 
-/// Starts QEMU and the daemon, and says which identity the render device has in this VM.
+/// Starts QEMU and the daemon, and says which identity the render device has in this VM. A machine
+/// whose first start on NVMe fails goes back to SATA and starts again there: see [`nvme_move`].
 fn start_gpu_vm(task: &mut Task) -> Result<PciIdentity> {
-    let plan = plan_for(task.context, &task.machine, Boot::Gpu);
-    let started = task.host.start(&plan, &task.machine);
+    let started = start_gpu_vm_once(task);
+    let Err(failure) = &started else {
+        // The agent answered, so Windows booted from the disk it was given.
+        nvme_move::passed(task);
+        return started;
+    };
+    if !nvme_move::on_trial(task.context, &task.machine) {
+        return started;
+    }
+    nvme_move::give_up(task, &failure.0)?;
+    wait_for_memory(task);
+    let shown = start_gpu_vm_once(task)?;
+    task.error = [nvme_move::BACK_ON_SATA, &task.error].join(" ").trim().to_owned();
+    Ok(shown)
+}
+
+fn start_gpu_vm_once(task: &mut Task) -> Result<PciIdentity> {
+    let machine = task.machine_this_run();
+    let plan = plan_for(task.context, &machine, Boot::Gpu);
+    let started = task.host.start(&plan, &machine);
     if started.is_err() && task.pid().is_none() {
         // The daemon and shared memory are still there.
         task.host.release()?;
@@ -191,37 +307,121 @@ fn start_gpu_vm(task: &mut Task) -> Result<PciIdentity> {
 
 /// The guest has answered, so this takes it from there to a desktop someone can use.
 fn get_ready(task: &mut Task, shown: PciIdentity) -> Result<()> {
-    get_gpu_ready(task)?;
-    if new_vm_needed(shown, &read_state(task.context, &task.machine), &task.machine) {
-        start_again_for_new_identity(task)?;
-        get_gpu_ready(task)?;
+    intel_device::switch_back_on(task, shown)?;
+    let picture_first = hardware_desktop::picture_first(task);
+    // A guest left running without its GPU stays as it came up, for the reports it's kept for.
+    if get_gpu_ready_on_this_desktop(task, picture_first)? != Gpu::Working {
+        return Ok(());
     }
+    let new_identity = new_vm_needed(shown, &read_state(task.context, &task.machine), &task.machine);
+    let to_nvme = nvme_move::ready_windows(task)?;
+    if new_identity || to_nvme {
+        start_again_in_new_vm(task, new_identity)?;
+        if get_gpu_ready_on_this_desktop(task, picture_first)? != Gpu::Working {
+            return Ok(());
+        }
+    }
+    intel_device::switch_off_for_software_desktop(task, shown)?;
     set_up_desktop(task)?;
-    if task.machine.windows_amd_card().is_some() {
-        // What follows places NVIDIA's files and settings store, which a guest on AMD has no use for.
-        return bring_amd_driver_up_to_date(task);
+    if let Some(why) = hardware_desktop::no_picture(task) {
+        return start_again_on_software_desktop(task, &why).map(|_| ());
     }
-    place_driver_files(task)?;
-    place_profile_store(task)
+    finish_on_desktop(task)?;
+    // The picture is up, so the start is done, and the watch goes on behind it.
+    task.watch_after_start = picture_first && hardware_desktop::watched(task);
+    Ok(())
+}
+
+/// The settings and the card maker's files, which are all asked of the guest. A VM that has gone by
+/// now, as one shut down from Windows' own menu while an Intel desktop was watched has, leaves no
+/// guest to ask: the start says how it went instead of what the guest didn't answer.
+fn finish_on_desktop(task: &mut Task) -> Result<()> {
+    if task.pid().is_none() {
+        let slot = task.context.slot.number();
+        task.error =
+            crate::stopped::said_for_a_stop(task.context, &task.machine, slot).unwrap_or_default().to_owned();
+        return Ok(());
+    }
+    apply_window_speed(task)?;
+    apply_remote_access(task)?;
+    place_files_for_maker(task)
+}
+
+/// What the guest is given for its card, by the card's maker. Each maker's files and settings are for
+/// its own driver only.
+fn place_files_for_maker(task: &mut Task) -> Result<()> {
+    match task.machine.windows_maker() {
+        Some(GpuMaker::Nvidia) => {
+            place_driver_files(task)?;
+            place_nvapi_wrapper(task)?;
+            place_profile_store(task)?;
+            register_media_transforms(task)?;
+            name_display(task)
+        }
+        Some(GpuMaker::Amd) => {
+            bring_amd_driver_up_to_date(task)?;
+            place_amd_runtime(task)?;
+            register_amd_package(task)
+        }
+        // Intel's support is new, so there is no earlier layout of its driver to bring up to date. The
+        // guest has the loaders from install, and this puts back any it lacks. Another maker's files
+        // would put a driver in the guest that isn't its card's.
+        Some(GpuMaker::Intel) => {
+            write_device_key(task)?;
+            place_system_files(task)
+        }
+        None => Ok(()),
+    }
 }
 
 /// Up to the point where it's known which identity the VM should show, before any work on a desktop
 /// that might be about to go.
-fn get_gpu_ready(task: &mut Task) -> Result<()> {
+fn get_gpu_ready(task: &mut Task) -> Result<Gpu> {
     task.step("Waiting for the desktop");
     if !wait_for_desktop(task) {
         return Err(Failure::new("Windows started, but its desktop never came up."));
     }
-    check_gpu(task).map_err(|failure| after_failed_gpu(task, failure))?;
-    restart_after_switch(task)?;
+    // Before the check, as a guest missing a file of Intel's driver has no GPU until it has the file.
+    complete_intel_driver(task)?;
+    if confirm_gpu(task)? == Gpu::Missing || restart_after_switch(task)? == Gpu::Missing {
+        return Ok(Gpu::Missing);
+    }
     set_up_identity(task);
-    Ok(())
+    Ok(Gpu::Working)
 }
 
-/// The same start goes on in a new VM, which shows the card maker's number. What the first one said is about a
-/// VM that's gone.
-fn start_again_for_new_identity(task: &mut Task) -> Result<()> {
-    stop_for_new_identity(task)?;
+/// [`get_gpu_ready`], and for a desktop on an Intel card, a watch until it has stayed up, unless
+/// this start shows its picture first and is watched after. One that
+/// failed is started again on the software desktop, and what that start found is then the answer.
+fn get_gpu_ready_on_this_desktop(task: &mut Task, picture_first: bool) -> Result<Gpu> {
+    let gpu = get_gpu_ready(task)?;
+    let Some(why) = hardware_desktop::failed(task, gpu == Gpu::Missing, picture_first) else {
+        return Ok(gpu);
+    };
+    start_again_on_software_desktop(task, &why)
+}
+
+/// A desktop on an Intel card that failed, for `why`: the machine goes to the software desktop and
+/// is started again on it, and what that start found is then the answer.
+fn start_again_on_software_desktop(task: &mut Task, why: &str) -> Result<Gpu> {
+    let told = hardware_desktop::fall_back_and_stop(task, why)?;
+    wait_for_memory(task);
+    task.error.clear();
+    let shown = start_gpu_vm(task)?;
+    get_ready(task, shown)?;
+    task.error = if task.error.is_empty() { told } else { format!("{told} {}", task.error) };
+    Ok(Gpu::StartedAgain)
+}
+
+/// The same start goes on in a new VM, which shows the card maker's number if `new_identity`, and has
+/// the disk on NVMe if the machine is now there. What the first one said is about a VM that's gone.
+fn start_again_in_new_vm(task: &mut Task, new_identity: bool) -> Result<()> {
+    if new_identity {
+        stop_for_new_identity(task)?;
+    } else {
+        task.step(nvme_move::MOVING);
+        task.host.stop(&task.machine, STOP_WAIT_SECONDS)?;
+    }
     wait_for_memory(task);
     task.error.clear();
     start_gpu_vm(task).map(|_| ())
@@ -264,12 +464,21 @@ fn after_reboot(task: &mut Task) -> Result<()> {
     set_up_desktop(task)
 }
 
+/// macOS takes no request to shut down at its login screen, by key or by power button, and holds one
+/// up while it asks about a document that isn't saved.
+const MACOS_TURNED_OFF: &str = "macOS did not shut down, so the VM was turned off. It only shuts down \
+                                when asked once someone is logged in, and waits if a document isn't saved.";
+
 fn stop(task: &mut Task) -> Result<()> {
     let gpu = task.machine.has_gpu();
     task.step(if gpu { "Shutting down Windows" } else { "Shutting down" });
     if task.host.stop(&task.machine, STOP_WAIT_SECONDS)? == Stopped::TurnedOff {
         let who = if gpu { "Windows" } else { "The guest" };
-        task.error = format!("{who} did not shut down in time, so the VM was turned off.");
+        task.error = if task.machine.macos() {
+            MACOS_TURNED_OFF.to_owned()
+        } else {
+            format!("{who} did not shut down in time, so the VM was turned off.")
+        };
     }
     Ok(())
 }
@@ -320,6 +529,11 @@ fn resume(task: &mut Task) -> Result<()> {
 }
 
 pub fn grow(task: &mut Task, gib: u32) -> Result<()> {
+    if task.machine.android() {
+        return Err(Failure::new(
+            "Android sizes its data when it formats it, so an Android machine's disk can't grow.",
+        ));
+    }
     if task.pid().is_some() {
         return Err(Failure::new("The disk can only grow while the VM is off."));
     }
@@ -345,11 +559,16 @@ fn run_action(task: &mut Task, arguments: &[String]) -> Result<()> {
     let first = arguments.first().map(String::as_str);
     let text = first.unwrap_or_default();
     match task.action.as_str() {
-        "start" => start(task),
+        "start" => {
+            // Each start is a look at the library, as the app's is.
+            crate::throwaway::delete_finished(task.context);
+            start(task).map(|()| recipe::after_start(task))
+        }
         "stop" => stop(task),
         "force" => force(task, first),
         "grow" => grow(task, text.parse().map_err(|_| Failure::new("That is not a size."))?),
         "resume" => resume(task),
+        "dxdiag" | "api-check" => diagnose::dxdiag(task),
         "clean_up" => clean_up(task),
         "after_reboot" => after_reboot(task),
         "apply_display" => {
@@ -360,11 +579,22 @@ fn run_action(task: &mut Task, arguments: &[String]) -> Result<()> {
             display::install_display(task);
             Ok(())
         }
+        crate::remote_access::APPLY_TASK => remote_access::apply_change(task),
+        RECIPE_TASK => recipe::run_again(task),
+        LEAN_TASK => lean::run_again(task),
+        SCAN_ALL_TASK => scan_exclusions::scan_all(task),
+        "install" if task.machine.macos() => macos_install::install(task),
         "install" if task.machine.kind == Kind::Linux => ubuntu::install(task),
         "install" => install(task),
         "take_snapshot" => take_snapshot(task, text),
         "go_back" => go_back(task, text),
         "delete_snapshot" => delete_snapshot(task, text),
+        crate::export::EXPORT_TASK => crate::export::export(task, text),
+        crate::duplicate::DUPLICATE_TASK => {
+            let said = |word: &str| arguments.iter().skip(1).any(|given| given == word);
+            let throwaway = said(crate::duplicate::THROWAWAY_WORD);
+            crate::duplicate::duplicate(task, text, throwaway, said(crate::duplicate::DELETE_WORD))
+        }
         other => Err(Failure(format!("There is no action called {}.", shell_quote(other)))),
     }
 }
@@ -387,20 +617,21 @@ pub fn run_task(
     machine_id: &str,
     arguments: &[String],
 ) -> Result<()> {
-    let machine = match load(context, machine_id) {
-        Ok(machine) => machine,
-        Err(error) => {
-            let record = TaskRecord {
-                action: action.to_owned(),
-                machine: machine_id.to_owned(),
-                pid: 0,
-                step: String::new(),
-                error: error.0.clone(),
-            };
-            let _ = write_task(context, None, &record);
-            return Err(error);
-        }
-    };
+    let machine =
+        match crate::machine::id_from_argument(context, machine_id).and_then(|id| load(context, &id)) {
+            Ok(machine) => machine,
+            Err(error) => {
+                let record = TaskRecord {
+                    action: action.to_owned(),
+                    machine: machine_id.to_owned(),
+                    pid: 0,
+                    step: String::new(),
+                    error: error.0.clone(),
+                };
+                let _ = write_task(context, None, &record);
+                return Err(error);
+            }
+        };
     let mut task = Task::new(context, host, action, machine);
     let lock = if action == "force" { Ok(None) } else { take_lock(context).map(Some) };
     let result = lock.and_then(|_lock| run_action(&mut task, arguments));
@@ -408,8 +639,29 @@ pub fn run_task(
         task.error = error.0.clone();
     }
     task.finish();
+    keep_ended_run(context, action);
     let _ = writeln!(std::io::stdout(), "{} {action} finished", clock_text());
+    if result.is_ok() && task.watch_after_start {
+        late_watch::watch_after_start(&mut task);
+    }
+    // Also once the start is reported done, and never part of it.
+    if result.is_ok() && action == "start" {
+        scan_exclusions::after_start(&mut task);
+        lean::after_start(&mut task);
+    }
     result
+}
+
+/// Once a VM has ended, its logs are copied where a reboot leaves them. A run that ended unseen is
+/// kept at the next start in its slot instead.
+fn keep_ended_run(context: &Context, action: &str) {
+    let ending = matches!(action, "stop" | "force" | "clean_up");
+    if ending
+        && qemu_pid(context, None).is_none()
+        && let Err(error) = kept_logs::keep_run(context, &context.run_folder(None))
+    {
+        let _ = write_log(context, &format!("{action}: the run's logs could not be kept: {error}"));
+    }
 }
 
 #[cfg(test)]

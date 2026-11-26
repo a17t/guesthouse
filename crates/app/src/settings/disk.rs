@@ -1,4 +1,5 @@
-//! The disk's size, and what is in the drive.
+//! The disk's size, on the Overview, and what is in the drive, on the Storage page. A draft has neither
+//! yet: New Machine sets its size and its disc.
 
 use super::{Shared, is_off};
 use crate::common::in_background;
@@ -26,17 +27,26 @@ struct Parts {
 pub struct Disk(Rc<Parts>);
 
 impl Disk {
-    pub fn new(shared: &Shared, page: &adw::PreferencesPage) -> Self {
-        let group = adw::PreferencesGroup::builder().title("Disk").build();
-        page.add(&group);
-        let disk = adw::ActionRow::builder().title("Disk size").subtitle("Reading the disk").build();
+    /// The size goes in `figures`, and the drive in a group of its own on `storage`.
+    pub fn new(shared: &Shared, figures: &adw::PreferencesGroup, storage: &adw::PreferencesPage) -> Self {
+        let draft = shared.is_draft();
+        let android = shared.machine.borrow().android();
+        // An Android machine's size is its data disk's, where its apps go.
+        let title = if android { "Data Disk" } else { "Disk" };
+        let disk =
+            adw::ActionRow::builder().title(title).subtitle("Reading the disk").visible(!draft).build();
         let grow = row_button("Grow");
         grow.set_sensitive(false);
         disk.add_suffix(&grow);
-        group.add(&disk);
-        let plain = shared.machine.borrow().kind == Kind::Plain;
-        let drive = adw::ActionRow::builder().title("ISO").subtitle_lines(1).visible(plain).build();
-        let eject = row_button("Eject");
+        figures.add(&disk);
+        // An Android machine has no drive for a disc: it boots only from its own disk.
+        let plain = shared.machine.borrow().kind == Kind::Plain && !android && !draft;
+        let macos = shared.machine.borrow().macos();
+        let title = if macos { "Installer" } else { "ISO" };
+        let group = adw::PreferencesGroup::builder().title("Disc").visible(plain).build();
+        storage.add(&group);
+        let drive = adw::ActionRow::builder().title(title).subtitle_lines(1).visible(plain).build();
+        let eject = row_button(if macos { "Remove" } else { "Eject" });
         drive.add_suffix(&eject);
         group.add(&drive);
         let this = Self(Rc::new(Parts {
@@ -60,20 +70,33 @@ impl Disk {
 
     fn show_drive(&self) {
         let iso = self.0.shared.machine.borrow().iso.clone();
-        let text = if iso.is_empty() { "Empty. The machine boots from its disk." } else { iso.as_str() };
+        let macos = self.0.shared.machine.borrow().macos();
+        let text = match (iso.is_empty(), macos) {
+            (true, true) => "Removed, so the Mac boots from its disk",
+            (true, false) => "Empty, so the machine boots from its disk",
+            (false, true) => "Apple's installer, to remove once macOS is installed",
+            (false, false) => iso.as_str(),
+        };
         self.0.drive.set_subtitle(&gtk::glib::markup_escape_text(text));
         self.0.eject.set_sensitive(!iso.is_empty());
     }
 
     fn on_eject(&self) {
         let shared = &self.0.shared;
-        shared.change(|machine| eject(&shared.window.context(), machine));
+        shared.change(eject);
         self.show_drive();
     }
 
     fn read_disk(&self) {
+        if self.0.shared.is_draft() {
+            return;
+        }
         let context = self.0.shared.window.context();
-        let disk = self.0.shared.machine.borrow().disk.clone();
+        // An Android machine's size is its data disk's, where its apps go.
+        let disk = {
+            let machine = self.0.shared.machine.borrow();
+            if machine.android() { machine.android_data.clone() } else { machine.disk.clone() }
+        };
         let this = self.clone();
         in_background(
             &context,
@@ -90,17 +113,26 @@ impl Disk {
 
     fn show_size(&self) {
         let off = is_off(&self.0.status.borrow());
+        // Android's data partition is sized when Android formats it, and isn't grown after.
+        self.0.grow.set_visible(!self.0.shared.machine.borrow().android());
         self.0.grow.set_sensitive(off && self.0.size.get().is_some());
+        self.0.grow.set_tooltip_text((!off).then_some("It can only grow while the VM is off."));
         if let Some(size) = self.0.size.get() {
-            let note = if off { "" } else { " It can only grow while the VM is off." };
-            self.0.disk.set_subtitle(&format!("{size} GiB.{note}"));
+            let machine = self.0.shared.machine.borrow();
+            let place = if machine.disk_folder.is_empty() {
+                String::new()
+            } else {
+                format!(" in {}", gtk::glib::markup_escape_text(&machine.disk_folder))
+            };
+            self.0.disk.set_subtitle(&format!("{size} GiB{place}"));
         }
     }
 
     fn on_grow(&self) {
         let Some(current) = self.0.size.get() else { return };
         let smallest = current.trunc() + 1.0;
-        let size = number_row("New size in GiB", smallest, smallest, MAX_DISK_GIB.into());
+        let size = number_row("New Size", smallest, smallest, MAX_DISK_GIB.into());
+        size.set_subtitle("In GiB");
         let dialog = question(
             "Grow the Disk?",
             "The guest will not use the new space until you extend its volume, which on Windows is in Disk \
@@ -111,6 +143,8 @@ impl Disk {
         dialog.set_extra_child(Some(&boxed_rows(&[size.upcast_ref()])));
         let shared = self.0.shared.clone();
         on_yes(&dialog, move || {
+            // A number typed and not yet entered is only taken when the field is told to.
+            size.update();
             let gib = (size.value() as u32).to_string();
             shared.window.launch("grow", &shared.machine.borrow(), &[gib], None);
         });

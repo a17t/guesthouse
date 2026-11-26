@@ -4,17 +4,35 @@ use crate::agent::{GuestAgent, TcpAgent};
 use crate::bridge::BridgeHost;
 use crate::clock::{Clock, RealClock};
 use crate::guest_memory::GuestMemory;
+use crate::guest_shell::{GuestShell, SshShell};
 use crate::jailing::Offer;
 use crate::monitor::{Monitor, QmpMonitor};
 use crate::paths::Paths;
 use crate::vm_args::VmPlan;
 use guesthouse_daemon::slot::Slot;
+use guesthouse_jail::Support;
+use rustix::fs::{Access, access};
 use std::fs::{self, DirBuilder, Permissions};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const PRIVATE_FOLDER: u32 = 0o700;
+/// Where pci.ids is kept: hwdata on Fedora and Arch, misc on Debian and Ubuntu, and on NixOS in the
+/// system's hwdata, which Guesthouse's module adds.
+const PCI_NAMES: [&str; 3] =
+    ["/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids", "/run/current-system/sw/share/hwdata/pci.ids"];
+
+/// Whether this user can open a device to read and write it.
+fn may_open_here(device: &Path) -> bool {
+    access(device, Access::READ_OK | Access::WRITE_OK).is_ok()
+}
+
+/// The first of these that is there, or the first if none is.
+fn first_present(paths: &[&str]) -> PathBuf {
+    let found = paths.iter().find(|path| Path::new(path).exists());
+    PathBuf::from(found.or(paths.first()).copied().unwrap_or_default())
+}
 
 /// A folder that already exists is made private too, as the first run could have made it otherwise.
 fn make_private_folder(folder: &Path) -> std::io::Result<()> {
@@ -49,20 +67,42 @@ pub struct Context {
     /// The DRM class in sysfs, where each render node links to its PCI device.
     pub drm_class: PathBuf,
     pub kvm: PathBuf,
+    /// Makes a dma-buf of a guest's memory. An AMD card takes the memory faster that way.
+    pub udmabuf: PathBuf,
+    /// The largest dma-buf udmabuf makes, in MiB.
+    pub udmabuf_limit: PathBuf,
+    /// The kernel's security modules that are on, Landlock among them or not.
+    pub security_modules: PathBuf,
+    /// AppArmor's profiles, of which swtpm's can keep it out of the run folder.
+    pub apparmor: PathBuf,
     pub driver_version_file: PathBuf,
     pub meminfo: PathBuf,
     /// Makes a GPU guest's memory and claims its RAM. A test has no gigabytes to spare.
     pub reserve_memory: fn(&Context, Slot, u64) -> crate::Result<GuestMemory>,
     /// What this PC offers a GPU machine's jail. A test's pretend programs can't be jailed.
     pub jail_offer: fn(&VmPlan) -> Offer,
+    /// What this kernel has of the jail's parts, which setup warns about before any start.
+    pub jail_support: fn() -> Support,
+    /// Whether this user can open a card's device. A test's cards have none.
+    pub may_open: fn(&Path) -> bool,
+    /// What NVIDIA's driver says of each card's address and memory, as `nvidia-smi`'s lines. A test
+    /// says what its cards have.
+    pub card_memories: fn() -> String,
     /// Stands in for what this PC can give a GPU machine, which depends on everything else running.
     pub ram_limit: Option<u64>,
     pub bridge: BridgeHost,
     pub monitor: Arc<dyn Monitor>,
     pub agent: Arc<dyn GuestAgent>,
+    /// A shell in an Ubuntu guest, over its forwarded SSH port.
+    pub shell: Arc<dyn GuestShell>,
     pub clock: Arc<dyn Clock>,
     /// Replaces the room an install needs, for a test on a small disk.
     pub install_room: Option<u64>,
+    /// A recording of an Intel card that stands in for one, for a lab run on a PC without it. Only
+    /// a process started with the variable that names it has one: see [`Context::from_process`].
+    pub recorded_intel_card: Option<PathBuf>,
+    /// How this process reaches app windows helpers, which a test points at a pretend one.
+    pub app_windows: crate::app_windows::LinkSettings,
 }
 
 impl Context {
@@ -80,27 +120,38 @@ impl Context {
             swaps: "/proc/swaps".into(),
             udev_data: "/run/udev/data".into(),
             pci_devices: "/sys/bus/pci/devices".into(),
-            pci_names: "/usr/share/hwdata/pci.ids".into(),
+            pci_names: first_present(&PCI_NAMES),
             nvidia_cards: "/proc/driver/nvidia/gpus".into(),
             drm_class: "/sys/class/drm".into(),
             kvm: "/dev/kvm".into(),
+            udmabuf: "/dev/udmabuf".into(),
+            udmabuf_limit: "/sys/module/udmabuf/parameters/size_limit_mb".into(),
+            security_modules: "/sys/kernel/security/lsm".into(),
+            apparmor: "/etc/apparmor.d".into(),
             driver_version_file: "/sys/module/nvidia/version".into(),
             meminfo: "/proc/meminfo".into(),
             reserve_memory: GuestMemory::claim,
             jail_offer: Offer::here,
+            jail_support: Support::probe,
+            may_open: may_open_here,
+            card_memories: crate::setup::cards::ask_card_memories,
             ram_limit: None,
             bridge: BridgeHost::default(),
             monitor: Arc::new(QmpMonitor),
             agent: Arc::new(TcpAgent),
+            shell: Arc::new(SshShell::default()),
             clock: Arc::new(RealClock::default()),
             install_room: None,
+            recorded_intel_card: None,
+            app_windows: crate::app_windows::LinkSettings::default(),
         }
     }
 
     /// For this process. A slot that can't be read stops it, as a guess could reach another VM's files.
     pub fn from_process() -> crate::Result<Self> {
         let slot = Slot::from_environment().map_err(|error| crate::Failure::new(error.to_string()))?;
-        Ok(Self::new(Paths::from_process(), slot))
+        let recorded_intel_card = guesthouse_backend_intel::recording::recorded_card_file();
+        Ok(Self { recorded_intel_card, ..Self::new(Paths::from_process(), slot) })
     }
 
     pub fn second_instance(&self) -> bool {
@@ -144,5 +195,15 @@ mod tests {
         for folder in [context.paths.runtime.clone(), context.run_folder(None)] {
             assert_eq!(fs::metadata(folder).unwrap().permissions().mode() & OTHERS, 0);
         }
+    }
+
+    #[test]
+    fn pci_ids_is_found_where_the_distribution_keeps_it() {
+        let scratch = Scratch::new();
+        let fedora = scratch.path("hwdata/pci.ids");
+        let debian = scratch.write("misc/pci.ids", "");
+        let places = [fedora.to_str().unwrap(), debian.to_str().unwrap()];
+        assert_eq!(super::first_present(&places), debian);
+        assert_eq!(super::first_present(&places[..1]), fedora, "none there is the first");
     }
 }

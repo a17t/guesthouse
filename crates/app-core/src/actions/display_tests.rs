@@ -652,3 +652,66 @@ fn a_change_made_while_a_restart_is_owed_credits_nothing_either() {
     rig.run(boot_display);
     assert!(!rig.run(apply_settings).shown_frames);
 }
+
+#[test]
+fn an_intel_machines_driver_is_taken_out_and_kept_out_in_the_software_desktop() {
+    let (mut rig, guest) = Rig::new().with(|context| Guest::new(context, "working", INSTALLED, true));
+    rig.machine.use_windows_card(crate::gpu_maker::GpuMaker::Intel, "0000:03:00.0");
+    fake_package(&rig.scratch, "build 1");
+    rig.say_this_build_is_in("build 1");
+    std::fs::create_dir_all(rig.machine.folder(&rig.context)).unwrap();
+    crate::intel_desktop::fall_back(&rig.context, &rig.machine, "a test of the software desktop").unwrap();
+    let state = rig.run(boot_display);
+    assert_eq!(guest.asked_for("take it out"), 1);
+    assert_eq!(state.driver, Driver::Absent);
+    assert!(state.reason.contains("drawn in software"), "{}", state.reason);
+    assert!(!state.running.unwrap().on_driver);
+    rig.run(boot_display);
+    rig.run(install_again);
+    assert_eq!(guest.asked_for("sign-and-install"), 0, "not at a start, nor when asked");
+    assert_eq!(guest.asked_for("take it out"), 1, "nothing to take out once it is gone");
+}
+
+/// What a B580 tester's machine had in display.json under 0.6.2-intel.3: the driver taken out, and
+/// its build marked as failed, with no word of the app version that marked it.
+const OLDER_APPS_STATE: &str = r#"{
+  "driver": "failed",
+  "package": "",
+  "failed_package": "build 1",
+  "reason": "The display driver installed but sent no picture, so it was taken out and Windows is on its basic display.",
+  "note": "",
+  "running": null,
+  "shown_frames": false,
+  "blank_boots": 2,
+  "restart_owed": false,
+  "offered_hz": 0
+}"#;
+
+#[test]
+fn the_first_start_after_an_older_app_gives_an_intel_hardware_desktop_its_display_driver_again() {
+    let (mut rig, guest) = Rig::new().with(|context| Guest::new(context, "missing", REFUSED, true));
+    rig.machine.use_windows_card(crate::gpu_maker::GpuMaker::Intel, "0000:03:00.0");
+    fake_package(&rig.scratch, "build 1");
+    std::fs::create_dir_all(rig.machine.folder(&rig.context)).unwrap();
+    fs::write(crate::display::state_file(&rig.context, &rig.machine), OLDER_APPS_STATE).unwrap();
+    assert_eq!(
+        crate::intel_desktop::for_start(&rig.context, &rig.machine),
+        guesthouse_backend_intel::stage::Desktop::Hardware
+    );
+    let state = rig.run(boot_display);
+    assert_eq!(guest.asked_for("sign-and-install.ps1 C:"), 1, "the older app's mark is not kept");
+    assert_eq!(state.failed_package, "build 1", "it failed again, on this version");
+    assert_eq!(state.failed_on, crate::updates::VERSION);
+    rig.run(boot_display);
+    assert_eq!(guest.asked_for("sign-and-install.ps1 C:"), 1, "once per version, as for any card");
+}
+
+#[test]
+fn an_older_apps_mark_on_another_card_is_kept() {
+    let (rig, guest) = Rig::new().with(|context| Guest::new(context, "missing", INSTALLED, true));
+    fake_package(&rig.scratch, "build 1");
+    std::fs::create_dir_all(rig.machine.folder(&rig.context)).unwrap();
+    fs::write(crate::display::state_file(&rig.context, &rig.machine), OLDER_APPS_STATE).unwrap();
+    rig.run(boot_display);
+    assert_eq!(guest.asked_for("sign-and-install"), 0);
+}

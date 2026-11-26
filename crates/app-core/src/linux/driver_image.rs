@@ -10,6 +10,7 @@ use super::gpu_off::{
     GUEST_DRIVER_FILES, GUEST_NO_SOURCE, GUEST_TABLES_DIFFER, GUEST_UNKNOWN_DRIVER, GpuOff,
 };
 use super::layout::{BUILT_SOURCES, GUEST_SETUP};
+use super::store_loader;
 use super::tables::{TABLE_FILES, match_the_device, write_tables};
 use crate::failure::Result;
 use crate::iso::iso_maker;
@@ -36,6 +37,8 @@ const SOURCE_ID_LENGTH: usize = 12;
 /// Where the guest's scripts go on the image, for a Linux the user installed to set itself up from.
 pub(super) const SETUP_ON_IMAGE: &str = "setup";
 pub(super) const READ_ONLY: u32 = 0o444;
+/// Where the driver's programs go on the image. One from NixOS needs the guest's loader.
+const PROGRAMS_ON_IMAGE: &str = "bin/";
 
 /// What came of asking for an image.
 #[derive(Debug, PartialEq, Eq)]
@@ -161,6 +164,11 @@ fn copy_file(source: &Path, target: &Path, place: &str) -> Result<()> {
         fs::write(target, driver_files::rewrite_icd(&fs::read_to_string(source)?))?;
     } else if let Some(sibling) = sibling_link(source) {
         symlink(sibling, target)?;
+    } else if place.starts_with(PROGRAMS_ON_IMAGE) {
+        let mut program = fs::read(source)?;
+        store_loader::use_usual_loader(&mut program);
+        fs::write(target, program)?;
+        fs::set_permissions(target, fs::metadata(source)?.permissions())?;
     } else {
         fs::copy(source, target)?;
     }
@@ -205,7 +213,7 @@ fn build(
     let tables = staging.join("tables");
     fs::create_dir_all(&tables)?;
     write_tables(tree, &tables)?;
-    if !match_the_device(&tables)? {
+    if !match_the_device(&tables, loaded)? {
         let detail = format!(
             "Driver {loaded} changes calls that the nvfwd device checks, so this QEMU can't forward them \
              safely. It needs a Guesthouse that knows this driver."
@@ -325,10 +333,10 @@ mod tests {
     #[test]
     fn an_unknown_branch_turns_the_gpu_off_even_with_an_image() {
         let scratch = Scratch::new();
-        let tree = tree(&scratch, "620.11");
+        let tree = tree(&scratch, "625.11");
         let said =
-            reason(prepare(&host("620.11"), &sources(&scratch), &tree, &scratch.path("images")).unwrap());
-        assert!(said.contains("branch 620"));
+            reason(prepare(&host("625.11"), &sources(&scratch), &tree, &scratch.path("images")).unwrap());
+        assert!(said.contains("branch 625"));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use super::*;
 use crate::machine::load;
 use crate::network::Mode;
+use crate::remote_access::{Access, NO_OPENSSH, read_access};
 
 fn refused(context: &Context, words: &str) -> String {
     match said(context, words).1 {
@@ -133,6 +134,75 @@ fn a_port_is_forwarded_listed_and_taken_back() {
 }
 
 #[test]
+fn window_speed_is_on_until_set_off_and_only_a_windows_machine_has_it() {
+    let scratch = Scratch::new();
+    let context = scratch_context(&scratch);
+    make(&context, "work", "Office PC", Kind::Plain);
+    make(&context, "win", "Win", Kind::Windows);
+    assert!(said(&context, "show win").0.contains("window-speed on\n"));
+    assert_eq!(said(&context, "set win window-speed off"), ("window-speed is now off.\n".to_owned(), Ok(())));
+    assert!(said(&context, "show win").0.contains("window-speed off\n"));
+    assert!(!crate::machine::load(&context, "win").unwrap().window_speed());
+    assert_eq!(said(&context, "set win window-speed on").1, Ok(()));
+    assert!(crate::machine::load(&context, "win").unwrap().window_speed());
+    assert!(refused(&context, "set work window-speed off").contains("only for a Windows machine"));
+    assert!(!said(&context, "show work").0.contains("window-speed"));
+}
+
+#[test]
+fn dlss_is_on_until_set_off_and_only_an_nvidia_windows_machine_has_it() {
+    let scratch = Scratch::new();
+    let context = scratch_context(&scratch);
+    make(&context, "work", "Office PC", Kind::Plain);
+    make(&context, "win", "Win", Kind::Windows);
+    assert!(said(&context, "show win").0.contains("dlss      on\n"));
+    assert_eq!(said(&context, "set win dlss off"), ("dlss is now off.\n".to_owned(), Ok(())));
+    assert!(said(&context, "show win").0.contains("dlss      off\n"));
+    assert!(!crate::machine::load(&context, "win").unwrap().nvapi_wrapper());
+    assert_eq!(said(&context, "set win dlss on").1, Ok(()));
+    assert!(crate::machine::load(&context, "win").unwrap().nvapi_wrapper());
+    assert!(refused(&context, "set work dlss off").contains("only for a Windows machine on an NVIDIA card"));
+    assert!(!said(&context, "show work").0.contains("dlss"));
+}
+
+#[test]
+fn the_one_interface_and_its_dns_server_are_set_and_listed() {
+    let scratch = Scratch::new();
+    let context = scratch_context(&scratch);
+    make(&context, "work", "Office PC", Kind::Plain);
+    assert_eq!(said(&context, "set work only-through wg0").0, "only-through is now wg0.\n");
+    assert_eq!(said(&context, "set work dns 10.64.0.1").1, Ok(()));
+    let machine = load(&context, "work").unwrap();
+    assert_eq!((machine.only_through.as_str(), machine.dns.as_str()), ("wg0", "10.64.0.1"));
+    let listing = said(&context, "show work").0;
+    assert!(listing.contains("only-through wg0\ndns       10.64.0.1\n"), "{listing}");
+    assert_eq!(said(&context, "set work only-through OFF").1, Ok(()));
+    assert_eq!(said(&context, "set work dns auto").1, Ok(()));
+    let machine = load(&context, "work").unwrap();
+    assert_eq!((machine.only_through.as_str(), machine.dns.as_str()), ("", ""));
+}
+
+#[test]
+fn the_one_interface_is_refused_where_it_cannot_work_or_is_not_a_name() {
+    let scratch = Scratch::new();
+    let context = scratch_context(&scratch);
+    make(&context, "work", "Office PC", Kind::Plain);
+    make(&context, "desk", "Desk", Kind::Linux);
+    assert!(refused(&context, "set work only-through wg/0").contains("up to 15"));
+    assert!(refused(&context, "set work dns fc00::1").contains("IPv4"));
+    assert_eq!(
+        refused(&context, "set desk only-through wg0"),
+        "An Ubuntu machine's network is fixed, with its SSH port forwarded."
+    );
+    assert_eq!(said(&context, "set work network none").1, Ok(()));
+    assert_eq!(refused(&context, "set work only-through wg0"), "only-through is for the NAT network.");
+    let machine = make(&context, "busy", "Busy", Kind::Plain);
+    running(&context, &machine, 41);
+    assert_eq!(refused(&context, "set busy only-through wg0"), "The VM must be off to change this.");
+    assert_eq!(refused(&context, "set busy dns 10.0.0.1"), "The VM must be off to change this.");
+}
+
+#[test]
 fn show_lists_what_the_kind_of_machine_has() {
     let scratch = Scratch::new();
     let context = scratch_context(&scratch);
@@ -141,12 +211,129 @@ fn show_lists_what_the_kind_of_machine_has() {
     let plain = said(&context, "show work").0;
     assert!(plain.starts_with("name      Office PC\nid        work\nfolder    "), "{plain}");
     assert!(
-        plain.contains("network   NAT\npasst     off\nshare     none\n") && !plain.contains("vram"),
+        plain.contains("network   NAT\npasst     off\nonly-through off\ndns       auto\nshare     none\n")
+            && !plain.contains("vram"),
         "{plain}"
     );
     let windows = said(&context, "show win").0;
     assert!(
         windows.contains("vram      no cap\nscreen    1920x1080\nrefresh   144 Hz\nsound     on\n"),
         "{windows}"
+    );
+}
+
+#[test]
+fn show_says_the_display_driver_and_the_vendor_id_of_a_gpu_machine() {
+    use crate::display::{DisplayState, Driver};
+    use crate::gpu_identity::{IdentityState, Shown};
+    let scratch = Scratch::new();
+    let context = scratch_context(&scratch);
+    make(&context, "work", "Office PC", Kind::Plain);
+    let win = make(&context, "win", "Win", Kind::Windows);
+    let plain = said(&context, "show work").0;
+    assert!(!plain.contains("display-driver") && !plain.contains("vendor-id"), "{plain}");
+    let fresh = said(&context, "show win").0;
+    assert!(fresh.contains("display-driver none in this build\n"), "{fresh}");
+    assert!(fresh.contains("vendor-id 1414:008e, Microsoft's\n"), "{fresh}");
+    let display = DisplayState { driver: Driver::Installed, ..DisplayState::default() };
+    crate::display::write_state(&context, &win, &display).unwrap();
+    let identity = IdentityState { shown: Shown::Maker, restart_due: true, ..IdentityState::default() };
+    crate::gpu_identity::write_state(&context, &win, &identity).unwrap();
+    let moved = said(&context, "show win").0;
+    assert!(moved.contains("display-driver in Windows\n"), "{moved}");
+    assert!(moved.contains("vendor-id 10de:2bfe, NVIDIA's, and Windows restarts once on it\n"), "{moved}");
+    let failed = DisplayState { driver: Driver::Failed, reason: "It sent no picture.".into(), ..display };
+    crate::display::write_state(&context, &win, &failed).unwrap();
+    let said_now = said(&context, "show win").0;
+    assert!(said_now.contains("display-driver taken out, as it failed: It sent no picture.\n"), "{said_now}");
+}
+
+#[test]
+fn a_machine_can_be_let_start_without_a_jail_and_says_so() {
+    let scratch = Scratch::new();
+    let context = scratch_context(&scratch);
+    make(&context, "win", "Win", Kind::Windows);
+    assert!(said(&context, "show win").0.contains("start-unjailed off\n"));
+    let answer = said(&context, "set win start-unjailed on");
+    assert_eq!(answer, ("start-unjailed is now on.\n".to_owned(), Ok(())));
+    assert!(load(&context, "win").unwrap().start_without_jail);
+    assert!(said(&context, "show win").0.contains("start-unjailed on\n"));
+    assert_eq!(said(&context, "set win start-unjailed off").1, Ok(()));
+    assert!(!load(&context, "win").unwrap().start_without_jail);
+    assert_eq!(refused(&context, "set win start-unjailed maybe"), "start-unjailed is on or off.");
+}
+
+#[test]
+fn remote_desktop_and_ssh_are_chosen_for_windows_and_reach_it_at_the_next_start() {
+    let scratch = Scratch::new();
+    let context = scratch_context(&scratch);
+    make(&context, "win", "Win", Kind::Windows);
+    let show = said(&context, "show win").0;
+    assert!(show.contains("remote-desktop not set\n") && show.contains("ssh       not set\n"), "{show}");
+    let answer = said(&context, "set win remote-desktop yes");
+    let reaches = "remote-desktop is now on.\nWindows gets it at the next start.\n";
+    assert_eq!(answer, (reaches.to_owned(), Ok(())));
+    let machine = load(&context, "win").unwrap();
+    assert_eq!(read_access(&context, &machine), Access { remote_desktop: Some(true), ssh: None });
+    let show = said(&context, "show win").0;
+    assert!(show.contains("remote-desktop on\n") && show.contains("ssh       not set\n"), "{show}");
+    assert_eq!(refused(&context, "set win ssh on"), NO_OPENSSH);
+    assert_eq!(said(&context, "set win ssh off").1, Ok(()));
+    assert!(said(&context, "show win").0.contains("ssh       off\n"));
+    assert_eq!(refused(&context, "set win remote-desktop maybe"), "remote-desktop is on or off.");
+}
+
+#[test]
+fn a_machine_still_to_install_gets_the_change_at_its_install() {
+    let scratch = Scratch::new();
+    let context = scratch_context(&scratch);
+    let mut machine = make(&context, "win", "Win", Kind::Windows);
+    machine.installing = true;
+    machine.save(&context).unwrap();
+    let answer = said(&context, "set win remote-desktop off").0;
+    assert_eq!(answer, "remote-desktop is now off.\nWindows gets it when it is installed.\n");
+}
+
+#[test]
+fn only_windows_has_remote_desktop_and_ssh() {
+    let scratch = Scratch::new();
+    let context = scratch_context(&scratch);
+    make(&context, "plain", "Plain", Kind::Plain);
+    assert_eq!(refused(&context, "set plain ssh off"), "ssh is only for a Windows machine with GPU-PV.");
+    assert!(!said(&context, "show plain").0.contains("remote-desktop"));
+}
+
+#[test]
+fn app_windows_is_off_until_set_on_and_only_a_windows_machine_has_it() {
+    let scratch = Scratch::new();
+    let context = scratch_context(&scratch);
+    make(&context, "win", "Win", Kind::Windows);
+    make(&context, "plain", "Plain", Kind::Plain);
+    assert!(said(&context, "show win").0.contains("app-windows off\n"));
+    assert_eq!(said(&context, "set win app-windows on"), ("app-windows is now on.\n".to_owned(), Ok(())));
+    assert!(said(&context, "show win").0.contains("app-windows on\n"));
+    let machine = load(&context, "win").unwrap();
+    assert!(crate::app_windows::is_on(&context, &machine));
+    assert_eq!(said(&context, "set win app-windows no").0, "app-windows is now off.\n");
+    assert!(!machine.folder(&context).join(crate::app_windows::SWITCH_FILE).exists());
+    assert_eq!(refused(&context, "set win app-windows maybe"), "app-windows is on or off.");
+    assert_eq!(
+        refused(&context, "set plain app-windows on"),
+        "app-windows is only for a Windows machine with GPU-PV."
+    );
+    assert!(!said(&context, "show plain").0.contains("app-windows"));
+}
+
+#[test]
+fn a_running_machine_is_told_it_gets_the_way_in_at_its_next_start() {
+    let scratch = Scratch::new();
+    let context = scratch_context(&scratch);
+    let machine = make(&context, "win", "Win", Kind::Windows);
+    running(&context, &machine, 40);
+    let (out, result) = said(&context, "set win app-windows on");
+    assert_eq!(result, Ok(()));
+    assert_eq!(
+        out,
+        "app-windows is now on.\nA running machine gets the way in that it needs at its next start.\n"
     );
 }

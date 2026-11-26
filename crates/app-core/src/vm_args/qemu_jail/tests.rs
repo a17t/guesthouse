@@ -1,10 +1,16 @@
 use super::*;
 use crate::machine::Machine;
 use crate::network::Forward;
+use crate::only_through::OnlyThrough;
 use crate::slots;
 use crate::testing::{Scratch, scratch_context};
 use crate::vm_args::PASST_PID_FILE;
-use crate::vm_args::{Boot, NetworkPlan};
+use crate::vm_args::{Boot, NetworkPlan, program_word};
+
+/// bubblewrap's word, which is its full path wherever this test's PATH finds it.
+fn bubblewrap() -> String {
+    program_word("bwrap")
+}
 
 fn jail(namespaces: bool) -> QemuJail {
     QemuJail {
@@ -64,7 +70,7 @@ fn it_gets_this_vms_files_and_not_its_folder() {
 fn nat_holds_binds_to_the_forwards_and_lets_the_guest_out() {
     let (_scratch, plan) = jailed(windows(), true);
     let network = plan.qemu_jail_plan(&jail(true)).network;
-    assert_eq!(network.tcp_bind, Ports::Only(vec![plan.agent_port, 8080]));
+    assert_eq!(network.tcp_bind, Ports::Only(vec![plan.agent_port, plan.files_port.unwrap(), 8080]));
     assert_eq!((network.tcp_connect, network.udp_send), (Ports::Any, Ports::Any));
 }
 
@@ -95,7 +101,7 @@ fn a_udp_forward_answers_whatever_port_it_was_sent_from() {
 fn bubblewrap_comes_first_and_binds_each_file_where_it_is() {
     let (_scratch, plan) = jailed(windows(), true);
     let command = plan.qemu_command();
-    assert_eq!(command[0], "bwrap");
+    assert_eq!(command[0], bubblewrap(), "where the app's PATH finds it");
     let bound = |kind: &str, path: &str| command.windows(3).any(|three| three == [kind, path, path]);
     assert!(bound("--bind-try", "/m/win/disk.qcow2"));
     assert!(bound("--ro-bind", "/p/guesthouse-jail"));
@@ -116,7 +122,10 @@ fn without_namespaces_the_launcher_comes_first() {
     let (_scratch, bridged) = jailed(Machine { network_mode: Mode::Bridged, ..windows() }, false);
     let command = bridged.qemu_command();
     assert_eq!(command[0], "/p/guesthouse-jail");
-    assert!(!command.iter().any(|word| word == "--open-only" || word == "bwrap"), "one launcher does it all");
+    assert!(
+        !command.iter().any(|word| *word == "--open-only" || *word == bubblewrap()),
+        "one launcher does it all"
+    );
     assert!(command.iter().any(|word| word == "--tap"));
 }
 
@@ -126,7 +135,7 @@ fn a_bridged_machine_gets_its_device_from_the_launcher_before_bubblewrap() {
     let command = plan.qemu_command();
     assert_eq!(command[..2], ["/p/guesthouse-jail".to_owned(), "--open-only".to_owned()]);
     let tap = command.iter().position(|word| word == "--tap").unwrap();
-    assert!(tap < command.iter().position(|word| word == "bwrap").unwrap());
+    assert!(tap < command.iter().position(|word| *word == bubblewrap()).unwrap());
     assert_eq!(command.iter().filter(|word| *word == "--tap").count(), 1);
     assert_eq!(command[tap + 2..tap + 4], ["br0".to_owned(), TAP_FD.to_string()]);
     assert!(
@@ -166,10 +175,10 @@ fn in_namespaces_passt_starts_before_bubblewrap() {
     let command = plan.qemu_command();
     assert_eq!(command[..2], ["/p/guesthouse-jail".to_owned(), "--open-only".to_owned()]);
     let at = |word: &str| command.iter().position(|found| found == word).unwrap();
-    assert!(at("--passt") < at("bwrap"));
+    assert!(at("--passt") < at(&bubblewrap()));
     assert_eq!(command.iter().filter(|word| *word == "--passt").count(), 1);
     let inner = command.iter().rposition(|word| word == "/p/guesthouse-jail").unwrap();
-    assert!(inner > at("bwrap") && command[inner + 1] != "--open-only");
+    assert!(inner > at(&bubblewrap()) && command[inner + 1] != "--open-only");
 }
 
 #[test]
@@ -178,7 +187,62 @@ fn on_passt_qemu_only_has_the_private_link() {
     let network = plan.qemu_jail_plan(&jail(true)).network;
     assert_eq!(network.tcp_connect, Ports::none());
     assert_eq!(network.udp_send, Ports::Any, "for the UDP forward's replies");
-    assert_eq!(network.tcp_bind, Ports::Only(vec![plan.agent_port, 8080]));
+    assert_eq!(network.tcp_bind, Ports::Only(vec![plan.agent_port, plan.files_port.unwrap(), 8080]));
+}
+
+fn held_to_wg0(machine: Machine, jailed_too: bool) -> (Scratch, VmPlan) {
+    let (scratch, plan) = jailed(machine, false);
+    let through = OnlyThrough { interface: "wg0".into(), ipv6: false };
+    let network = NetworkPlan { passt: true, only_through: Some(through), ..plan.network.clone() };
+    let jail = plan.jail.clone().filter(|_| jailed_too);
+    (scratch, VmPlan { network, jail, ..plan })
+}
+
+#[test]
+fn without_a_jail_a_machine_held_to_an_interface_still_has_the_launcher_start_passt() {
+    let (_scratch, plan) = held_to_wg0(windows(), false);
+    let command = plan.qemu_command();
+    assert_eq!(command[..2], [plan.launcher.display().to_string(), "--open-only".to_owned()]);
+    let passt = command.iter().position(|word| word == "--passt").unwrap();
+    assert_eq!(command[passt + 2], PASST_FD.to_string());
+    let words: Vec<&str> =
+        command.windows(2).filter(|two| two[0] == "--passt-word").map(|two| two[1].as_str()).collect();
+    assert!(words.contains(&"--outbound-if4") && words.contains(&"wg0"), "{words:?}");
+    let end = command.iter().position(|word| word == "--").unwrap();
+    assert!(end > passt && command[end + 1..].contains(&"/usr/bin/qemu-system-x86_64".to_owned()));
+    assert!(!plan.clears_environment(), "QEMU runs as it is");
+    assert!(plan.qemu_arguments().iter().any(|word| *word == format!("socket,model=e1000e,fd={PASST_FD}")));
+}
+
+#[test]
+fn a_machine_held_to_an_interface_has_the_launcher_guard_its_passt_with_or_without_a_jail() {
+    for jailed_too in [false, true] {
+        let (_scratch, plan) = held_to_wg0(windows(), jailed_too);
+        let command = plan.qemu_command();
+        let guard = command.iter().position(|word| word == "--passt-only-through").unwrap();
+        let cut_file = plan.run_folder.join("network-cut").display().to_string();
+        assert_eq!(command[guard + 1..guard + 3], ["wg0".to_owned(), cut_file]);
+    }
+    let (_scratch, plan) = on_passt(windows(), true);
+    assert!(!plan.qemu_command().contains(&"--passt-only-through".to_owned()), "passt alone has no guard");
+}
+
+#[test]
+fn without_a_jail_a_machine_on_passt_alone_has_no_launcher() {
+    let (_scratch, plan) = held_to_wg0(windows(), false);
+    let plan = VmPlan { network: NetworkPlan { only_through: None, ..plan.network.clone() }, ..plan };
+    assert_eq!(plan.qemu_command()[0], "/usr/bin/qemu-system-x86_64");
+}
+
+#[test]
+fn in_a_jail_the_interface_is_in_the_launchers_passt_words() {
+    let (_scratch, plan) = held_to_wg0(windows(), true);
+    let command = plan.qemu_command();
+    let words: Vec<&str> =
+        command.windows(2).filter(|two| two[0] == "--passt-word").map(|two| two[1].as_str()).collect();
+    assert!(words.windows(2).any(|two| two == ["--outbound-if4", "wg0"]), "{words:?}");
+    assert!(words.contains(&"--ipv4-only"), "{words:?}");
+    assert_eq!(plan.passt().unwrap().words.len(), words.len());
 }
 
 #[test]
@@ -188,6 +252,9 @@ fn a_jailed_qemu_gets_a_clean_environment() {
     let environment = plan.qemu_environment();
     let names: Vec<&str> = environment.iter().map(|(name, _)| name.as_str()).collect();
     assert_eq!(names, ["PATH", "TMPDIR", "XDG_RUNTIME_DIR", "SHARE"]);
+    let path: Vec<&str> = environment[0].1.split(':').collect();
+    assert!(path.contains(&"/usr/bin"), "most systems' programs");
+    assert!(path.contains(&"/run/current-system/sw/bin"), "NixOS's, for setarch and taskset");
     assert_eq!(
         environment[1].1,
         plan.run_folder.display().to_string(),
@@ -221,7 +288,10 @@ fn with_no_sound_the_launcher_opens_every_unix_socket_and_qemu_makes_none() {
 fn a_shared_folder_gets_the_loopback_pair_its_program_is_reached_through() {
     let (_scratch, plan) = jailed(Machine { share: "/home/me/Shared".into(), ..windows() }, true);
     let network = plan.qemu_jail_plan(&jail(true)).network;
-    assert_eq!(network.tcp_bind, Ports::Only(vec![plan.agent_port, 8080, EPHEMERAL_PORT]));
+    assert_eq!(
+        network.tcp_bind,
+        Ports::Only(vec![plan.agent_port, plan.files_port.unwrap(), 8080, EPHEMERAL_PORT])
+    );
     let restricted = Machine { share: "/home/me/Shared".into(), network_mode: Mode::None, ..windows() };
     let (_scratch, plan) = jailed(restricted, true);
     assert_eq!(plan.qemu_jail_plan(&jail(true)).network.tcp_connect, Ports::Any);
@@ -309,6 +379,7 @@ fn ubuntu_with_gpu(namespaces: bool) -> (Scratch, VmPlan) {
             pci: "0000:02:00.0".into(),
             minor: 0,
             render_node: Some("renderD128".into()),
+            memory_mib: None,
         },
     });
     let plan = VmPlan::new(&context, &machine, boot, slots::number(2), 0);
@@ -343,21 +414,68 @@ fn the_forwarded_gpu_gets_its_device_files_and_not_windows_ones() {
 fn the_forwarded_gpu_keeps_its_address_layout_and_the_viewers_pid() {
     let (_scratch, plan) = ubuntu_with_gpu(true);
     let command = plan.qemu_command();
-    assert_eq!(command[0], "bwrap");
+    assert_eq!(command[0], bubblewrap(), "where the app's PATH finds it");
     assert!(!command.iter().any(|word| word == "--unshare-pid"), "the D-Bus display needs the viewer's pid");
     // The last time each word comes: bubblewrap binds the launcher before it runs it.
     let at = |word: &str| command.iter().rposition(|found| found == word).unwrap();
     // The filter refuses changing it, so it's set before the launcher.
-    assert!(at("bwrap") < at("setarch") && at("setarch") < at("/p/guesthouse-jail"));
+    assert!(at(&bubblewrap()) < at("setarch") && at("setarch") < at("/p/guesthouse-jail"));
     assert_eq!(command[at("setarch")..at("setarch") + 3], ["setarch", "x86_64", "-L"]);
     assert!(at("/p/guesthouse-jail") < at("/p/qemu/build/qemu-system-x86_64"));
-    assert!(
-        !command.iter().any(|word| word == "--no-new-unix-sockets"),
-        "the device makes the socket its frames are offered on"
-    );
+    assert!(command.iter().any(|word| word == "--no-new-unix-sockets"), "its frames socket is opened for it");
     assert!(plan.qemu_arguments().ends_with(&["-sandbox".to_owned(), QEMU_SANDBOX.to_owned()]));
     let (_scratch, plain) = ubuntu_with_gpu(false);
     assert_eq!(plain.qemu_command()[..4], ["setarch", "x86_64", "-L", "/p/guesthouse-jail"]);
+}
+
+/// The words after `--unix-listen` or `--unix-connect`: each socket's path and descriptor.
+fn opened(command: &[String], kind: &str) -> Vec<(String, String)> {
+    let at = command.iter().enumerate().filter(|(_, word)| *word == kind).map(|(at, _)| at);
+    at.map(|at| (command[at + 1].clone(), command[at + 2].clone())).collect()
+}
+
+#[test]
+fn the_forwarded_gpu_gets_every_unix_socket_from_the_launcher_and_makes_none() {
+    for namespaces in [false, true] {
+        let (_scratch, plan) = ubuntu_with_gpu(namespaces);
+        let command = plan.qemu_command();
+        assert!(command.iter().any(|word| word == "--no-new-unix-sockets"));
+        let run = |file: &str| plan.run_folder.join(file).display().to_string();
+        let listening: Vec<(String, String)> =
+            ["qmp.sock", "watch.sock", "input.sock", "display.sock", "forwarded-input.sock", "show.sock"]
+                .iter()
+                .zip(20..)
+                .map(|(file, fd)| (run(file), fd.to_string()))
+                .collect();
+        assert_eq!(opened(&command, "--unix-listen"), listening);
+        assert!(opened(&command, "--unix-connect").is_empty(), "no daemon and no TPM");
+        let arguments = plan.qemu_arguments();
+        assert!(
+            !arguments.iter().any(|word| word.starts_with("unix:") || word.contains(",path=")),
+            "{arguments:?}"
+        );
+        assert!(arguments.iter().any(|word| word == "socket,id=monitor3,fd=23,server=on,wait=off"));
+        assert!(arguments.iter().any(|word| word == "socket,id=fwdin,fd=24,server=on,wait=off"));
+        let device = arguments.iter().find(|word| word.starts_with("nvfwd,")).unwrap();
+        assert!(device.contains(&format!(",show={},show-fd=25,", run("show"))), "{device}");
+        // With no monitor path in its words, the app finds it by this.
+        assert!(arguments.iter().any(|word| *word == run(PID_FILE)));
+    }
+}
+
+#[test]
+fn a_linux_guest_on_the_gpu_without_a_jail_makes_its_own_sockets() {
+    let (_scratch, plan) = ubuntu_with_gpu(false);
+    let plan = VmPlan { jail: None, ..plan };
+    let arguments = plan.qemu_arguments();
+    let device = arguments.iter().find(|word| word.starts_with("nvfwd,")).unwrap();
+    assert!(!device.contains("show-fd"), "{device}");
+    let input = format!(
+        "socket,id=fwdin,path={},server=on,wait=off",
+        plan.run_folder.join("forwarded-input.sock").display()
+    );
+    assert!(arguments.contains(&input), "{arguments:?}");
+    assert!(arguments.iter().any(|word| word.starts_with("unix:") && word.contains("/qmp.sock,")));
 }
 
 #[test]
@@ -373,4 +491,21 @@ fn ubuntus_own_line_gets_none_of_the_machines_network_or_share() {
         assert!(!rules.paths.iter().any(|(_, path)| path == Path::new("/home/me/Shared")));
         assert_eq!(rules.network.tcp_bind, Ports::Only(vec![plan.ssh_port()]));
     }
+}
+
+#[test]
+fn the_jail_lets_qemu_listen_for_the_app_windows_helper_only_when_it_is_on() {
+    let scratch = Scratch::new();
+    let context = scratch_context(&scratch);
+    let machine = windows();
+    let plan_for = |context: &crate::context::Context| {
+        let plan = VmPlan::new(context, &machine, Boot::Gpu, slots::number(2), 0);
+        VmPlan { jail: Some(jail(true)), qemu: "/usr/bin/qemu-system-x86_64".into(), ..plan }
+    };
+    let off = plan_for(&context).qemu_jail_plan(&jail(true)).network.tcp_bind;
+    assert_eq!(off, Ports::Only(vec![18767, 18867, 8080]), "as before");
+    std::fs::create_dir_all(machine.folder(&context)).unwrap();
+    crate::app_windows::set_on(&context, &machine, true).unwrap();
+    let on = plan_for(&context).qemu_jail_plan(&jail(true)).network.tcp_bind;
+    assert_eq!(on, Ports::Only(vec![18767, 18867, 18967, 8080]));
 }

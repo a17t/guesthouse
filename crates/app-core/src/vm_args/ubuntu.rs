@@ -3,7 +3,7 @@
 //! whether or not it gets the GPU.
 
 use super::arguments::{RELATIVE_MOUSE, words};
-use super::{Boot, DISPLAY_SOCKET, UbuntuBoot, UbuntuInstall, VmPlan};
+use super::{Boot, UbuntuBoot, UbuntuInstall, VmPlan};
 use crate::linux::card::ForwardedCard;
 use crate::text::qemu_value;
 use guesthouse_daemon::slot::Slot;
@@ -24,6 +24,8 @@ const INPUT_PORT: &str = "nvfwd.input";
 const OFF_REASON_NAME: &str = "opt/nvfwd/gpu-off-reason";
 /// Where the guest's frames are offered, as `show.sock` and `show.display`.
 pub const FRAMES_PREFIX: &str = "show";
+/// The first of those, which a jail's launcher opens for QEMU.
+pub(super) const FRAMES_SOCKET: &str = "show.sock";
 /// The guest's keyboard and pointer once it's on the GPU. QEMU's input has no way to its session.
 pub const FORWARDED_INPUT_SOCKET: &str = "forwarded-input.sock";
 pub const INSTALL_LOG: &str = "install-serial.log";
@@ -40,12 +42,11 @@ impl VmPlan {
         ssh_port(self.slot)
     }
 
-    fn monitors(&self) -> Vec<String> {
-        let sockets = ["qmp.sock", "watch.sock", "input.sock", DISPLAY_SOCKET];
-        let each = sockets.iter().flat_map(|socket| {
-            words(&["-qmp", &format!("unix:{},server=on,wait=off", self.in_run_folder(socket))])
-        });
-        each.collect()
+    /// The machine's own cap, and without one the card less the host's share, as a Windows guest gets.
+    /// Left unsaid, the device stops at its own 8 GiB, whatever the card.
+    fn video_memory_cap(&self, card: &ForwardedCard) -> Option<String> {
+        let budget = card.memory_mib.map(crate::settings::video_budget_gib_of).filter(|gib| *gib > 0);
+        self.vram.clone().or_else(|| budget.map(|gib| format!("{gib}G")))
     }
 
     fn install_arguments(&self, install: &UbuntuInstall) -> Vec<String> {
@@ -76,7 +77,7 @@ impl VmPlan {
             "-drive",
             &format!("file={},media=cdrom,readonly=on", qemu_value(&install.seed.to_string_lossy())),
             "-nic",
-            "user,model=virtio-net-pci",
+            &self.ubuntu_nic(""),
             "-display",
             "dbus,p2p=yes",
             "-vga",
@@ -84,7 +85,7 @@ impl VmPlan {
             "-serial",
             &format!("file:{}", self.in_run_folder(INSTALL_LOG)),
         ]));
-        arguments.extend(self.monitors());
+        arguments.extend(self.monitor_arguments());
         arguments
     }
 
@@ -98,10 +99,7 @@ impl VmPlan {
                     "-device",
                     "virtio-serial-pci",
                     "-chardev",
-                    &format!(
-                        "socket,id=fwdin,path={},server=on,wait=off",
-                        self.in_run_folder(FORWARDED_INPUT_SOCKET)
-                    ),
+                    &self.listening_socket("fwdin", FORWARDED_INPUT_SOCKET),
                     "-device",
                     &format!("virtserialport,chardev=fwdin,name={INPUT_PORT}"),
                 ]));
@@ -130,14 +128,15 @@ impl VmPlan {
             "virtio-blk-pci,drive=nvdriver",
             "-device",
             &format!(
-                "nvfwd,allow={},sensord={},log={},trace=off,nogpu=off,show={},card={},card-minor={}{}",
+                "nvfwd,allow={},sensord={},log={},trace=off,nogpu=off,show={}{},card={},card-minor={}{}",
                 allow_list.display(),
                 sensor_daemon.display(),
                 self.in_run_folder("calls.log"),
                 self.in_run_folder(FRAMES_PREFIX),
+                self.socket_fd(FRAMES_SOCKET).map_or_else(String::new, |fd| format!(",show-fd={fd}")),
                 card.pci,
                 card.minor,
-                self.vram.as_ref().map_or_else(String::new, |cap| format!(",max-vram={cap}"))
+                self.video_memory_cap(card).map_or_else(String::new, |cap| format!(",max-vram={cap}"))
             ),
         ])
     }
@@ -171,7 +170,7 @@ impl VmPlan {
             "-device",
             "virtio-blk-pci,drive=system,bootindex=1",
             "-nic",
-            &format!("user,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:{ssh_port}-:{GUEST_SSH_PORT}"),
+            &self.ubuntu_nic(&format!("hostfwd=tcp:127.0.0.1:{ssh_port}-:{GUEST_SSH_PORT}")),
             "-device",
             "qemu-xhci,id=xhci",
             "-device",
@@ -185,7 +184,7 @@ impl VmPlan {
             _ => words(&["-vga", "std", "-display", "dbus,p2p=yes"]),
         });
         arguments.extend(words(&["-serial", &format!("file:{}", self.in_run_folder(SERIAL_LOG))]));
-        arguments.extend(self.monitors());
+        arguments.extend(self.monitor_arguments());
         arguments.extend(self.with_gpu_arguments(boot));
         arguments.extend(self.qemu_sandbox_arguments());
         arguments
@@ -246,7 +245,7 @@ mod tests {
             image: "/images/driver.iso".into(),
             allow_list: "/p/allow.txt".into(),
             sensor_daemon: "/q/nvfwd-sensord".into(),
-            card: ForwardedCard { pci: pci.into(), minor, render_node: None },
+            card: ForwardedCard { pci: pci.into(), minor, render_node: None, memory_mib: None },
         })
     }
 
@@ -303,12 +302,70 @@ mod tests {
     }
 
     #[test]
+    fn the_frames_socket_is_the_one_the_viewer_looks_for() {
+        assert_eq!(FRAMES_SOCKET, format!("{FRAMES_PREFIX}.sock"));
+    }
+
+    #[test]
     fn the_system_disk_boots_first_and_the_app_can_find_it() {
         let scratch = Scratch::new();
         let arguments = plan(&scratch_context(&scratch), with_gpu()).qemu_arguments();
         assert!(arguments.iter().any(|word| word == "virtio-blk-pci,drive=system,bootindex=1"));
         assert!(arguments.iter().any(|word| word.contains("file=/m/disk.qcow2,")));
         assert!(arguments.iter().any(|word| word.contains("/run/qmp.sock,")));
+    }
+
+    fn with_mac(context: &Context, boot: Boot, mac: &str) -> VmPlan {
+        let machine = Machine {
+            kind: Kind::Linux,
+            mac: mac.into(),
+            ..Machine::new("ubuntu", "Ubuntu", "/m/disk.qcow2", "")
+        };
+        VmPlan::new(context, &machine, boot, slots::first(), 0)
+    }
+
+    #[test]
+    fn the_card_has_the_machines_own_address_in_a_start_and_an_install() {
+        let scratch = Scratch::new();
+        let context = scratch_context(&scratch);
+        let mac = "52:54:00:a2:1c:6d";
+        let started = with_mac(&context, with_gpu(), mac).qemu_arguments();
+        let card = value_after(&started, "-nic");
+        assert!(
+            card.starts_with(&format!("user,model=virtio-net-pci,mac={mac},hostfwd=tcp:127.0.0.1:")),
+            "{card}"
+        );
+        let install = UbuntuInstall {
+            iso: "/iso/a.iso".into(),
+            seed: "/m/seed/cidata.iso".into(),
+            kernel: PathBuf::from("/m/boot/vmlinuz"),
+            initrd: PathBuf::from("/m/boot/initrd"),
+        };
+        let installing = with_mac(&context, Boot::UbuntuInstall(install), mac).qemu_arguments();
+        assert_eq!(value_after(&installing, "-nic"), format!("user,model=virtio-net-pci,mac={mac}"));
+    }
+
+    #[test]
+    fn a_guest_from_before_the_netplan_by_name_keeps_the_default_where_no_script_of_ours_runs() {
+        let scratch = Scratch::new();
+        let context = scratch_context(&scratch);
+        let mac = "52:54:00:a2:1c:6d";
+        let plan = with_mac(&context, no_gpu(), mac);
+        assert!(
+            value_after(&plan.qemu_arguments(), "-nic").starts_with("user,model=virtio-net-pci,hostfwd=")
+        );
+        let machine = Machine { kind: Kind::Linux, ..Machine::new("ubuntu", "Ubuntu", "/m/disk.qcow2", "") };
+        std::fs::create_dir_all(machine.folder(&context)).unwrap();
+        std::fs::write(machine.network_by_name_marker(&context), "").unwrap();
+        let plan = with_mac(&context, no_gpu(), mac);
+        assert!(value_after(&plan.qemu_arguments(), "-nic").contains(&format!(",mac={mac},")));
+    }
+
+    #[test]
+    fn a_machine_with_no_address_yet_keeps_qemus_default() {
+        let scratch = Scratch::new();
+        let arguments = with_mac(&scratch_context(&scratch), no_gpu(), "").qemu_arguments();
+        assert!(value_after(&arguments, "-nic").starts_with("user,model=virtio-net-pci,hostfwd="));
     }
 
     #[test]

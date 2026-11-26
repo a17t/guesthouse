@@ -1,7 +1,7 @@
 #!/bin/sh
 # Compiles what can be compiled without the WDK against mingw's D3D11 headers. It needs x86_64-w64-mingw32-g++.
 # It proves the D3D11 and Win32 calls are spelled right. It doesn't prove anything about iddcx.h, and the shader isn't compiled.
-HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 GUESTHOUSE=$HERE/../GuesthouseDisplay/Guesthouse
 OUT=$HERE/build/mingw
 mkdir -p "$OUT"

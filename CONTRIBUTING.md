@@ -2,7 +2,11 @@
 
 ## Getting going
 
-You need Rust 1.88 or newer. `cargo clippy` needs 1.92 and the app's development files below. No GPU and no VM are needed for any of this:
+The workspace builds on Linux and on Windows. Each builds the host for the system it's on, and the other system's crates build empty, so `cargo test` works on both. The GTK app is the exception, and only builds on Linux. No GPU and no VM are needed for any of this.
+
+### On Linux
+
+You need Rust 1.88 or newer. `cargo clippy` needs 1.92 and the app's development files below.
 
 ```sh
 cargo test
@@ -17,6 +21,22 @@ The desktop app in `crates/app` also needs GTK 4 and libadwaita's development fi
 
 To try the sockets by hand, `cargo run -p guesthouse-daemon --features stand-in` answers messages with a pretend GPU behind them. It's for poking at, and it won't run a guest.
 
+A real VM also needs QEMU with the patch in `qemu/`, which `qemu/README.md` says how to build.
+
+### On Windows
+
+You need Windows 11, Rust 1.95 or newer, as windows-reactor asks for it, and Visual Studio's C++ build tools.
+
+```powershell
+cargo test
+cargo build --release -p guesthouse-service -p guesthouse-host-windows
+cargo build --release -p guesthouse-app-windows
+```
+
+`cargo test` leaves the app out here too. The app's first build downloads the Windows App Runtime from NuGet. The app does nothing to a machine itself and only asks the service, so to make or start one, turn on Virtual Machine Platform and run `.\target\release\guesthouse-service.exe run` in an elevated prompt. A build with `--features preview` shows the window with made-up machines and no service. `scripts\windows-setup.ps1` packs it all into the installer. [docs/windows-host.md](docs/windows-host.md) has the details.
+
+The checks on pull requests run on Linux only, so build a Windows change on Windows before you send it.
+
 ## Legal rules
 
 These matter more than anything else here, because text inside code is something `.gitignore` can't catch.
@@ -28,6 +48,13 @@ These matter more than anything else here, because text inside code is something
 - The QEMU patch in `qemu/` keeps QEMU's licence, GPL-2.0-or-later.
 - No secrets, and no paths from your own machine.
 - Everything here is GPL-2.0-or-later, and that includes what you add. `THIRD-PARTY.md` lists the exceptions.
+- Send only what you wrote yourself, or open source code under a licence that fits GPL-2.0-or-later, with its line in `THIRD-PARTY.md`.
+- Nothing leaked or confidential, and nothing an NDA or an agreement with your employer covers.
+- If you aren't sure about something, open an issue and ask before you write it.
+
+## The contributor licence agreement
+
+Your first pull request goes in once you've signed the [contributor licence agreement](CLA.md), by adding your line to [CLA-SIGNERS.md](CLA-SIGNERS.md) in that pull request. You keep your copyright. The agreement gives RUXN LLC a licence to your work that isn't tied to the GPL, and RUXN LLC keeps publishing your work under GPL-2.0-or-later. A check on the pull request looks for your line.
 
 ## Recordings
 
@@ -40,7 +67,7 @@ Recordings hold guest data. They never go in git. Keep them in `/captures/`, whi
 - Comments say why. If a comment says what the next line does, delete it.
 - The message path shouldn't allocate or lock. Measure first, though: `core/tests/no_allocation.rs` and the benchmark will tell you, and a clever change needs a number behind it.
 - Dependencies are few, and each one has a comment saying why it's there.
-- `unsafe` lives in `daemon` and in the parts of `backend-nvidia` that talk to the kernel or to memory the GPU reads, with a `SAFETY` comment on each block. There are two exceptions in `app`: `viewer/import.rs`, as GTK's call for a texture on a dmabuf is `unsafe`, and `main.rs`, which sets an environment variable before GTK starts. One test has it too: `core/tests/no_allocation.rs` counts allocations, and a global allocator has to be `unsafe`.
+- `unsafe` lives in `daemon`, in the parts of the backends that talk to the kernel or to memory the GPU reads, in `hcs`, whose every job is a call into Windows, and in the Windows parts of `jail` and of `service-windows` (`src/windows/`), which talk to the kernel's security and to the service manager, and in `installer-windows` (`src/system.rs` and the pages' window procedure), which talks to the shell, the registry and the service manager, with a `SAFETY` comment on each block. There are two exceptions in `app`: `viewer/import.rs`, as GTK's call for a texture on a dmabuf is `unsafe`, and `main.rs`, which sets an environment variable before GTK starts. The Windows app keeps its own in `app-windows/src/system.rs`, for the few calls WinUI doesn't make: the file dialog, the clipboard, and cancelling a read on the pipe, and in `app-windows/src/console.rs`, which hosts Windows' Remote Desktop control and RdpBase's pipe connector, through COM interfaces declared by hand, and in its example, which takes that file as it is and asks which process serves a pipe. Two tests have it too: `core/tests/no_allocation.rs` and `backend-intel/tests/quiet_path.rs` count allocations, and a global allocator has to be `unsafe`.
 
 ## Keeping the layers apart
 
@@ -61,3 +88,5 @@ Each handler has tests in `core/src/session/tests.rs`, which send whole messages
 ## Commits
 
 Small steps, each of which builds and passes its tests. Say what changed and why, in a line a stranger can follow.
+
+A change reaches `main` through a pull request. It runs `cargo fmt --check`, clippy with warnings as errors, the tests, shellcheck on the shell scripts and PSScriptAnalyzer on the PowerShell ones, and all of them have to pass.

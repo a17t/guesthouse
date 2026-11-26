@@ -1,0 +1,36 @@
+[package]
+name = "guesthouse-backend-intel"
+description = "The Intel backend: the guest's work on the host's xe driver, and the private data Intel's Windows driver sends."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+guesthouse-backend.workspace = true
+guesthouse-messages.workspace = true
+# The facade, as in the core.
+log = "0.4"
+# ioctl, which the standard library does not offer. Same as the other backends.
+libc = "0.2"
+
+[dev-dependencies]
+guesthouse-backend-standin.workspace = true
+guesthouse-core.workspace = true
+
+[features]
+# For the lab only, never in a build for people: with a recorded card and
+# GUESTHOUSE_INTEL_LAB_FAKE_CARD=1, the guest's work goes to a stand-in for xe whose buffers are
+# host memory and whose batches end at once, unrun. It tries the work path's plumbing with a real
+# guest on a PC with no Intel card.
+lab-fake-card = []
+
+[[bin]]
+# Prints what the host's xe driver says about the card, for a tester to paste. By itself it only
+# reads. With --run it also runs the host's self-test: a few tiny buffers and batches of its own.
+name = "intel-probe"
+path = "src/bin/intel_probe.rs"
+
+[lints]
+workspace = true

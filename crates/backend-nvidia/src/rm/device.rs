@@ -1,8 +1,8 @@
 //! The objects this backend keeps in the RM: one client, one device, and what hangs from them.
 
 use super::classes::{
-    CONTROL_GET_GPU_ID, CONTROL_GET_TIME, DEVICE, MEMORY_LOCAL_USER, MEMORY_VIRTUAL, SUBDEVICE,
-    VIRTUAL_ADDRESS_SPACE,
+    CONTROL_GET_GPU_ID, CONTROL_GET_TIME, DEVICE, MEMORY_LOCAL_USER, MEMORY_SYSTEM, MEMORY_VIRTUAL,
+    SUBDEVICE, VIRTUAL_ADDRESS_SPACE,
 };
 use super::instance::device_instance_at;
 use super::listing::CardPlace;
@@ -33,6 +33,8 @@ const MEMORY_PARAM_SIZE: usize = 0x40;
 const MEMORY_PARAM_OFFSET: usize = 0x50;
 const MEMORY_PARAM_ADDRESS_SPACE: usize = 0x6C;
 const MEMORY_FLAG_HANDLE_PROVIDED: u32 = 0x4000;
+/// `NVOS32_ATTR_LOCATION_PCI`, which system memory asks for by name.
+const MEMORY_ATTR_LOCATION_PCI: u32 = 1 << 25;
 /// Memory for a depth surface, which the RM gives the depth kind its attributes' packing calls for.
 const MEMORY_TYPE_DEPTH: u32 = 1;
 /// Virtual, at a fixed address, with the handle provided, and lazily. Without lazily the page tables
@@ -84,6 +86,9 @@ pub struct Device<R> {
     pub rm: R,
     /// How long a graphics channel group may hold the GPU. 0 leaves the RM's own choice.
     pub graphics_timeslice_micros: u64,
+    /// The same for the ring channels of a guest context that has several queues, unless
+    /// `graphics_timeslice_micros` is set. 0 leaves the RM's own choice.
+    pub shared_context_timeslice_micros: u64,
     pub client: Handle,
     pub device: Handle,
     pub subdevice: Handle,
@@ -135,6 +140,7 @@ impl<R: Rm> Device<R> {
         RmError::check(|| format!("class {SUBDEVICE:#x}"), status)?;
         Ok(Self {
             graphics_timeslice_micros: 0,
+            shared_context_timeslice_micros: 0,
             rm,
             client,
             device: DEVICE_HANDLE,
@@ -205,6 +211,35 @@ impl<R: Rm> Device<R> {
         let handle = self.alloc(self.device, MEMORY_LOCAL_USER, &mut params)?;
         let given = params[MEMORY_PARAM_SIZE..MEMORY_PARAM_SIZE + 8].try_into().expect("eight bytes");
         Ok((handle, u64::from_le_bytes(given)))
+    }
+
+    /// Makes system memory the GPU reaches, laid out as `kind` says, for video memory the card has
+    /// no room for. Returns it, and the size the RM gave it.
+    pub fn alloc_spill_memory(&mut self, size: u64, kind: MemoryKind) -> Result<(Handle, u64), RmError> {
+        let mut params = vec![0; self.sizes.memory_params];
+        put_u32(&mut params, MEMORY_PARAM_OWNER, MEMORY_OWNER);
+        put_u32(&mut params, MEMORY_PARAM_FLAGS, MEMORY_FLAG_HANDLE_PROVIDED);
+        put_u64(&mut params, MEMORY_PARAM_SIZE, size);
+        let mut attributes = MEMORY_ATTR_LOCATION_PCI;
+        if kind != MemoryKind::PLAIN {
+            put_u32(&mut params, MEMORY_PARAM_TYPE, MEMORY_TYPE_DEPTH);
+            attributes |= kind.0;
+        }
+        put_u32(&mut params, MEMORY_PARAM_ATTRIBUTES, attributes);
+        let handle = self.alloc(self.device, MEMORY_SYSTEM, &mut params)?;
+        let given = params[MEMORY_PARAM_SIZE..MEMORY_PARAM_SIZE + 8].try_into().expect("eight bytes");
+        Ok((handle, u64::from_le_bytes(given)))
+    }
+
+    /// Makes system memory the RM owns, which the kernel can map to the CPU. A semaphore
+    /// surface's slots must live in memory of exactly this kind.
+    pub fn alloc_sysmem(&mut self, size: u64) -> Result<Handle, RmError> {
+        let mut params = vec![0; self.sizes.memory_params];
+        put_u32(&mut params, MEMORY_PARAM_OWNER, MEMORY_OWNER);
+        put_u32(&mut params, MEMORY_PARAM_FLAGS, MEMORY_FLAG_HANDLE_PROVIDED);
+        put_u32(&mut params, MEMORY_PARAM_ATTRIBUTES, MEMORY_ATTR_LOCATION_PCI);
+        put_u64(&mut params, MEMORY_PARAM_SIZE, size);
+        self.alloc(self.device, MEMORY_SYSTEM, &mut params)
     }
 
     pub fn alloc_host_pages(&mut self, address: u64, size: u64) -> Result<Handle, RmError> {

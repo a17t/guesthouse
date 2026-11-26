@@ -13,7 +13,8 @@
 //! The payload after the header is a dword byte count, that many bytes of input, a dword byte count
 //! and that many bytes of output. Three escapes the guest's user-mode driver sends at start and
 //! can't go on without are answered as done, with an output of zeros and a status index of zero:
-//! see [`NEEDED_AT_START`]. No other subfunction's payload is known, so every other escape that is
+//! see [`NEEDED_AT_START`]. The Vulkan and Direct3D 12 drivers' primary surface query has its own
+//! shape and is answered too: see [`PRIMARY_INFO`]. No other subfunction's payload is known, so every other escape that is
 //! framed right is answered as failed. One answered as done would leave the guest reading a payload
 //! nobody filled in. The guest goes on past most failures.
 
@@ -57,7 +58,7 @@ const SERVICE_3: u32 = 3;
 /// ulEscapeReturnCode for an escape that is done.
 const RETURN_DONE: u32 = 0;
 /// A payload's byte counts, ahead of its input and its output.
-const COUNT_SIZE: usize = 4;
+pub(crate) const COUNT_SIZE: usize = 4;
 /// ulEscapeReturnCode for a failed escape. Zero is done, and the guest takes any other value as a
 /// failure.
 const RETURN_FAILED: u32 = 2;
@@ -198,17 +199,134 @@ fn reply(data: &mut [u8], needed: &Needed) -> bool {
     true
 }
 
+/// Service 1 subfunction 0x10 from the user-mode driver: what the display can do with a primary
+/// surface of a given size and format on one video present source. The Vulkan and Direct3D 12
+/// drivers ask it when they make a swap chain, through PAL's GetPrimaryInfo.
+///
+/// Its payload differs from the service 3 shape: the input and the output are each a block of
+/// [`PRIMARY_BLOCK`] bytes whose first dword is the block's own size, the output straight after the
+/// input. AMD's kernel driver answers it from its display objects. The guest's adapter drives no
+/// display, so the answer is the one that promises nothing: no tiling demand, no stereo, no
+/// compositing modes and no compressed scanout, which is also what the user-mode driver fills in
+/// itself when it runs without a kernel display. It differs from all zeros in one field only: the
+/// stereo field, three bits at bit 3 of the flags dword, which the kernel driver always starts at
+/// 2, the user-mode driver's own value for no stereo.
+pub const PRIMARY_INFO: EscapeCode = EscapeCode { service: 1, subfunction: 0x10, client: USER_MODE_CLIENT };
+/// The size of the request's input block and of its output block, size dword included.
+const PRIMARY_BLOCK: usize = 0x40;
+/// In the input, after its size dword: the bits per pixel of the format. The kernel driver fails a
+/// request for fewer than 8.
+const PRIMARY_BITS_PER_PIXEL: usize = 0x0C;
+const PRIMARY_LEAST_BITS: u32 = 8;
+/// In the output, after its size dword: the flags dword.
+const PRIMARY_FLAGS: usize = 0x10;
+/// The flags with only the stereo field set, to the kernel driver's starting value.
+const PRIMARY_NO_STEREO: u32 = 2 << 3;
+
+/// Fills in the answer to [`PRIMARY_INFO`] in an unwrapped escape. Returns false, writing nothing,
+/// when the payload isn't the shape the guest's driver sends, or asks for what the kernel driver
+/// refuses.
+fn primary_info(data: &mut [u8]) -> bool {
+    let input = HEADER_SIZE;
+    let output = input + PRIMARY_BLOCK;
+    let well_shaped = data.len() >= output + PRIMARY_BLOCK
+        && dword(data, input).is_some_and(|size| size as usize >= PRIMARY_BLOCK)
+        && dword(data, output).is_some_and(|size| size as usize >= PRIMARY_BLOCK);
+    let bits = dword(data, input + COUNT_SIZE + PRIMARY_BITS_PER_PIXEL);
+    if !well_shaped || bits.is_none_or(|bits| bits < PRIMARY_LEAST_BITS) {
+        return false;
+    }
+    data[output + COUNT_SIZE..output + PRIMARY_BLOCK].fill(0);
+    put_dword(data, output + COUNT_SIZE + PRIMARY_FLAGS, PRIMARY_NO_STEREO);
+    true
+}
+
+/// Whether the user-mode driver's wrapper is in front of the escape.
+fn is_wrapped(data: &[u8]) -> bool {
+    data.len() >= WRAPPER_SIZE
+        && dword(data, 0) == Some(WRAPPER_KIND)
+        && dword(data, WRAPPER_VERSION_AT) == Some(WRAPPER_VERSION)
+}
+
 /// The escape inside its wrapper, or the whole buffer when it came without one.
 pub fn unwrapped(data: &mut [u8]) -> &mut [u8] {
-    let wrapped = data.len() >= WRAPPER_SIZE
-        && dword(data, 0) == Some(WRAPPER_KIND)
-        && dword(data, WRAPPER_VERSION_AT) == Some(WRAPPER_VERSION);
-    if wrapped { &mut data[WRAPPER_SIZE..] } else { data }
+    if is_wrapped(data) { &mut data[WRAPPER_SIZE..] } else { data }
+}
+
+/// [`unwrapped`], for a buffer that is only read.
+fn unwrapped_to_read(data: &[u8]) -> &[u8] {
+    if is_wrapped(data) { &data[WRAPPER_SIZE..] } else { data }
+}
+
+/// One of a payload's two byte counts, as far as the buffer holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Count {
+    /// The buffer ends before the count.
+    Missing,
+    /// The count, with that many bytes after it in the buffer.
+    Fits(u32),
+    /// The count, with fewer bytes than that after it. Whatever would follow them can't be placed.
+    PastEnd(u32),
+}
+
+/// How an escape is framed, read from it as it came, for the log. No answer is made from this: the
+/// counts are read where the payload's shape puts them, whether or not this escape's payload has
+/// that shape, and each says whether the buffer bears it out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Framing {
+    /// The user-mode driver's wrapper is in front.
+    pub wrapped: bool,
+    /// The code as it was sent, where [`EscapeCode`] is the one the kernel driver dispatches. `None`
+    /// for a buffer too short for a header.
+    pub code_sent: Option<u32>,
+    /// The count ahead of the input.
+    pub input: Count,
+    /// The count ahead of the output, which is [`Count::Missing`] unless the input fits.
+    pub output: Count,
+}
+
+/// Reads an escape's framing, inside its wrapper if it has one.
+pub fn framing(data: &[u8]) -> Framing {
+    let escape = unwrapped_to_read(data);
+    let count_at = |at: usize| match dword(escape, at) {
+        None => Count::Missing,
+        Some(count) => {
+            let end = (at + COUNT_SIZE).checked_add(count as usize);
+            if end.is_some_and(|end| end <= escape.len()) {
+                Count::Fits(count)
+            } else {
+                Count::PastEnd(count)
+            }
+        }
+    };
+    let input = count_at(HEADER_SIZE);
+    let output = match input {
+        Count::Fits(bytes) => count_at(HEADER_SIZE + COUNT_SIZE + bytes as usize),
+        Count::Missing | Count::PastEnd(_) => Count::Missing,
+    };
+    let code_sent = if escape.len() >= HEADER_SIZE { dword(escape, ESCAPE_CODE) } else { None };
+    Framing { wrapped: is_wrapped(data), code_sent, input, output }
+}
+
+/// The payload after the header, inside the wrapper if there is one. Empty for a buffer that ends
+/// with its header or before.
+pub fn payload(data: &[u8]) -> &[u8] {
+    unwrapped_to_read(data).get(HEADER_SIZE..).unwrap_or_default()
 }
 
 /// Answers an escape in place, inside its wrapper if it has one. Returns how, or why it couldn't be
 /// read; an escape too short for its header has nowhere to put an answer and goes back untouched.
 pub fn answer(data: &mut [u8]) -> Result<Answered, Refused> {
+    answer_with(data, |_, _| false)
+}
+
+/// [`answer`], with someone to ask about an escape nothing here answers. `other` is given the
+/// dispatched code and the payload after the header, and says whether it wrote an answer there, in
+/// which case the escape is done.
+pub fn answer_with(
+    data: &mut [u8],
+    other: impl FnOnce(EscapeCode, &mut [u8]) -> bool,
+) -> Result<Answered, Refused> {
     let data = unwrapped(data);
     let code = match parse(data) {
         Ok(code) => code,
@@ -219,10 +337,10 @@ pub fn answer(data: &mut [u8]) -> Result<Answered, Refused> {
             return Err(refused);
         }
     };
-    let done = code.needed().is_some_and(|needed| reply(data, needed));
-    if !done {
-        put_dword(data, RETURN_CODE, RETURN_FAILED);
-    }
+    let done = code.needed().is_some_and(|needed| reply(data, needed))
+        || (code == PRIMARY_INFO && primary_info(data))
+        || other(code, &mut data[HEADER_SIZE..]);
+    put_dword(data, RETURN_CODE, if done { RETURN_DONE } else { RETURN_FAILED });
     Ok(Answered { code, done })
 }
 
@@ -346,6 +464,33 @@ mod tests {
     }
 
     #[test]
+    fn an_escape_nothing_here_answers_is_done_when_someone_else_answers_it() {
+        let mut data = escape(0x0200_0103);
+        let answered = answer_with(&mut data, |code, payload| {
+            assert_eq!((code.service, code.subfunction, payload.len()), (2, 1, 0x20));
+            payload[4] = 0x5A;
+            true
+        });
+        assert!(answered.unwrap().done);
+        assert_eq!(dword(&data, RETURN_CODE), Some(RETURN_DONE));
+        assert_eq!(data[HEADER_SIZE + 4], 0x5A);
+
+        let mut left = escape(0x0200_0103);
+        assert!(!answer_with(&mut left, |_, _| false).unwrap().done);
+        assert_eq!(dword(&left, RETURN_CODE), Some(RETURN_FAILED));
+    }
+
+    #[test]
+    fn nobody_else_is_asked_about_an_escape_answered_here_or_one_that_cannot_be_read() {
+        let nobody = |_: EscapeCode, _: &mut [u8]| -> bool { panic!("asked") };
+        assert!(answer_with(&mut needed_escape(0x5D), nobody).unwrap().done);
+        let mut old = escape(0x0200_0103);
+        put_dword(&mut old, HEADER_VERSION, 0xFFFF);
+        assert!(answer_with(&mut old, nobody).is_err());
+        assert!(answer_with(&mut [0xEE; 6], nobody).is_err());
+    }
+
+    #[test]
     fn a_needed_subfunction_under_another_service_or_client_is_not_answered() {
         for code in [0x0200_5D03, 0x0300_5D01] {
             let mut data = needed_escape(0x5D);
@@ -422,6 +567,63 @@ mod tests {
     }
 
     #[test]
+    fn the_framing_is_read_from_inside_the_wrapper() {
+        let mut bare = needed_escape(0x5D);
+        put_dword(&mut bare, ESCAPE_CODE, 0x0100_2603);
+        let read = Framing {
+            wrapped: false,
+            code_sent: Some(0x0100_2603),
+            input: Count::Fits(0x20),
+            output: Count::Fits(0x60),
+        };
+        assert_eq!(framing(&bare), read);
+        assert_eq!(framing(&wrapped(&bare)), Framing { wrapped: true, ..read });
+        assert_eq!(payload(&bare).len(), 2 * COUNT_SIZE + 0x20 + 0x60);
+        assert_eq!(payload(&wrapped(&bare)), payload(&bare));
+        // The kernel driver dispatches this one under another service, and the framing still says
+        // what was sent.
+        assert_eq!(parse(&bare).unwrap().service, SERVICE_3);
+    }
+
+    #[test]
+    fn a_count_the_buffer_does_not_bear_out_says_so() {
+        let whole = needed_escape(0x62);
+        let mut short_output = whole.clone();
+        short_output.pop();
+        assert_eq!(framing(&short_output).input, Count::Fits(0x20));
+        assert_eq!(framing(&short_output).output, Count::PastEnd(0x20));
+
+        // The input's count runs past the end, so nothing says where the output's count would be.
+        let mut long_input = whole.clone();
+        put_dword(&mut long_input, HEADER_SIZE, 0x1000);
+        assert_eq!(framing(&long_input).input, Count::PastEnd(0x1000));
+        assert_eq!(framing(&long_input).output, Count::Missing);
+        put_dword(&mut long_input, HEADER_SIZE, u32::MAX);
+        assert_eq!(framing(&long_input).input, Count::PastEnd(u32::MAX));
+
+        let no_output_count = &whole[..HEADER_SIZE + COUNT_SIZE + 0x20 + 3];
+        assert_eq!(framing(no_output_count).input, Count::Fits(0x20));
+        assert_eq!(framing(no_output_count).output, Count::Missing);
+
+        let header_only = &whole[..HEADER_SIZE];
+        assert_eq!(framing(header_only).code_sent, Some(0x0300_6203));
+        assert_eq!(
+            (framing(header_only).input, framing(header_only).output),
+            (Count::Missing, Count::Missing)
+        );
+        assert!(payload(header_only).is_empty());
+    }
+
+    #[test]
+    fn a_buffer_too_short_for_a_header_has_no_code_and_no_payload() {
+        let short = &needed_escape(0x62)[..HEADER_SIZE - 1];
+        let read = Framing { wrapped: false, code_sent: None, input: Count::Missing, output: Count::Missing };
+        assert_eq!(framing(short), read);
+        assert!(payload(short).is_empty());
+        assert_eq!(framing(&[]), read);
+    }
+
+    #[test]
     fn a_badly_framed_escape_is_refused() {
         let mut short = escape(0x0200_0103);
         short.truncate(HEADER_SIZE - 1);
@@ -435,5 +637,75 @@ mod tests {
         let mut small = escape(0x0200_0103);
         put_dword(&mut small, SIZE, 0x40);
         assert_eq!(parse(&small), Err(Refused("its size is less than its header")));
+    }
+    /// A primary info request as the Vulkan driver sent it on Short3D's card: source 0, 2560 by 1440,
+    /// 32 bits per pixel, format 0x20, with an output block of junk to be overwritten.
+    fn primary_request(bits: u32) -> Vec<u8> {
+        let size = HEADER_SIZE + 2 * PRIMARY_BLOCK;
+        let mut data = vec![0u8; size];
+        put_dword(&mut data, SIZE, size as u32);
+        put_dword(&mut data, HEADER_VERSION, LEAST_HEADER_VERSION);
+        put_dword(&mut data, ESCAPE_CODE, 0x0100_1003);
+        let input = HEADER_SIZE;
+        put_dword(&mut data, input, PRIMARY_BLOCK as u32);
+        for (at, value) in [(4, 0), (8, 2560), (12, 1440), (16, bits), (20, 0x20)] {
+            put_dword(&mut data, input + at, value);
+        }
+        let output = input + PRIMARY_BLOCK;
+        data[output..].fill(0xAB);
+        put_dword(&mut data, output, PRIMARY_BLOCK as u32);
+        data
+    }
+
+    #[test]
+    fn primary_info_is_done_and_promises_nothing_but_no_stereo() {
+        let mut data = primary_request(32);
+        let answered = answer(&mut data).unwrap();
+        assert_eq!(answered.code, PRIMARY_INFO);
+        assert!(answered.done);
+        assert_eq!(dword(&data, RETURN_CODE), Some(RETURN_DONE));
+        let output = HEADER_SIZE + PRIMARY_BLOCK;
+        assert_eq!(dword(&data, output), Some(PRIMARY_BLOCK as u32));
+        let fields: Vec<u32> =
+            (output + 4..output + PRIMARY_BLOCK).step_by(4).map(|at| dword(&data, at).unwrap()).collect();
+        let mut expected = vec![0u32; 15];
+        expected[PRIMARY_FLAGS / 4] = 0x10;
+        assert_eq!(fields, expected);
+        // As the user-mode driver reads it: tiling caps 0, stereo mode 2, no flags.
+        assert_eq!(fields[0], 0);
+        assert_eq!(fields[PRIMARY_FLAGS / 4] >> 3 & 7, 2);
+        // The input is left as it came.
+        assert_eq!(dword(&data, HEADER_SIZE + 8), Some(2560));
+    }
+
+    #[test]
+    fn primary_info_is_found_inside_the_wrapper() {
+        let mut data = vec![0u8; WRAPPER_SIZE];
+        put_dword(&mut data, 0, WRAPPER_KIND);
+        put_dword(&mut data, WRAPPER_VERSION_AT, WRAPPER_VERSION);
+        data.extend_from_slice(&primary_request(32));
+        assert!(answer(&mut data).unwrap().done);
+    }
+
+    #[test]
+    fn primary_info_fails_as_the_kernel_does_for_a_bad_request() {
+        let mut too_few_bits = primary_request(4);
+        assert!(!answer(&mut too_few_bits).unwrap().done);
+        let mut short = primary_request(32);
+        short.truncate(HEADER_SIZE + PRIMARY_BLOCK + 8);
+        assert!(!answer(&mut short).unwrap().done);
+        assert_eq!(dword(&short, RETURN_CODE), Some(RETURN_FAILED));
+        let mut small_output = primary_request(32);
+        put_dword(&mut small_output, HEADER_SIZE + PRIMARY_BLOCK, 0x20);
+        assert!(!answer(&mut small_output).unwrap().done);
+        // Nothing was written into an output the request didn't make room for.
+        assert_eq!(small_output[HEADER_SIZE + PRIMARY_BLOCK + 4], 0xAB);
+    }
+
+    #[test]
+    fn only_the_user_mode_client_s_service_1_subfunction_0x10_is_primary_info() {
+        let mut data = primary_request(32);
+        put_dword(&mut data, ESCAPE_CODE, 0x0300_1003);
+        assert!(!answer(&mut data).unwrap().done);
     }
 }

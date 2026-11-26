@@ -1,6 +1,9 @@
 //! `guesthouse`: the desktop app.
 
+use guesthouse_app::viewer::app_windows;
+use guesthouse_app::{gpu_reset, installer};
 use std::env;
+use std::path::PathBuf;
 
 const GTK_DEBUG_VARIABLE: &str = "GDK_DEBUG";
 /// GTK hides Wayland's colour management from itself without this, and HDR needs it. It's a debug
@@ -28,7 +31,35 @@ fn main() -> gtk::glib::ExitCode {
         // SAFETY: nothing else is running yet, and GTK reads this when it starts, which is after this.
         unsafe { env::set_var(GTK_DEBUG_VARIABLE, flags) };
     }
-    guesthouse_app::application::run()
+    // The AppImage's own run, which installs the release it carries and opens nothing else.
+    if let Some(payload) = env::var_os(installer::VARIABLE).map(PathBuf::from) {
+        // SAFETY: nothing else is running yet. Taken out so that nothing the installer starts gets it.
+        unsafe { env::remove_var(installer::VARIABLE) };
+        return installer::run(&payload);
+    }
+    // The viewer of app windows: a machine's programs as windows of their own.
+    let arguments: Vec<String> = env::args().skip(1).collect();
+    match app_windows::request(&arguments) {
+        Some(Ok(request)) => return app_windows::run(request),
+        Some(Err(text)) => {
+            eprintln!("{text}");
+            return gtk::glib::ExitCode::FAILURE;
+        }
+        None => {}
+    }
+    // One step from a launcher entry to a program's window.
+    match app_windows::launch::request(&arguments) {
+        Some(Ok(request)) => return app_windows::launch::run(request),
+        Some(Err(text)) => {
+            eprintln!("{text}");
+            return gtk::glib::ExitCode::FAILURE;
+        }
+        None => {}
+    }
+    let restart = env::var(gpu_reset::VARIABLE).ok().and_then(|note| gpu_reset::Restart::from_value(&note));
+    // SAFETY: nothing else is running yet. Taken out so that nothing the app starts gets it.
+    unsafe { env::remove_var(gpu_reset::VARIABLE) };
+    guesthouse_app::application::run(restart)
 }
 
 #[cfg(test)]

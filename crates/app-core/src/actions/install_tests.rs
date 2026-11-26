@@ -100,11 +100,11 @@ fn the_answer_file_gets_the_hosts_zone() {
     let context = scratch_context(&scratch);
     scratch.write("program/guest/autounattend.xml", "<a><TimeZone>UTC</TimeZone></a>");
     assert_eq!(
-        answer_file(&context, "Asia/Tokyo", "gpupv", "secret").unwrap(),
+        answer_file(&context, "Asia/Tokyo", "gpupv", "secret", None).unwrap(),
         "<a><TimeZone>Tokyo Standard Time</TimeZone></a>"
     );
     assert_eq!(
-        answer_file(&context, "Mars/Olympus_Mons", "gpupv", "secret").unwrap(),
+        answer_file(&context, "Mars/Olympus_Mons", "gpupv", "secret", None).unwrap(),
         "<a><TimeZone>UTC</TimeZone></a>"
     );
 }
@@ -115,7 +115,7 @@ fn the_answer_file_gets_the_machines_password() {
     let context = scratch_context(&scratch);
     scratch.write("program/guest/autounattend.xml", "<Value>@PASSWORD@</Value><Value>@PASSWORD@</Value>");
     assert_eq!(
-        answer_file(&context, "Asia/Tokyo", "gpupv", "secret").unwrap(),
+        answer_file(&context, "Asia/Tokyo", "gpupv", "secret", None).unwrap(),
         "<Value>secret</Value><Value>secret</Value>"
     );
 }
@@ -126,9 +126,32 @@ fn the_answer_file_gets_the_account_as_xml() {
     let context = scratch_context(&scratch);
     scratch.write("program/guest/autounattend.xml", "<Name>@USER@</Name><Value>@PASSWORD@</Value>");
     assert_eq!(
-        answer_file(&context, "UTC", "Ana B", "a<b>&c").unwrap(),
+        answer_file(&context, "UTC", "Ana B", "a<b>&c", None).unwrap(),
         "<Name>Ana B</Name><Value>a&lt;b&gt;&amp;c</Value>"
     );
+}
+
+#[test]
+fn the_answer_file_picks_the_edition_and_its_key() {
+    let scratch = Scratch::new();
+    let context = scratch_context(&scratch);
+    scratch.write(
+        "program/guest/autounattend.xml",
+        "<Value>@EDITION@</Value>@PRODUCT_KEY@<AcceptEula>true</AcceptEula>",
+    );
+    let pro = answer_file(&context, "UTC", "gpupv", "secret", Some("Windows 11 Pro")).unwrap();
+    assert!(pro.contains("<Value>Windows 11 Pro</Value>"));
+    assert!(pro.contains("W269N-WFGWX-YVC9B-4J6C9-T83GX"));
+    let iot =
+        answer_file(&context, "UTC", "gpupv", "secret", Some("Windows 11 IoT Enterprise LTSC")).unwrap();
+    assert!(iot.contains("<Value>Windows 11 IoT Enterprise LTSC</Value>"));
+    assert!(iot.contains("KBN8V-HFGQ4-MGXVD-347P6-PDQGT"));
+    let year =
+        answer_file(&context, "UTC", "gpupv", "secret", Some("Windows 11 IoT Enterprise LTSC 2024")).unwrap();
+    assert!(year.contains("<Value>Windows 11 IoT Enterprise LTSC 2024</Value>"), "the image's own name");
+    assert!(year.contains("KBN8V-HFGQ4-MGXVD-347P6-PDQGT"), "a year on the end is the same edition");
+    let defaulted = answer_file(&context, "UTC", "gpupv", "secret", None).unwrap();
+    assert!(defaulted.contains("<Value>Windows 11 Pro</Value>"), "an unread disc still gets Pro");
 }
 
 #[test]
@@ -143,6 +166,8 @@ fn with_install_files(scratch: &Scratch, context: &Context) {
         scratch.write(&format!("program/guest/{name}"), "<TimeZone>UTC</TimeZone>");
     }
     scratch.write("program/guest/setmode.ps1", "mode");
+    scratch.write("program/guest/remote-desktop.ps1", "turn it");
+    scratch.write("program/guest/ssh.ps1", "set it up");
     let driver = crate::settings::driver_folder(context);
     fs::create_dir_all(driver.join("sub")).unwrap();
     fs::write(driver.join("nv_dispi.inf"), "driver").unwrap();
@@ -182,6 +207,32 @@ fn the_answer_disc_holds_this_machines_token_and_is_private() {
     assert!(!vm.folder(&context).join("answer-disc.new").exists(), "the files for the disc are gone");
 }
 
+/// As in NixOS's store, where the program folder's files can't be written.
+fn make_read_only(folder: &Path) {
+    for entry in fs::read_dir(folder).unwrap().flatten() {
+        fs::set_permissions(entry.path(), fs::Permissions::from_mode(0o444)).unwrap();
+    }
+}
+
+#[test]
+fn a_read_only_program_folder_still_makes_the_disc() {
+    let scratch = Scratch::new();
+    let context = scratch_context(&scratch);
+    with_install_files(&scratch, &context);
+    scratch.write("program/openssh/OpenSSH-Win64.msi", "installer");
+    make_read_only(&scratch.path("program/guest"));
+    make_read_only(&scratch.path("program/openssh"));
+    let vm = machine(&context);
+    let access = crate::remote_access::Access { ssh: Some(true), ..crate::remote_access::Access::NEW };
+    crate::remote_access::write_access(&context, &vm, &access).unwrap();
+    make_answer_disc(&context, &vm).unwrap();
+    let answers = on_disc(&answer_disc_path(&context, &vm), "/autounattend.xml");
+    assert!(
+        String::from_utf8_lossy(&answers).contains("<TimeZone>"),
+        "the filled answer file is on the disc"
+    );
+}
+
 #[test]
 fn a_machine_on_an_amd_card_gets_amds_driver_on_its_disc() {
     let scratch = Scratch::new();
@@ -203,6 +254,72 @@ fn a_machine_on_an_amd_card_gets_amds_driver_on_its_disc() {
     let listing = String::from_utf8_lossy(&listing);
     assert!(listing.lines().any(|line| line == "/amd/amdxc64.dll"), "{listing}");
     assert!(!listing.contains("/nvidia"), "NVIDIA's driver is not this machine's");
+}
+
+#[test]
+fn the_disc_carries_remote_desktop_and_ssh_as_the_machine_was_made() {
+    let scratch = Scratch::new();
+    let context = scratch_context(&scratch);
+    with_install_files(&scratch, &context);
+    let vm = machine(&context);
+    let access = crate::remote_access::Access { ssh: Some(true), ..crate::remote_access::Access::NEW };
+    crate::remote_access::write_access(&context, &vm, &access).unwrap();
+    let refused = make_answer_disc(&context, &vm).unwrap_err();
+    assert!(refused.0.contains("no OpenSSH"), "{}", refused.0);
+    scratch.write("program/openssh/OpenSSH-Win64.msi", "installer");
+    make_answer_disc(&context, &vm).unwrap();
+    let path = answer_disc_path(&context, &vm);
+    assert!(String::from_utf8_lossy(&on_disc(&path, "/remote-desktop.ps1")).starts_with("$on = $true\n"));
+    let ssh = String::from_utf8_lossy(&on_disc(&path, "/ssh.ps1")).into_owned();
+    assert!(ssh.contains("$package = Join-Path $PSScriptRoot 'OpenSSH-Win64.msi'\n"), "{ssh}");
+    assert_eq!(on_disc(&path, "/OpenSSH-Win64.msi"), b"installer");
+}
+
+fn disc_files(path: &Path) -> Vec<(String, Vec<u8>)> {
+    let listing = Command::new("isoinfo").args(["-J", "-f", "-i"]).arg(path).output().unwrap().stdout;
+    let mut names: Vec<String> = String::from_utf8_lossy(&listing).lines().map(str::to_owned).collect();
+    names.sort();
+    names.into_iter().map(|name| (name.clone(), on_disc(path, &name))).collect()
+}
+
+/// Lean Windows adds two files and one line, and only to a lean machine's disc: off, the disc is the
+/// same to the byte as one made before the choice existed.
+#[test]
+fn only_a_lean_machines_disc_has_lean_windows_on_it() {
+    let scratch = Scratch::new();
+    let context = scratch_context(&scratch);
+    with_install_files(&scratch, &context);
+    let real = |name: &str| {
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../guest").join(name)).unwrap()
+    };
+    scratch.write("program/guest/autounattend.xml", real("autounattend.xml"));
+    scratch.write("program/guest/lean.ps1", real("lean.ps1"));
+    let vm = machine(&context);
+    make_answer_disc(&context, &vm).unwrap();
+    let path = answer_disc_path(&context, &vm);
+    let before = disc_files(&path);
+    assert!(
+        before
+            .iter()
+            .all(|(name, bytes)| !name.contains("lean") && !String::from_utf8_lossy(bytes).contains("lean"))
+    );
+    lean::write_lean(&context, &vm, true).unwrap();
+    make_answer_disc(&context, &vm).unwrap();
+    let lean_disc = disc_files(&path);
+    let names: Vec<&str> = lean_disc.iter().map(|(name, _)| name.as_str()).collect();
+    assert!(names.contains(&"/lean.ps1") && names.contains(&"/lean.json"), "{names:?}");
+    let answers = |files: &[(String, Vec<u8>)]| {
+        String::from_utf8(files.iter().find(|(name, _)| name == "/autounattend.xml").unwrap().1.clone())
+            .unwrap()
+    };
+    let with_step = answers(&lean_disc);
+    assert_eq!(lean::with_specialize_step(&answers(&before)).unwrap(), with_step);
+    let data: serde_json::Value =
+        serde_json::from_slice(&lean_disc.iter().find(|(name, _)| name == "/lean.json").unwrap().1).unwrap();
+    assert_eq!(data["apps"].as_array().unwrap().len(), lean::APPS.len());
+    lean::write_lean(&context, &vm, false).unwrap();
+    make_answer_disc(&context, &vm).unwrap();
+    assert_eq!(disc_files(&path), before, "off again is the disc as it was");
 }
 
 /// Stands in for a guest that installs and shuts down.
@@ -234,12 +351,17 @@ fn install_setup(scratch: &Scratch) -> (Context, Machine) {
         name: "Steps".into(),
         iso,
         kind: Kind::Windows,
+        windows_disc: true,
         cores: 2,
         ram_gib: 4,
         disk_gib: 64,
+        refresh_hz: None,
         user: String::new(),
         password: String::new(),
         amd_gpu: None,
+        disk_place: String::new(),
+        gpu_maker: None,
+        access: crate::remote_access::Access::NEW,
     };
     let vm = crate::library::create(&context, &new).unwrap();
     (context, vm)
@@ -329,9 +451,19 @@ fn an_install_forgets_what_the_old_windows_had_taken_in() {
     write_state(&context, &vm, &old).unwrap();
     let display = vm.folder(&context).join("display.json");
     fs::write(&display, r#"{"driver":"installed"}"#).unwrap();
+    let failed_start = crate::auto_snapshot::record::Record {
+        tag: "guesthouse-0a1b2c3d".into(),
+        name: "Automatic: before the vendor ID".into(),
+        pending: true,
+        covered: vec!["files:old".into()],
+        back_to: None,
+    };
+    crate::auto_snapshot::record::write(&context, &vm, &failed_start).unwrap();
     let host = InstallHost { inner: RecordingHost::default(), context: &context };
     let mut task = Task::new(&context, &host, "install", vm.clone());
     assert!(install(&mut task).is_err(), "the stand-in VM never shuts down");
+    let record = crate::auto_snapshot::record::read(&context, &vm);
+    assert_eq!(record, Default::default(), "no way back to a snapshot that went with the old disk");
     assert!(read_state(&context, &vm).restart_due, "the new Windows was given the package again");
     assert!(!display.exists(), "and its display driver is looked at afresh");
 }
@@ -347,4 +479,70 @@ fn a_machine_outside_its_folder_is_never_installed_over() {
     let host = RecordingHost::default();
     let mut task = Task::new(&context, &host, "install", elsewhere);
     assert!(install(&mut task).unwrap_err().0.contains("not in its folder"));
+}
+
+/// A guest that installs, and shuts down when told to. Every ask is kept, in order.
+struct ShutdownGuest {
+    process: std::path::PathBuf,
+    asked: Mutex<Vec<String>>,
+}
+
+impl crate::agent::GuestAgent for ShutdownGuest {
+    fn ask(&self, port: u16, token: &str, script: &str, seconds: u64) -> String {
+        self.asked.lock().unwrap().push(script.to_owned());
+        if script == "Stop-Computer -Force" {
+            let _ = fs::remove_dir_all(&self.process);
+            return String::new();
+        }
+        InstalledGuest.ask(port, token, script, seconds)
+    }
+}
+
+const RECIPE: &str =
+    "name = \"Box\"\ndescription = \"A box.\"\nguest = \"windows\"\n[steps]\npackages = [\"Git.Git\"]\n";
+
+/// Installs to the end, as a guest that shuts down does, with the recipe if there is one. There is no
+/// room to start the machine after it, so it ends off, which is the one end that needs no GPU.
+fn install_to_the_end(scratch: &Scratch, recipe: Option<&str>) -> (Context, Machine, Vec<String>, String) {
+    let (mut context, vm) = install_setup(scratch);
+    let guest = Arc::new(ShutdownGuest { process: context.processes.join("40"), asked: Mutex::default() });
+    context.agent = guest.clone();
+    context.ram_limit = Some(1);
+    if let Some(text) = recipe {
+        let chosen = crate::recipe::Chosen {
+            source: crate::recipe::Source::App,
+            file: String::new(),
+            recipe: crate::recipe::Recipe::parse(text).unwrap(),
+        };
+        crate::recipe::write_chosen(&context, &vm, &chosen).unwrap();
+    }
+    let host = InstallHost { inner: RecordingHost::default(), context: &context };
+    let mut task = Task::new(&context, &host, "install", vm.clone());
+    install(&mut task).unwrap();
+    let asked = guest.asked.lock().unwrap().clone();
+    let (made, error) = (load(&context, &vm.id).unwrap(), task.error);
+    (context, made, asked, error)
+}
+
+#[test]
+fn an_install_with_no_recipe_ends_as_it_did_and_asks_a_guest_nothing_after_its_shutdown() {
+    let scratch = Scratch::new();
+    let (_, made, asked, error) = install_to_the_end(&scratch, None);
+    assert!(!made.installing);
+    assert_eq!(error, "Windows is installed. There isn't room to start it right now.");
+    assert_eq!(asked.last().map(String::as_str), Some("Stop-Computer -Force"), "{asked:?}");
+}
+
+#[test]
+fn a_recipes_steps_wait_when_the_machine_ends_off_and_say_so() {
+    let scratch = Scratch::new();
+    let (context, made, asked, error) = install_to_the_end(&scratch, Some(RECIPE));
+    assert!(!made.installing, "the machine is installed");
+    assert!(error.contains("isn't room") && error.contains("run at its first start"), "{error}");
+    assert_eq!(
+        asked.last().map(String::as_str),
+        Some("Stop-Computer -Force"),
+        "the guest was asked nothing more"
+    );
+    assert_eq!(crate::recipe::read_outcome(&context, &made), crate::recipe::Outcome::Pending);
 }

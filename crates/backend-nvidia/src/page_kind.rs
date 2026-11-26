@@ -8,11 +8,11 @@ const CLASS_MASK: u64 = 0xFF;
 const CLASS_NONE: u8 = 0;
 
 // The depth classes, in the driver's own numbering, and what each one packs.
-const CLASS_S8: u8 = 1;
-const CLASS_Z16: u8 = 2;
-const CLASS_S8Z24: u8 = 3;
-const CLASS_Z24S8: u8 = 4;
-const CLASS_ZF32_X24S8: u8 = 5;
+pub(crate) const CLASS_S8: u8 = 1;
+pub(crate) const CLASS_Z16: u8 = 2;
+pub(crate) const CLASS_S8Z24: u8 = 3;
+pub(crate) const CLASS_Z24S8: u8 = 4;
+pub(crate) const CLASS_ZF32_X24S8: u8 = 5;
 
 // The kind field of a page table entry for each, which these three generations share.
 const KIND_Z16: u32 = 0x01;
@@ -42,6 +42,20 @@ pub enum PageKinds {
 /// The depth class a driver protection value names, or zero for none.
 pub fn depth_class(driver_protection: u64) -> u8 {
     (driver_protection >> CLASS_SHIFT & CLASS_MASK) as u8
+}
+
+/// The value with a depth class put in, for a map whose driver named none. One that did keeps its own.
+pub fn with_depth_class(driver_protection: u64, class: u8) -> u64 {
+    if depth_class(driver_protection) != CLASS_NONE {
+        return driver_protection;
+    }
+    driver_protection | u64::from(class) << CLASS_SHIFT
+}
+
+/// The depth class a driver protection value names, if it is one of the classes known here.
+pub fn known_class(driver_protection: u64) -> Option<u8> {
+    let class = depth_class(driver_protection);
+    CLASS_KINDS.iter().any(|known| known.0 == class).then_some(class)
 }
 
 /// The page kind of a driver protection value's class, with nothing logged.
@@ -84,6 +98,12 @@ mod tests {
         for (class, kind) in [(1, 0x02), (2, 0x01), (3, 0x03), (4, 0x05), (5, 0x04)] {
             assert_eq!(page_kind(InEntries, with_class(class)), Some(kind), "class {class}");
         }
+    }
+
+    #[test]
+    fn a_class_goes_in_only_where_the_driver_named_none() {
+        assert_eq!(with_depth_class(0x1, CLASS_ZF32_X24S8), 0x0501);
+        assert_eq!(with_depth_class(0x1000_0301, CLASS_ZF32_X24S8), 0x1000_0301);
     }
 
     #[test]

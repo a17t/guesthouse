@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::{Delivery, Frame, FrameRing, FrameSink, ViewerFacts};
+use guesthouse_backend::RingTiling;
 use guesthouse_messages::adapter::{AdapterQuery, DisplayMode};
 use guesthouse_messages::indirect::as_the_driver_sends as driver;
 use guesthouse_messages::indirect::{FrameDone, Look, Mastering, Register, RingName, Stamp};
@@ -20,8 +21,13 @@ const STATUS_STALE: u32 = 1;
 const STATUS_REFUSED: u32 = 2;
 const ESCAPE_SIZE_AT: usize = HEADER_SIZE + 16;
 const ESCAPE_HEADER: usize = HEADER_SIZE + 24;
-const HDR_VIEWER: ViewerFacts =
-    ViewerFacts { shows_hdr: true, refresh_millihertz: 240_000, peak_nits: 1000, wants_memory: false };
+const HDR_VIEWER: ViewerFacts = ViewerFacts {
+    shows_hdr: true,
+    refresh_millihertz: 240_000,
+    peak_nits: 1000,
+    wants_memory: false,
+    takes_ring_tiling: false,
+};
 
 #[derive(Default)]
 struct Sink {
@@ -364,6 +370,90 @@ fn a_viewer_on_another_gpu_gets_each_frame_copied_into_memory_here() {
     assert!(session.memory().host_buffers.is_empty());
 }
 
+const TILES: RingTiling = RingTiling { modifier: 0x0300_0000_0060_6014, block: 4 };
+const TILE_VIEWER: ViewerFacts = ViewerFacts {
+    shows_hdr: false,
+    refresh_millihertz: 60_000,
+    peak_nits: 0,
+    wants_memory: false,
+    takes_ring_tiling: true,
+};
+
+/// A session whose card has tiles, with one frame waiting and a viewer that takes them.
+fn with_a_tile_viewer() -> (TestSession, u32) {
+    let (mut session, first) = registered();
+    session.backend_mut().ring_tiling = Some(TILES);
+    frame(&mut session, Some(first));
+    let _ = session.poll(Instant::now());
+    session.viewer_arrived();
+    session.viewer_described(TILE_VIEWER);
+    (session, first)
+}
+
+#[test]
+fn a_viewer_that_takes_the_cards_tiles_gets_its_frames_copied_into_them() {
+    let (mut session, _) = with_a_tile_viewer();
+    let mut sink = Sink::default();
+    turn(&mut session, &mut sink);
+    turn(&mut session, &mut sink);
+    assert_eq!((sink.rings.len(), sink.frames.len()), (1, 1));
+    assert_eq!(sink.frames[0].tiling, Some(TILES));
+    assert_eq!(session.backend().slot_copies.last().unwrap().slot_tiling, Some(TILES.block));
+}
+
+#[test]
+fn tiled_slots_that_cant_be_made_leave_the_viewer_its_frames_in_rows() {
+    let (mut session, first) = with_a_tile_viewer();
+    session.backend_mut().fail_next_allocation = true;
+    let mut sink = Sink::default();
+    turn(&mut session, &mut sink);
+    turn(&mut session, &mut sink);
+    assert_eq!((sink.rings.len(), sink.frames.len()), (1, 1), "the viewer still has a picture");
+    assert_eq!((sink.frames[0].slot, sink.frames[0].tiling), (first, None));
+    assert!(session.backend().slot_copies.is_empty());
+
+    session.viewer_left();
+    session.viewer_arrived();
+    session.viewer_described(TILE_VIEWER);
+    let mut next = Sink::default();
+    turn(&mut session, &mut next);
+    turn(&mut session, &mut next);
+    assert_eq!(next.frames[0].tiling, None, "the tiles aren't tried again on this card");
+    assert!(session.backend().slot_copies.is_empty());
+}
+
+#[test]
+fn a_first_copy_into_the_tiles_that_fails_leaves_the_viewer_its_frames_in_rows() {
+    let (mut session, first) = with_a_tile_viewer();
+    session.backend_mut().slot_copy_status = Status::UNSUCCESSFUL;
+    let mut sink = Sink::default();
+    turn(&mut session, &mut sink);
+    turn(&mut session, &mut sink);
+    assert_eq!((sink.rings.len(), sink.frames.len()), (1, 1));
+    assert_eq!((sink.frames[0].slot, sink.frames[0].tiling), (first, None));
+    assert!(session.frames.ring.as_ref().unwrap().memory.is_empty(), "the tiled slots went");
+}
+
+#[test]
+fn a_later_copy_into_the_tiles_that_fails_moves_the_viewer_to_rows() {
+    let (mut session, _) = with_a_tile_viewer();
+    let mut sink = Sink::default();
+    turn(&mut session, &mut sink);
+    turn(&mut session, &mut sink);
+    assert_eq!(sink.frames[0].tiling, Some(TILES));
+
+    session.backend_mut().slot_copy_status = Status::UNSUCCESSFUL;
+    let next = frame(&mut session, None).1.expect("a free slot");
+    frame(&mut session, Some(next));
+    turn(&mut session, &mut sink);
+    turn(&mut session, &mut sink);
+    assert_eq!(sink.rings.len(), 2, "the guest's own buffers, as a new ring");
+    assert!(sink.rings[1].generation > sink.rings[0].generation, "the tiled ring's releases can't touch it");
+    let last = sink.frames.last().unwrap();
+    assert_eq!((last.generation, last.slot, last.tiling), (sink.rings[1].generation, next, None));
+    assert!(session.frames.ring.as_ref().unwrap().memory.is_empty());
+}
+
 #[test]
 fn a_copy_waiting_for_its_frame_doesnt_hold_up_frames_in_memory() {
     let (mut session, first) = registered();
@@ -529,6 +619,93 @@ fn destroying_a_slot_ends_the_ring() {
     destroy(&mut session, resource, &[buffers[0]]);
     assert!(session.frames.indirect.is_none());
     assert_eq!(frame(&mut session, None).0, STATUS_STALE);
+}
+
+/// A guest whose driver has the CPU lock every slot, as Intel's does, and stamps them where they
+/// then lie: in the guest's own pages.
+fn stamped_after_locking() -> (TestSession, Vec<u32>) {
+    let (mut session, buffers) = stamped(NAME.generation + 7);
+    for (slot, &handle) in buffers.iter().enumerate() {
+        let (status, address) = lock(&mut session, handle);
+        assert_eq!(status, SUCCESS);
+        let stamp = driver::stamp(Stamp { generation: NAME.generation, slot: slot as u32 });
+        for (at, word) in stamp.chunks(8).enumerate() {
+            let word = u64::from_le_bytes(word.try_into().unwrap());
+            session.memory_mut().write_u64(address + at as u64 * 8, word).unwrap();
+        }
+    }
+    (session, buffers)
+}
+
+#[test]
+fn locked_slots_are_never_taken_for_a_ring_unless_the_backend_says_they_may_be() {
+    let (mut session, _) = stamped_after_locking();
+    let (status, first) = register(&mut session, &ring(Look::SDR));
+    assert_eq!((status, first), (STATUS_REFUSED, None));
+    assert!(session.frames.indirect.is_none());
+}
+
+#[test]
+fn a_backend_whose_slots_may_be_guest_pages_has_their_stamps_read_there() {
+    let (mut session, buffers) = stamped_after_locking();
+    session.backend_mut().slots_in_guest_pages = true;
+    let (status, first) = register(&mut session, &ring(Look::SDR));
+    assert_eq!(status, STATUS_OK);
+    assert!(first.is_some());
+    let slots = &session.frames.indirect.as_ref().unwrap().slots;
+    let found: Vec<u32> = slots.iter().map(|slot| slot.allocation).collect();
+    assert_eq!(found, buffers, "by the stamps in guest memory, not by the stale ones on the card");
+}
+
+/// A ring whose slots are in guest pages, one frame waiting, and a viewer of this kind watching.
+fn watched_in_guest_pages(viewer: ViewerFacts) -> (TestSession, Sink) {
+    let (mut session, _) = stamped_after_locking();
+    session.backend_mut().slots_in_guest_pages = true;
+    let first = register(&mut session, &ring(Look::SDR)).1.expect("a slot");
+    frame(&mut session, Some(first));
+    let _ = session.poll(Instant::now());
+    session.viewer_arrived();
+    session.viewer_described(viewer);
+    let mut sink = Sink::default();
+    turn(&mut session, &mut sink);
+    turn(&mut session, &mut sink);
+    (session, sink)
+}
+
+#[test]
+fn frames_in_guest_pages_reach_a_viewer_on_the_card_through_slots_made_on_the_card() {
+    let (session, sink) = watched_in_guest_pages(ViewerFacts::default());
+    assert_eq!(sink.rings.len(), 1);
+    // The viewer didn't ask for memory, so it must not be handed any: it would import it as the
+    // card's buffers.
+    assert!(session.memory().host_buffers.is_empty());
+    let ring = session.frames.ring.as_ref().unwrap();
+    assert_eq!(ring.memory.len(), SLOTS as usize, "slots of the viewer's own, in video memory");
+    assert_eq!((sink.frames.len(), session.backend().slot_copies.len()), (1, 1));
+    assert_eq!(sink.frames[0].tiling, None, "in rows");
+    assert!(!session.frames.indirect.as_ref().unwrap().export_refused);
+}
+
+#[test]
+fn frames_in_guest_pages_reach_a_viewer_on_another_gpu_through_memory_here() {
+    let viewer = ViewerFacts { wants_memory: true, ..ViewerFacts::default() };
+    let (session, sink) = watched_in_guest_pages(viewer);
+    assert_eq!(session.memory().host_buffers.len(), SLOTS as usize);
+    assert_eq!((sink.rings.len(), sink.frames.len(), session.backend().slot_copies.len()), (1, 1, 1));
+}
+
+#[test]
+fn guest_page_slots_whose_copies_cant_be_exported_leave_the_viewer_nothing_and_say_so() {
+    let (mut session, _) = stamped_after_locking();
+    session.backend_mut().slots_in_guest_pages = true;
+    register(&mut session, &ring(Look::SDR));
+    session.backend_mut().refuse_exports = true;
+    session.viewer_arrived();
+    session.viewer_described(ViewerFacts::default());
+    let mut sink = Sink::default();
+    turn(&mut session, &mut sink);
+    assert!(session.frames.indirect.as_ref().unwrap().export_refused);
+    assert!(session.memory().host_buffers.is_empty());
 }
 
 #[test]
@@ -825,4 +1002,24 @@ fn a_restart_forgets_the_display_mode() {
     let (mut session, _) = registered();
     session.guest_reset();
     assert!(is_refused(&display_mode(&mut session)));
+}
+
+#[test]
+fn an_older_rings_buffer_with_the_same_stamp_loses_to_the_newest() {
+    let (mut session, older) = stamped(NAME.generation);
+    let mut newer = Vec::new();
+    for slot in 0..SLOTS {
+        let (_, handle) = allocate(&mut session, private(SLOT_BYTES));
+        map(&mut session, handle, 0, 0, 0);
+        let memory = session.allocations[&handle].memory.unwrap();
+        session
+            .backend
+            .memory_starts
+            .insert(memory, driver::stamp(Stamp { generation: NAME.generation, slot }));
+        newer.push(handle);
+    }
+    assert_eq!(register(&mut session, &ring(Look::SDR)).0, STATUS_OK);
+    let found: Vec<u32> =
+        session.frames.indirect.as_ref().unwrap().slots.iter().map(|slot| slot.allocation).collect();
+    assert_eq!(found, newer, "not the older ring's {older:?}");
 }

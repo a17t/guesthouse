@@ -2,7 +2,7 @@
 
 use super::{Handled, Session, answer_status};
 use crate::deferred::{DeferredAction, FreedAllocation};
-use crate::gpu_addresses::{ADDRESSES_END, ALLOCATION_ALIGN, AddressUse, GpuAddresses, LARGE_ALIGN, Window};
+use crate::gpu_addresses::{ADDRESSES_END, ALLOCATION_ALIGN, AddressUse, LARGE_ALIGN, Window};
 use crate::pending::Pending;
 use crate::tables::Mapping;
 use guesthouse_backend::{Backend, BackendError, GuestMemory, MapRequest, MemoryId, SpaceId, UnmapRequest};
@@ -72,14 +72,25 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
             self.backend.release_memory(memory);
             let allocation = self.allocations.get_mut(&handle).expect("read above");
             allocation.memory = None;
-            let (grown, size) = self.backend.allocate_video_memory(needed, allocation.kind)?;
+            let kind = allocation.kind;
+            let (grown, size, spilled) = self.card_or_spill_memory(needed, kind)?;
+            let allocation = self.allocations.get_mut(&handle).expect("read above");
             allocation.memory = Some(grown);
             allocation.size = size;
+            allocation.spilled = spilled;
             memory = grown;
         }
         if request.address != 0 {
             // A guest-chosen address, usually in a reserved range: map only the pages it asked for.
             log::debug!("map {handle:#x} at {:#x}: {first:#x} for {length:#x}", request.address);
+            if let Some((protection, driver_protection)) =
+                GuestMap::protections(message).filter(|said| said.1 != 0)
+            {
+                log::debug!(
+                    "the map at {:#x} came with protection {protection:#x}, driver protection {driver_protection:#x}",
+                    request.address
+                );
+            }
             let chosen = self.map_chosen(request.address, memory, first, length, space, handle);
             if let Err(error) = chosen {
                 log::warn!("mapping {handle:#x} at {:#x}: {error}", request.address);
@@ -152,9 +163,20 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
     /// Notes a mapping. Which allocation was mapped first decides the order they are closed in.
     fn add_mapping(&mut self, handle: u32, mapping: Mapping) {
         let allocation = self.allocations.get_mut(&handle).expect("the caller has just used it");
+        if self.described_surfaces.get(&allocation.owner).is_some_and(|described| described.0 == handle) {
+            // It has an address of its own, so it describes no range to come.
+            self.described_surfaces.remove(&allocation.owner);
+        }
+        if self.newest_description.is_some_and(|(_, described, _)| described == handle) {
+            self.newest_description = None;
+        }
         if allocation.first_mapped.is_none() {
             allocation.first_mapped = Some(self.mapped_so_far);
             self.mapped_so_far += 1;
+        }
+        if !allocation.mapped_at.iter().any(|&(space, _)| space == mapping.space) {
+            let writes = self.space_writes.get(&mapping.space).copied().unwrap_or(0);
+            allocation.mapped_at.push((mapping.space, writes));
         }
         allocation.mappings.push(mapping);
     }
@@ -167,9 +189,10 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
         }
     }
 
-    /// Addresses for a mapping the host places, inside the guest's window. New addresses are
-    /// handed out in order, so a window below the next new one is searched in this space alone,
-    /// and what is found there is placed, so nothing is handed out over it.
+    /// Addresses for a mapping the host places, inside the guest's window, clear of anything mapped
+    /// in any space. New addresses are handed out in order, so a window below the next new one is
+    /// searched in this space alone, and what is found there is placed, so nothing is handed out
+    /// over it.
     fn choose_address(
         &mut self,
         size: u64,
@@ -178,7 +201,8 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
         window: Window,
         space: SpaceId,
     ) -> Option<u64> {
-        if let Some(base) = self.gpu_addresses.take_within(size, align, usage, window) {
+        let mapped = self.mapped_anywhere();
+        if let Some(base) = self.gpu_addresses.take_clear_of(size, align, usage, window, &mapped) {
             return Some(base);
         }
         let taken = self.taken_in(space);
@@ -207,7 +231,7 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
         space: SpaceId,
         handle: u32,
     ) -> Result<(), BackendError> {
-        if !GpuAddresses::in_a_range(address) {
+        if !self.gpu_addresses.guest_may_map(address, length) {
             return Err(BackendError::new("no GPU address range holds this"));
         }
         let gpu_cached = self.allocations[&handle].gpu_cached;
@@ -338,7 +362,7 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
             // Each piece would be something more to copy, and clearing the way first loses the source.
             return Err(OVERLAPPING_COPY);
         }
-        self.unmap_gpu_addresses(destination, size, space)?;
+        self.clear_gpu_addresses(destination, size, space)?;
         let mut done = 0;
         while done < size {
             let Some((handle, found)) = self.mapping_at(source + done, space) else {
@@ -361,7 +385,8 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
     fn apply_update(&mut self, operation: UpdateOperation, space: SpaceId) -> Result<(), BackendError> {
         match operation {
             UpdateOperation::Map { address, size, allocation, offset, driver_protection } => {
-                let driver_protection = driver_protection.unwrap_or(0);
+                let driver_protection =
+                    self.protection_in_range(address, space, driver_protection.unwrap_or(0));
                 let end = range_end(address, size)?;
                 range_end(offset, size)?;
                 if let Some((handle, current)) = self.mapping_at(address, space)
@@ -373,7 +398,9 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
                     // Already there, and the pages wouldn't be mapped any differently.
                     return Ok(());
                 }
-                self.unmap_gpu_addresses(address, size, space)?;
+                // A free still waiting for the GPU can hold pages here that the guest has already
+                // given up, and the driver refuses to map over them.
+                self.clear_gpu_addresses(address, size, space)?;
                 let piece = Mapping { address, first: offset, length: size, space, driver_protection };
                 self.map_piece(allocation, piece)
             }

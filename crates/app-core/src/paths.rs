@@ -25,14 +25,23 @@ const AGENT_PORT_VARIABLE: &str = "AGENT_PORT";
 
 const APP_FOLDER: &str = "guesthouse";
 const STORE_POINTER: &str = "store";
+const PARTS_FOLDER: &str = "parts";
 const INSTALLED_PROGRAM: &str = "/usr/libexec/guesthouse";
 const USER_PROGRAM: &str = ".local/lib/guesthouse/current";
 /// What the program folder holds besides the binaries, which tells it from any other folder.
 const PROGRAM_MARK: &str = "guest";
 /// Where the program folder keeps a build of the display driver. A build from source has none.
 const DISPLAY_DRIVER_FOLDER: &str = "display-driver";
+/// Where the program folder keeps Microsoft's installer of OpenSSH for Windows, which a release brings
+/// for a guest's SSH. A build from source may have none.
+const OPENSSH_INSTALLER: &str = "openssh/OpenSSH-Win64.msi";
 /// A file that tells the repo's guest folder from any other folder of that name.
 const REPO_GUEST_MARK: &str = "setup.ps1";
+/// The recipes that come with the app, and the file that tells the repo's folder of them from another.
+const RECIPES_FOLDER: &str = "recipes";
+const RECIPES_MARK: &str = "README.md";
+/// The user's own recipes, in the app's config folder.
+const YOUR_RECIPES_FOLDER: &str = "recipes";
 const SHARED_MEMORY: &str = "/dev/shm";
 /// Where the system makes each user's runtime folder, named by user id.
 const USER_RUN_FOLDERS: &str = "/run/user";
@@ -103,10 +112,17 @@ pub struct Paths {
     guest: PathBuf,
     /// The sources of a Linux guest. See [`shipped_folder`].
     linux: PathBuf,
+    /// The recipes that come with the app. See [`shipped_folder`].
+    recipes: PathBuf,
     pub home: PathBuf,
+    /// `$XDG_DATA_HOME`, where the desktop's launcher entries and icons go. It is not the app's own folder.
+    pub data_home: PathBuf,
     /// The program folder: QEMU and the guest's files. It isn't in this repo, and the app runs plain
     /// VMs without it.
     pub program: PathBuf,
+    /// What the app fetches for itself, each part in a folder of its own name. It's outside the
+    /// program folder, which an update replaces.
+    pub parts: PathBuf,
     /// Where this app's own programs are, which is beside the running one if it can say.
     pub binaries: PathBuf,
     pub shared_memory: PathBuf,
@@ -126,8 +142,10 @@ impl Paths {
     /// `running_from` is the folder of the running program, which an unpacked release runs from.
     pub fn new(variables: &Variables, running_from: Option<&Path>) -> Self {
         let config = variables.xdg("XDG_CONFIG_HOME", ".config").join(APP_FOLDER);
-        let data = variables.xdg("XDG_DATA_HOME", ".local/share").join(APP_FOLDER);
+        let data_home = variables.xdg("XDG_DATA_HOME", ".local/share");
+        let data = data_home.join(APP_FOLDER);
         let state = variables.xdg("XDG_STATE_HOME", ".local/state").join(APP_FOLDER);
+        let parts = data.join(PARTS_FOLDER);
         let store = variables
             .folder(STORE_VARIABLE)
             .or_else(|| store_pointer(&config.join(STORE_POINTER), &variables.home()))
@@ -140,7 +158,9 @@ impl Paths {
         Self {
             guest: shipped_folder(&program, running_from, PROGRAM_MARK, REPO_GUEST_MARK),
             linux: shipped_folder(&program, running_from, SOURCES_FOLDER, SOURCES_MARK),
+            recipes: shipped_folder(&program, running_from, RECIPES_FOLDER, RECIPES_MARK),
             home: variables.home(),
+            data_home,
             qemu: variables.folder(QEMU_VARIABLE).unwrap_or_else(|| qemu_program(variables, &program)),
             binaries: running_from.map_or_else(|| program.clone(), Path::to_owned),
             store,
@@ -149,6 +169,7 @@ impl Paths {
             state,
             runtime,
             program,
+            parts,
             shared_memory: variables
                 .folder(SHARED_MEMORY_VARIABLE)
                 .unwrap_or_else(|| PathBuf::from(SHARED_MEMORY)),
@@ -163,6 +184,16 @@ impl Paths {
     /// by program, not by run folder, so it never takes them: they would stop the other VM.
     pub fn second_instance(&self) -> bool {
         self.own_run.is_some()
+    }
+
+    /// Where the desktop looks for launcher entries of this user.
+    pub fn applications(&self) -> PathBuf {
+        self.data_home.join("applications")
+    }
+
+    /// Where this user's icons are, in the size the helper gives.
+    pub fn icons(&self) -> PathBuf {
+        self.data_home.join("icons/hicolor/48x48/apps")
     }
 
     pub fn run_folder(&self, slot: Slot) -> PathBuf {
@@ -203,6 +234,21 @@ impl Paths {
     /// The built display driver, if this program folder has one.
     pub fn display_driver(&self) -> PathBuf {
         self.program.join(DISPLAY_DRIVER_FOLDER)
+    }
+
+    /// OpenSSH's installer for a Windows guest, if this program folder has it.
+    pub fn openssh_installer(&self) -> PathBuf {
+        self.program.join(OPENSSH_INSTALLER)
+    }
+
+    /// The recipes that come with the app, which may not be there.
+    pub fn shipped_recipes(&self) -> PathBuf {
+        self.recipes.clone()
+    }
+
+    /// The user's own recipes, a file for each. The folder is theirs to make.
+    pub fn your_recipes(&self) -> PathBuf {
+        self.config.join(YOUR_RECIPES_FOLDER)
     }
 
     /// The sources of a Linux guest.
@@ -266,9 +312,22 @@ fn program_folder(variables: &Variables, running_from: Option<&Path>) -> PathBuf
     }
     let here = running_from.filter(|folder| folder.join(PROGRAM_MARK).is_dir());
     let user = variables.home().join(USER_PROGRAM);
+    // The app's menu entry names the install by its link, and a VM it starts is known by that
+    // path. A tool run from a terminal out of the same install has to name it the same way.
+    if here.is_some_and(|here| same_folder(here, &user)) {
+        return user;
+    }
     here.map(Path::to_owned)
         .or_else(|| user.join(PROGRAM_MARK).is_dir().then_some(user))
         .unwrap_or_else(|| PathBuf::from(INSTALLED_PROGRAM))
+}
+
+/// Whether two paths lead to one folder, as a link and what it points at do.
+fn same_folder(one: &Path, other: &Path) -> bool {
+    match (one.canonicalize(), other.canonicalize()) {
+        (Ok(one), Ok(other)) => one == other,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -414,6 +473,21 @@ mod tests {
         let paths = Paths::new(&Variables::of(&[("HOME", "/h")]), Some(&release));
         assert_eq!(paths.guest_files(), release.join("guest"));
         assert!(paths.guest_files_in_program());
+    }
+
+    #[test]
+    fn a_tool_run_out_of_the_users_install_names_it_by_its_link_as_the_app_does() {
+        let scratch = Scratch::new();
+        let version = scratch.path("home/.local/lib/guesthouse/0.6.2");
+        fs::create_dir_all(version.join("guest")).unwrap();
+        let link = scratch.path("home/.local/lib/guesthouse/current");
+        std::os::unix::fs::symlink(&version, &link).unwrap();
+        let home = scratch.path("home").display().to_string();
+        let variables = Variables::of(&[("HOME", &home)]);
+        assert_eq!(program_folder(&variables, Some(&version)), link);
+        let elsewhere = scratch.path("unpacked");
+        fs::create_dir_all(elsewhere.join("guest")).unwrap();
+        assert_eq!(program_folder(&variables, Some(&elsewhere)), elsewhere, "another copy is itself");
     }
 
     #[test]

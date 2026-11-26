@@ -3,6 +3,7 @@
 
 use crate::context::Context;
 use crate::failure::Result;
+use crate::gpu_maker::GpuMaker;
 use crate::gpu_support::{NO_GPU_PART, gpu_ready};
 use crate::held_memory::used_by_others;
 use crate::host::{self, GIB, physical_cores, ram_limit_for, vcache_cpus};
@@ -10,9 +11,11 @@ use crate::host_drives::drive_problems;
 use crate::machine::{Kind, Machine};
 use crate::network_settings::{network_start_problems, other_machines};
 use crate::processes::{memory_taken, qemu_pid};
-use crate::settings::max_vram_gib;
+use crate::screen_gpu::{card_of, setup_card};
+use crate::settings::max_vram_gib_for;
 use crate::setup::amd::amd_start_problems;
-use crate::setup::cards::card_problem;
+use crate::setup::cards::{card_problem, nvidia_card_problem};
+use crate::setup::intel::intel_start_problems;
 use crate::setup::setup_done;
 use crate::tasks::no_slot_text;
 use std::path::Path;
@@ -39,8 +42,12 @@ pub struct SharedFacts {
     pub ram_limit: u64,
     /// How much of the PC's RAM the other VMs' memory already takes, in GiB.
     pub touched_gib: u64,
+    /// What this machine's card can give it.
     pub max_vram_gib: u32,
     pub vcache_cpus: u32,
+    /// Where the NVIDIA card setup chose is, which a machine given no card runs on. Empty if it
+    /// can't be told.
+    pub setup_card: String,
 }
 
 impl SharedFacts {
@@ -48,10 +55,19 @@ impl SharedFacts {
         Ok(Self {
             ram_limit: ram_limit_for(context, machine)?,
             touched_gib: used_by_others(context, context.slot) / GIB,
-            max_vram_gib: max_vram_gib(context),
+            max_vram_gib: max_vram_gib_for(context, machine),
             vcache_cpus: vcache_cpus(&context.cpus).len() as u32,
+            setup_card: setup_card(context),
         })
     }
+}
+
+/// The machines in `others` with a GPU on the same card as this one, which share that card's memory.
+/// `setup_card` is where setup's NVIDIA card is.
+pub fn card_mates(machine: &Machine, others: &[Machine], setup_card: &str) -> Vec<Machine> {
+    let card = card_of(machine, setup_card);
+    let same_card = |other: &&Machine| other.has_gpu() && card_of(other, setup_card) == card;
+    others.iter().filter(same_card).cloned().collect()
 }
 
 /// What the machines running now leave of the card. One with no cap has all of it.
@@ -61,8 +77,8 @@ pub fn video_memory_left(others: &[Machine], max_vram_gib: u32) -> u32 {
     max_vram_gib.saturating_sub(used)
 }
 
-/// What several machines share: the memory that holds them, and the card's. None of it counts if
-/// this one runs alone, so a single VM is told what it always was.
+/// What several machines share: the memory that holds them, and the card's for those on the same
+/// card. None of it counts if this one runs alone, so a single VM is told what it always was.
 pub fn shared_problems(machine: &Machine, others: &[Machine], facts: &SharedFacts) -> Vec<String> {
     if others.is_empty() {
         return Vec::new();
@@ -76,8 +92,9 @@ pub fn shared_problems(machine: &Machine, others: &[Machine], facts: &SharedFact
     if machine.has_gpu() && u64::from(machine.ram_gib) + untouched > facts.ram_limit {
         found.push("This PC's RAM cannot hold this machine beside the ones running.".to_owned());
     }
-    if machine.has_gpu() {
-        let left = video_memory_left(others, facts.max_vram_gib);
+    let mates = if machine.has_gpu() { card_mates(machine, others, &facts.setup_card) } else { Vec::new() };
+    if !mates.is_empty() {
+        let left = video_memory_left(&mates, facts.max_vram_gib);
         if left == 0 {
             found.push(
                 "The running machine has all the video memory. Give it a cap in its settings first."
@@ -94,7 +111,8 @@ pub fn shared_problems(machine: &Machine, others: &[Machine], facts: &SharedFact
     found
 }
 
-/// The cap a machine starts with: its own, or what the others leave. Alone it needs none.
+/// The cap a machine starts with: its own, or what `others`, the machines running on its card, leave.
+/// Alone on its card it needs none.
 pub fn video_cap(machine: &Machine, others: &[Machine], max_vram_gib: u32) -> u32 {
     match (machine.vram_gib, others.is_empty()) {
         (0, false) => video_memory_left(others, max_vram_gib),
@@ -117,9 +135,23 @@ pub fn share_problem(context: &Context, folder: &str) -> Option<String> {
     (folder == home || home.starts_with(&folder) || holds_ours || hidden).then(|| SHARE_REFUSAL.to_owned())
 }
 
+/// Says why a GPU machine can't start on its card, by the maker whose setup and card it needs.
+fn card_start_problems(context: &Context, machine: &Machine) -> Vec<String> {
+    match machine.windows_maker() {
+        Some(GpuMaker::Nvidia) if !setup_done(context) => vec![NO_SETUP.to_owned()],
+        Some(GpuMaker::Nvidia) => match machine.windows_card_address() {
+            Some(pci) => nvidia_card_problem(context, pci).into_iter().collect(),
+            None => card_problem(context).into_iter().collect(),
+        },
+        Some(GpuMaker::Amd) => amd_start_problems(context, &machine.amd_gpu),
+        Some(GpuMaker::Intel) => intel_start_problems(context, &machine.amd_gpu),
+        None => Vec::new(),
+    }
+}
+
 /// Says why this machine can't start on this host now.
 pub fn start_problems(context: &Context, machine: &Machine) -> Result<Vec<String>> {
-    let mut found = machine.problems(max_vram_gib(context));
+    let mut found = machine.problems(max_vram_gib_for(context, machine));
     for path in [&machine.disk, &machine.vars] {
         if !path.is_empty() && !Path::new(path).exists() {
             found.push(format!("{path} is missing."));
@@ -135,13 +167,7 @@ pub fn start_problems(context: &Context, machine: &Machine) -> Result<Vec<String
     if machine.kind == Kind::Windows && !gpu_ready(context) {
         found.push(NO_GPU_PART.to_owned());
     } else if machine.has_gpu() {
-        if let Some(pci) = machine.windows_amd_card() {
-            found.extend(amd_start_problems(context, pci));
-        } else if !setup_done(context) {
-            found.push(NO_SETUP.to_owned());
-        } else {
-            found.extend(card_problem(context));
-        }
+        found.extend(card_start_problems(context, machine));
         if !machine.token_file(context).exists() {
             found.push(NO_TOKEN.to_owned());
         }
@@ -199,7 +225,13 @@ mod tests {
     }
 
     fn facts() -> SharedFacts {
-        SharedFacts { ram_limit: 36, touched_gib: 0, max_vram_gib: 28, vcache_cpus: 0 }
+        SharedFacts {
+            ram_limit: 36,
+            touched_gib: 0,
+            max_vram_gib: 28,
+            vcache_cpus: 0,
+            setup_card: String::new(),
+        }
     }
 
     fn says(found: &[String], text: &str) -> bool {
@@ -246,6 +278,24 @@ mod tests {
         let others = [first.clone()];
         assert_eq!(video_memory_left(&others, 28), 0);
         assert!(says(&shared_problems(&second, &others, &facts()), "all the video memory"));
+    }
+
+    #[test]
+    fn machines_on_different_cards_do_not_share_video_memory() {
+        let first = machine("first");
+        let mut second = machine("second");
+        second.use_windows_card(GpuMaker::Nvidia, "0000:02:00.0");
+        let others = [first.clone()];
+        let facts = SharedFacts { setup_card: "0000:01:00.0".to_owned(), ..facts() };
+        assert!(card_mates(&second, &others, &facts.setup_card).is_empty());
+        assert!(shared_problems(&second, &others, &facts).is_empty(), "the second card is its own");
+        assert_eq!(video_cap(&second, &card_mates(&second, &others, &facts.setup_card), 28), 0);
+        let mut on_first_by_address = machine("third");
+        on_first_by_address.use_windows_card(GpuMaker::Nvidia, "0000:01:00.0");
+        assert_eq!(card_mates(&on_first_by_address, &others, &facts.setup_card), others);
+        assert!(says(&shared_problems(&on_first_by_address, &others, &facts), "all the video memory"));
+        let running_second = [second.clone()];
+        assert_eq!(card_mates(&first, &running_second, &facts.setup_card), []);
     }
 
     #[test]
@@ -371,6 +421,22 @@ mod tests {
     }
 
     #[test]
+    fn a_windows_machine_on_an_intel_card_needs_intels_own_setup_and_card() {
+        use crate::setup::intel::NO_INTEL_SETUP;
+        let scratch = Scratch::new();
+        let (context, machine) = startable(&scratch);
+        finish_setup(&context);
+        let mut on_intel = Machine { kind: Kind::Windows, ..machine };
+        on_intel.use_windows_card(GpuMaker::Intel, "0000:00:02.0");
+        fs::create_dir_all(on_intel.folder(&context)).unwrap();
+        crate::agent::make_token(&context, &on_intel).unwrap();
+        let found = start_problems(&context, &on_intel).unwrap();
+        assert!(says(&found, NO_INTEL_SETUP), "{found:?}");
+        assert!(says(&found, "at 0000:00:02.0, isn't in this PC now"), "{found:?}");
+        assert!(!says(&found, NO_SETUP), "NVIDIA's setup is not this machine's");
+    }
+
+    #[test]
     fn on_two_cards_a_gpu_machine_needs_setup_to_have_named_one() {
         use crate::setup::cards::stand_in::{NAMES, fake_pci};
         let scratch = Scratch::new();
@@ -389,6 +455,29 @@ mod tests {
     }
 
     #[test]
+    fn a_machine_given_the_second_nvidia_card_starts_while_it_is_here_and_is_refused_once_it_is_gone() {
+        use crate::setup::cards::stand_in::{NAMES, fake_pci};
+        let scratch = Scratch::new();
+        let (mut context, machine) = startable(&scratch);
+        context.pci_names = scratch.write("pci.ids", NAMES);
+        fake_pci(&scratch, "0000:01:00.0", 0x2704, "0x10de", "0x030000");
+        let card = serde_json::json!({"card": {"device": 0x2704, "pci": "0000:01:00.0"}});
+        fs::create_dir_all(crate::settings::driver_folder(&context)).unwrap();
+        crate::settings::write_setup(&context, card.as_object().cloned().unwrap()).unwrap();
+        let mut gpu = Machine { kind: Kind::Windows, ..machine };
+        gpu.use_windows_card(GpuMaker::Nvidia, "0000:02:00.0");
+        fs::create_dir_all(gpu.folder(&context)).unwrap();
+        crate::agent::make_token(&context, &gpu).unwrap();
+        let found = start_problems(&context, &gpu).unwrap();
+        assert!(says(&found, "The NVIDIA card this machine runs on, at 0000:02:00.0, isn't in this PC now"));
+        assert!(says(&found, "Choose another NVIDIA card in its settings"), "{found:?}");
+        fake_pci(&scratch, "0000:02:00.0", 0x21C4, "0x10de", "0x030000");
+        assert_eq!(start_problems(&context, &gpu).unwrap(), Vec::<String>::new());
+        fs::remove_dir_all(scratch.path("pci/0000:01:00.0")).unwrap();
+        assert!(start_problems(&context, &gpu).unwrap().is_empty(), "setup's card isn't this machine's");
+    }
+
+    #[test]
     fn only_a_gpu_machine_needs_setup() {
         let scratch = Scratch::new();
         let (context, machine) = startable(&scratch);
@@ -400,7 +489,9 @@ mod tests {
     #[test]
     fn a_gpu_machine_with_no_token_says_where_to_give_it_one() {
         let scratch = Scratch::new();
-        let (context, machine) = startable(&scratch);
+        let (mut context, machine) = startable(&scratch);
+        context.pci_names = scratch.write("pci.ids", crate::setup::cards::stand_in::NAMES);
+        crate::setup::cards::stand_in::fake_pci(&scratch, "0000:01:00.0", 0x2704, "0x10de", "0x030000");
         finish_setup(&context);
         let gpu = Machine { kind: Kind::Windows, ..machine };
         fs::create_dir_all(gpu.folder(&context)).unwrap();

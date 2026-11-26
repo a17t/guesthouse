@@ -1,6 +1,7 @@
 //! What a new machine starts as, for the app's dialog and the command line alike.
 
 use crate::account::default_user;
+use crate::iso::Iso;
 use crate::machine::Kind;
 use std::path::Path;
 
@@ -17,6 +18,8 @@ pub struct Sizes {
 const WINDOWS_SIZES: Sizes = Sizes { cores: 8, ram: 16, disk: 128 };
 const PLAIN_SIZES: Sizes = Sizes { cores: 4, ram: 4, disk: 32 };
 const UBUNTU_SIZES: Sizes = Sizes { cores: 8, ram: 8, disk: 80 };
+/// What Microsoft asks for Windows 11, for a Windows disc that's installed by hand.
+const PLAIN_WINDOWS_SIZES: Sizes = Sizes { cores: 4, ram: 4, disk: 64 };
 
 pub fn sizes_for(kind: Kind) -> Sizes {
     match kind {
@@ -24,6 +27,12 @@ pub fn sizes_for(kind: Kind) -> Sizes {
         Kind::Linux => UBUNTU_SIZES,
         Kind::Plain => PLAIN_SIZES,
     }
+}
+
+/// Sizes for what this disc makes here. A Windows disc that's only a plain VM still has to pass
+/// Windows' own setup.
+pub fn sizes_for_disc(iso: &Iso) -> Sizes {
+    if iso.kind == Kind::Plain && iso.windows_disc { PLAIN_WINDOWS_SIZES } else { sizes_for(iso.kind) }
 }
 
 pub fn suggested_name(kind: Kind, path: &str) -> String {
@@ -52,6 +61,15 @@ mod tests {
         assert_eq!(account_name(Kind::Linux, "desk"), "");
         assert_eq!(account_name(Kind::Windows, "ana"), "ana");
         assert_eq!(account_name(Kind::Linux, "gpupv"), "gpupv");
+    }
+
+    #[test]
+    fn a_windows_disc_installed_by_hand_gets_the_disk_windows_asks_for() {
+        let disc =
+            |kind, windows_disc| Iso { kind, title: String::new(), edition: String::new(), windows_disc };
+        assert_eq!(sizes_for_disc(&disc(Kind::Plain, true)).disk, 64);
+        assert_eq!(sizes_for_disc(&disc(Kind::Plain, false)).disk, PLAIN_SIZES.disk);
+        assert_eq!(sizes_for_disc(&disc(Kind::Windows, true)).disk, WINDOWS_SIZES.disk);
     }
 
     #[test]

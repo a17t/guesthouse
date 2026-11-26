@@ -4,11 +4,18 @@
 //! guest that won't take the package keeps Microsoft's number, and the row says why.
 
 use super::Task;
+use super::guest_files::give_display_its_name;
 use crate::agent::guest_script;
+use crate::context::Context;
 use crate::failure::{Failure, Result};
-use crate::gpu_identity::{IdentityState, Shown, maker_identity, maker_name, read_state, write_state};
+use crate::gpu_identity::{
+    FELL_BACK, IdentityState, STAYS_ON_INTEL, Shown, falls_back_after_failed_check, machine_maker,
+    maker_identity, maker_name, read_state, write_state,
+};
+use crate::gpu_maker::GpuMaker;
 use crate::gpu_support::qemu_sets_identity;
 use crate::log::write_log;
+use crate::machine::Machine;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
@@ -17,8 +24,6 @@ const SCRIPT: &str = "gpu-identity.ps1";
 const STAGE_SECONDS: u64 = 110;
 const STAGED_MARK: &str = "identity staged";
 const STAY_MARK: &str = "stay: ";
-
-const FELL_BACK: &str = "The next start shows Windows Microsoft's vendor ID again.";
 
 fn qemu_without(maker: &str) -> String {
     format!("This QEMU can't show Windows {maker}'s vendor ID, so Windows sees Microsoft's.")
@@ -44,6 +49,20 @@ fn script_id(script: &str) -> String {
     let mut hasher = DefaultHasher::new();
     script.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+/// Whether this machine's next boot will ask Windows to write the package for its maker's number,
+/// from what the state files and the scripts say now. The same checks `set_up` makes, in the same
+/// order, and the cheap ones first as this is asked at every start: the QEMU is only asked about a
+/// machine that has something to stage. It says which script would run, as a build with a new one
+/// tries again what an older one failed at.
+pub(crate) fn will_stage(context: &Context, machine: &Machine) -> Option<String> {
+    let state = read_state(context, machine);
+    if state.shown == Shown::Maker {
+        return None;
+    }
+    let id = script_id(&guest_script(context, SCRIPT).ok()?);
+    (state.failed_script != id && qemu_sets_identity(&context.paths.qemu)).then_some(id)
 }
 
 /// Has Windows write the package, and records what came of it.
@@ -105,11 +124,15 @@ pub(super) fn set_up_identity(task: &mut Task) {
 }
 
 /// Windows started without its GPU. If it was shown its maker's number, that's the first suspect, and
-/// the next start goes back to the one that always works.
+/// the next start goes back to the one that always works, unless the maker's card can't do without
+/// its number: see [`falls_back_after_failed_check`].
 pub(super) fn after_failed_gpu(task: &Task, failure: Failure) -> Failure {
     let mut state = read_state(task.context, &task.machine);
     if state.shown != Shown::Maker {
         return failure;
+    }
+    if !falls_back_after_failed_check(machine_maker(&task.machine)) {
+        return Failure(format!("{} {STAYS_ON_INTEL}", failure.0));
     }
     state.shown = Shown::Microsoft;
     state.restart_due = false;
@@ -122,6 +145,10 @@ pub(super) fn after_failed_gpu(task: &Task, failure: Failure) -> Failure {
     }
     if let Err(problem) = write_state(task.context, &task.machine, &state) {
         let _ = write_log(task.context, &format!("gpu identity: could not fall back: {}", problem.0));
+    }
+    if task.machine.windows_maker() == Some(GpuMaker::Nvidia) {
+        // The guest is still up, so it can have the name the next start's driver needs.
+        let _ = give_display_its_name(task);
     }
     Failure(format!("{} {FELL_BACK}", failure.0))
 }

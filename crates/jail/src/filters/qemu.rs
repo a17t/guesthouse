@@ -69,8 +69,17 @@ const NAMESPACE_FLAGS: c_int =
 const TERMINAL_REQUESTS: [c_ulong; 2] = [TIOCSTI, TIOCLINUX];
 
 /// The filter for QEMU. passt, which makes namespaces of its own, is started before it, outside.
-pub fn qemu(no_new_unix_sockets: bool) -> Filter {
-    let mut rules: Vec<Rule> = all(&DENIED, Action::Fail(EPERM)).collect();
+pub fn qemu(no_new_unix_sockets: bool, reads_own_memory: bool) -> Filter {
+    let mut rules = Vec::new();
+    if reads_own_memory {
+        // Reading its own memory this way gives QEMU nothing it couldn't read already, and the pid
+        // stays its own across the exec. A macOS guest's device finds out which pages the kernel can
+        // pin by reading a byte of each mapping so, and refused, it hands the GPU copies of the guest's
+        // memory. Only a macOS guest's QEMU is let.
+        let own_memory = Condition::Equals(0, std::process::id());
+        rules.push(Rule::when(SYS_process_vm_readv, own_memory, Action::Allow));
+    }
+    rules.extend(all(&DENIED, Action::Fail(EPERM)));
     rules.extend(
         TERMINAL_REQUESTS
             .iter()
@@ -99,9 +108,21 @@ mod tests {
     }
 
     #[test]
+    fn only_a_macos_qemu_may_read_its_own_memory_and_no_other_process() {
+        assert!(denies(&qemu(false, false), SYS_process_vm_readv), "not let unless asked");
+        let filter = qemu(false, true);
+        let rules: Vec<&Rule> =
+            filter.rules.iter().filter(|rule| rule.call == SYS_process_vm_readv).collect();
+        assert_eq!(rules[0].when, Some(Condition::Equals(0, std::process::id())));
+        assert_eq!(rules[0].action, Action::Allow);
+        assert_eq!((rules[1].when, rules[1].action), (None, Action::Fail(EPERM)), "any other pid");
+        assert!(denies(&filter, SYS_process_vm_writev));
+    }
+
+    #[test]
     fn no_namespaces_or_mounts_and_no_tracing() {
         for no_new_unix_sockets in [false, true] {
-            let filter = qemu(no_new_unix_sockets);
+            let filter = qemu(no_new_unix_sockets, false);
             for call in [SYS_unshare, SYS_setns, SYS_mount, SYS_ptrace, SYS_clone3] {
                 assert!(denies(&filter, call), "{call}");
             }

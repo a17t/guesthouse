@@ -7,6 +7,9 @@
 //! Architectures and driver branches are a backend's own business. [`Backend::open`] is where it
 //! picks its profiles, and nothing in this trait is per-architecture or per-card.
 
+// Linux only: a guest's memory is handed over as file descriptors. Other systems get an empty crate.
+#![cfg(target_os = "linux")]
+
 mod driver;
 pub mod guest_text;
 mod memory;
@@ -21,8 +24,8 @@ pub use guesthouse_messages::Status;
 pub use guesthouse_messages::registry::RegistryName;
 pub use guesthouse_messages::standard::StandardSurface;
 pub use memory::{
-    GuestMemory, HostBuffer, MemoryError, PagesView, WINDOW_BASE, WINDOW_SIZE, in_window, window_base,
-    window_base_for,
+    FilePages, FileRange, GuestMemory, HostBuffer, MemoryError, PagesView, WINDOW_BASE, WINDOW_SIZE,
+    in_window, window_base, window_base_for,
 };
 pub use pci_address::PciAddress;
 pub use types::*;
@@ -52,13 +55,49 @@ pub trait Backend: Sized {
     /// What the card and its driver turned out to be.
     fn facts(&self) -> &AdapterFacts;
 
+    /// The descriptor the GPU's own interrupts post to, for a backend whose waits can sleep on
+    /// them. `None`, as it stays, when there is nothing to be woken by.
+    fn wake_descriptor(&self) -> Option<std::os::fd::RawFd> {
+        None
+    }
+
     /// Makes video memory of at least `size` bytes, laid out as `kind` says. Returns it and the
     /// size it really has.
     fn allocate_video_memory(&mut self, size: u64, kind: MemoryKind)
     -> Result<(MemoryId, u64), BackendError>;
 
+    /// Makes memory of at least `size` bytes in host system memory that the GPU reaches, for an
+    /// allocation the card has no room for, as Windows moves memory out of a full card instead of
+    /// failing. Laid out as `kind` says if it can be. A backend that can't says so, and the
+    /// allocation fails as before.
+    fn allocate_spill_memory(
+        &mut self,
+        _size: u64,
+        _kind: MemoryKind,
+    ) -> Result<(MemoryId, u64), BackendError> {
+        Err(BackendError::new("this backend can't place video memory in system memory"))
+    }
+
+    /// How much of the card's own memory is free right now, everyone's use counted, if the backend
+    /// can tell. The guest's budget follows it, so a game asks for less when the host is using the
+    /// card too.
+    fn card_memory_free(&self) -> Option<u64> {
+        None
+    }
+
     /// Lets the GPU reach host memory that is already mapped in this process.
     fn adopt_host_pages(&mut self, host_address: u64, size: u64) -> Result<MemoryId, BackendError>;
+
+    /// The same, for host memory that is also `pages` of a file. A backend whose driver can take
+    /// the file's pages themselves does, and any other adopts the mapping as before.
+    fn adopt_file_pages(
+        &mut self,
+        host_address: u64,
+        size: u64,
+        _pages: &FilePages<'_>,
+    ) -> Result<MemoryId, BackendError> {
+        self.adopt_host_pages(host_address, size)
+    }
 
     fn release_memory(&mut self, memory: MemoryId);
 
@@ -74,6 +113,12 @@ pub trait Backend: Sized {
         size: u64,
     ) -> Result<(), BackendError>;
 
+    /// Whether video memory nothing has written yet reads as zero. Then an allocation that moves
+    /// before anything could have written it needs no copy, as zeroed pages hold the same.
+    fn new_video_memory_is_zero(&self) -> bool {
+        false
+    }
+
     /// Reads the first bytes of memory the GPU may have written, for telling one buffer from
     /// another. It may wait a moment, like [`Backend::preserve_contents`], and nothing else needing
     /// the copy engine is running. At most one small page.
@@ -85,6 +130,22 @@ pub trait Backend: Sized {
         _out: &mut [u8],
     ) -> Result<(), BackendError> {
         Err(BackendError::new("this backend can't read video memory"))
+    }
+
+    /// The most video memory this guest may hold, in bytes, when the card itself sets a limit under
+    /// what it told the guest it has: a card the host's desktop also draws on must keep room for it.
+    /// `None` leaves the limit to the person's own setting, or to none.
+    fn video_memory_cap(&self) -> Option<u64> {
+        None
+    }
+
+    /// Whether the display driver's slots may lie in the guest's own pages. A vendor's guest driver
+    /// that has the CPU lock nearly every allocation moves the slots there before the ring is
+    /// registered, and the core then reads their stamps from guest memory and has each frame copied
+    /// out of it. A backend whose slots stay in video memory says no, and a locked allocation is
+    /// then never taken for a slot.
+    fn slots_may_be_guest_pages(&self) -> bool {
+        false
     }
 
     /// Makes a GPU address space covering `ranges`.
@@ -99,6 +160,15 @@ pub trait Backend: Sized {
     /// backends map every value the same way, which is what this says unless they know better.
     fn maps_differently(&self, _first: u64, _second: u64) -> bool {
         false
+    }
+
+    /// The driver protection value to map memory with when it lands in a range the guest set aside,
+    /// given what is known of the range: the kind of the surface it is for, if the guest described
+    /// one, and the driver's own word on the range. Some drivers back a surface from a plain heap
+    /// whose maps say nothing of the surface. A backend whose mappings depend on the kind adds its
+    /// word for it; the rest leave the value be.
+    fn protection_for_view(&self, _view: RangeView, driver_protection: u64) -> u64 {
+        driver_protection
     }
 
     fn unmap(&mut self, unmap: &UnmapRequest) -> Result<(), BackendError>;
@@ -138,6 +208,20 @@ pub trait Backend: Sized {
         &[]
     }
 
+    /// GPU addresses past [`GPU_RANGES`] where the guest may map at addresses it chose itself, as the
+    /// vendor's driver expects the card's address space to reach them. The host never hands these
+    /// out, so whatever has to stay inside [`GPU_RANGES`], like the host's own mappings, still does.
+    fn guest_placed_gpu_ranges(&self) -> &'static [GpuRange] {
+        &[]
+    }
+
+    /// How long a range of GPU addresses the host chose rests, once its mapping is gone, before it
+    /// is handed out again. `None`, the default, hands it out again at once. An experiment's switch:
+    /// a vendor's firmware may hold on to an address after the memory there went.
+    fn hold_freed_gpu_addresses(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     /// The guest has restarted, with its bus reset. Most of what a backend holds goes with its
     /// messages, so this is only for what has to follow the guest's own start.
     fn guest_restarted(&mut self) {}
@@ -154,8 +238,9 @@ pub trait Backend: Sized {
     /// a query it leaves to the core.
     fn adapter_answer(&mut self, query: &VendorQuery<'_>, out: &mut Vec<u8>) -> Option<Status>;
 
-    /// A value from the adapter's registry key, or one of the driver paths.
-    fn registry_value(&mut self, name: &RegistryName) -> Option<RegistryValue>;
+    /// A value from the adapter's registry key, or one of the driver paths. `asked_type` is the
+    /// type the guest asks for, for a value a backend gives in whichever type it is asked in.
+    fn registry_value(&mut self, name: &RegistryName, asked_type: u32) -> Option<RegistryValue>;
 
     /// The GPU's clock, in nanoseconds.
     fn gpu_clock(&mut self) -> Result<u64, BackendError>;
@@ -204,6 +289,12 @@ pub trait Backend: Sized {
         None
     }
 
+    /// Whether a context's submissions should come with the commands their message names. A backend
+    /// that says no gets none, and finds its commands in its driver's private data if anywhere.
+    fn runs_context_commands(&self) -> bool {
+        false
+    }
+
     /// Prepares work without letting it run. [`WorkStart::Finished`] says nothing reached the GPU,
     /// and [`WorkStart::Ran`] that it all ran already. Either way the backend has done what the guest
     /// would otherwise wait for, except the queue's fence.
@@ -213,13 +304,25 @@ pub trait Backend: Sized {
     /// submission is a call that can fail says so here: nothing then runs, the core stands in for the
     /// GPU at the queue's fence, and the queue stops as if [`WorkStart::QueueFailed`] had come back.
     /// A call that is only refused for now answers [`Doorbell::NotYet`], and the core rings again
-    /// soon, holding the queue's later work behind it.
+    /// soon, holding the queue's later work behind it. A backend that knows the work mustn't run
+    /// before some time answers [`Doorbell::NotBefore`], and the core rings again then.
     fn ring_doorbell(&mut self, queue: u32, doorbell: u64) -> Result<Doorbell, BackendError>;
 
     /// Looks at work the GPU was given, while the core waits for queues to reach their fences. For a
     /// backend whose driver can end work early, as when it resets a hung engine, without the GPU
     /// writing the fence: it stands in at the fence then, as the work will never get there.
     fn poll_work(&mut self, _host: &mut dyn HostServices, _now: Instant) {}
+
+    /// The descriptor from [`Backend::wake_descriptor`] became readable: work the backend asked to
+    /// be woken for may have ended. Called before the core looks at what waits, so what the
+    /// backend writes here for the guest is seen at once.
+    fn gpu_woke(&mut self, _host: &mut dyn HostServices, _now: Instant) {}
+
+    /// Whether work is on the GPU whose end the backend itself must act on, with nothing to wake
+    /// the daemon for it. While it is, the core calls [`Backend::poll_work`] often.
+    fn needs_polling(&self) -> bool {
+        false
+    }
 
     /// A hardware queue has gone, so whatever backs it can go too.
     fn close_queue(&mut self, queue: u32);
@@ -228,8 +331,36 @@ pub trait Backend: Sized {
     /// as the message thread serves every other guest thread meanwhile.
     fn start_staging_copy(&mut self, host: &mut dyn HostServices, copy: &StagingCopy) -> StagingStart;
 
+    /// Copies a frame into a staging surface before the work that draws it has finished, when the
+    /// card itself can hold the copy until that work is done. `after` are the fences, with the
+    /// values they must reach, that the core would otherwise wait for on the message thread. The
+    /// copy is waited for at most `wait`; one still on the card then lands late.
+    ///
+    /// `None` means this backend can't, or the card hasn't been sent all of that work yet, and
+    /// nothing was done: the core waits for the fences and calls [`Backend::start_staging_copy`].
+    fn copy_staging_after(
+        &mut self,
+        _host: &mut dyn HostServices,
+        _copy: &StagingCopy,
+        _after: &[(u64, u64)],
+        _wait: Duration,
+    ) -> Option<Status> {
+        None
+    }
+
     /// Looks at a copy that [`StagingStart::Running`] said was under way. `None` means not yet.
     fn poll_staging_copy(&mut self, host: &mut dyn HostServices, now: Instant) -> Option<Status>;
+
+    /// Waits until a copy that [`StagingStart::Running`] said was under way ends. The default spins
+    /// on [`Backend::poll_staging_copy`]; a backend whose copies can raise an interrupt sleeps on it.
+    fn wait_staging_copy(&mut self, host: &mut dyn HostServices) -> Status {
+        loop {
+            if let Some(status) = self.poll_staging_copy(host, Instant::now()) {
+                return status;
+            }
+            std::hint::spin_loop();
+        }
+    }
 
     /// Starts copying a whole picture into a slot of the frame ring. It runs when no other copy is
     /// under way, and a backend that can't show this picture says so with a failure.
@@ -247,6 +378,12 @@ pub trait Backend: Sized {
     /// The bytes a tiled surface fills, as this backend's copy engine lays it out, for a copy that
     /// starts at byte `x` of row `y`. `None` if the engine can't be given these numbers at all.
     fn tiled_bytes(&self, _surface: &SurfaceShape, _x: u64, _y: u64) -> Option<u64> {
+        None
+    }
+
+    /// The tiles this backend can copy a viewer's frames into, if any. A slot laid out this way is
+    /// plain video memory, filled by [`Backend::start_slot_copy`].
+    fn ring_tiling(&self) -> Option<RingTiling> {
         None
     }
 }
@@ -285,4 +422,10 @@ pub trait HostServices {
 
     /// A fence's value, by its guest physical address.
     fn fence_value(&self, fence: u64) -> Result<u64, MemoryError>;
+
+    /// The guest physical address of a monitored fence, by its GPU address, if the process of this
+    /// space holds a sync object with that fence. Only such a fence may be written for the guest.
+    fn monitored_fence(&self, _space: SpaceId, _gpu_address: u64) -> Option<u64> {
+        None
+    }
 }

@@ -9,7 +9,9 @@ use super::{Handled, HeldReply, Session, services};
 use crate::frames::{
     Cursor, FrameLight, GuestSlot, IndirectRing, Landing, LiveRing, Picture, Registering, ReplyWaiting, Slots,
 };
-use guesthouse_backend::{Backend, BackendError, GuestMemory, SlotCopy, SpaceId, StagingStart, SurfaceShape};
+use guesthouse_backend::{
+    Backend, BackendError, GuestMemory, RingTiling, SlotCopy, SpaceId, StagingStart, SurfaceShape,
+};
 use guesthouse_messages::Status;
 use guesthouse_messages::adapter::DisplayMode;
 use guesthouse_messages::indirect::{FrameDone, Look, Outcome, Register, Reply, Request, STAMP_SIZE, Stamp};
@@ -24,6 +26,22 @@ const QUEUE_WAIT: Duration = Duration::from_secs(2);
 const SLOT_SLACK: u64 = 2 << 20;
 /// How many allocations of about the right size are worth reading. Each costs a short copy.
 const MOST_CANDIDATES: usize = 32;
+
+/// What each buffer read for a stamp began with, for a ring that couldn't be made. Which slots
+/// were stamped, and with what, says where the stamps went.
+fn what_was_read(read: &[(u32, [u8; STAMP_SIZE])]) -> String {
+    if read.is_empty() {
+        return "no buffer of the right size to read".to_string();
+    }
+    let each: Vec<String> = read
+        .iter()
+        .map(|(allocation, bytes)| {
+            let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+            format!("{allocation:#x} starts {hex}")
+        })
+        .collect();
+    format!("read {}", each.join(", "))
+}
 
 impl<B: Backend, M: GuestMemory> Session<B, M> {
     fn reply(&self, outcome: Outcome, next_slot: Option<u32>) -> Reply {
@@ -115,12 +133,13 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
     /// it has opened are here too, which is why a size alone can't say what's a slot.
     fn slot_candidates(&self, ring: &Register, space: SpaceId) -> Vec<GuestSlot> {
         let fits = |size: u64| size >= ring.slot_size && size - ring.slot_size <= SLOT_SLACK;
+        let in_guest_pages = self.backend.slots_may_be_guest_pages();
         let mut found: Vec<GuestSlot> = self
             .allocations
             .iter()
             .filter(|(_, allocation)| {
                 fits(allocation.size)
-                    && allocation.guest_address.is_none()
+                    && (in_guest_pages || allocation.guest_address.is_none())
                     && allocation.view.is_none()
                     && allocation.mappings.iter().any(|mapping| mapping.space == space)
             })
@@ -138,19 +157,38 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
     fn find_slots(&mut self, ring: &Register, space: SpaceId) -> Result<Vec<GuestSlot>, BackendError> {
         let own_space = self.own_space()?;
         let mut slots = vec![None; ring.slots as usize];
+        let mut read = Vec::new();
         for candidate in self.slot_candidates(ring, space) {
             let mut bytes = [0; STAMP_SIZE];
-            let host = &mut services!(self);
-            self.backend.read_memory_start(host, own_space, candidate.memory, &mut bytes)?;
+            // A candidate the guest's CPU has locked lies in the guest's own pages, and its stamp is
+            // read where it is. Only a backend that says its slots may be there has such candidates.
+            let in_guest_pages =
+                self.allocations.get(&candidate.allocation).and_then(|found| found.guest_address);
+            match in_guest_pages {
+                Some(address) => {
+                    if self.memory.read_bytes(address, &mut bytes) != bytes.len() {
+                        continue;
+                    }
+                }
+                None => {
+                    let host = &mut services!(self);
+                    self.backend.read_memory_start(host, own_space, candidate.memory, &mut bytes)?;
+                }
+            }
+            read.push((candidate.allocation, bytes));
             let Some(stamp) = Stamp::parse(&bytes) else { continue };
+            // The driver starts each ring's generations again, so an older ring's buffer that never
+            // had a frame still carries a stamp like this one. The candidates come newest first.
             if stamp.generation == ring.name.generation
-                && let Some(place) = slots.get_mut(stamp.slot as usize)
+                && let Some(place @ None) = slots.get_mut(stamp.slot as usize)
             {
                 *place = Some(candidate);
             }
         }
         let found: Option<Vec<GuestSlot>> = slots.into_iter().collect();
-        found.ok_or(BackendError::new("the ring's stamps aren't all there"))
+        found.ok_or_else(|| {
+            BackendError::new(format!("the ring's stamps aren't all there; {}", what_was_read(&read)))
+        })
     }
 
     /// The stamps have reached memory, or never will.
@@ -194,6 +232,7 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
             slot_size,
             space,
             memory: Vec::new(),
+            tiling: None,
             slots: states,
             unsent: None,
         });
@@ -312,6 +351,7 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
         self.frames.registering = None;
         self.frames.cursor = Cursor::default();
         self.end_indirect_ring("the guest restarted");
+        self.end_the_last_start();
         self.display_driver_seen = false;
         self.context_processes.clear();
         self.backend.all_processes_gone();
@@ -363,6 +403,9 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
                 return;
             }
             let copied = !reached || !in_memory || self.copy_to_memory_slot(slot) == Status::SUCCESS;
+            // In rows the frame is the viewer's as it lies in the guest's slot, with no copy.
+            let tiled = self.frames.ring.as_ref().is_some_and(|ring| ring.tiling.is_some());
+            let copied = copied || (tiled && self.fall_back_to_rows());
             let frames = &mut self.frames;
             let (Some(indirect), Some(ring)) = (frames.indirect.as_mut(), frames.ring.as_mut()) else {
                 return;
@@ -370,7 +413,7 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
             let Some(landing) = indirect.landing.pop_front() else { return };
             if reached && !copied {
                 ring.slots.abandoned(landing.slot);
-                frames.complain("a frame couldn't be copied for a viewer on another GPU");
+                frames.complain("a frame couldn't be copied into the viewer's own slot");
             } else if reached {
                 frames.sequence += 1;
                 let replaced = ring.slots.finished(landing.slot, frames.sequence);
@@ -403,9 +446,27 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
         if !wanted {
             return;
         }
-        if self.frames.viewer_facts.wants_memory {
-            self.make_memory_slots();
+        // Slots in the guest's own pages aren't the card's to hand out, so their frames are copied
+        // into slots made for the viewer: on the card, or in memory here if it asked for that.
+        let in_guest_pages = self.frames.indirect.as_ref().is_some_and(|ring| {
+            let locked = |slot: &GuestSlot| {
+                self.allocations.get(&slot.allocation).is_some_and(|found| found.guest_address.is_some())
+            };
+            ring.slots.iter().any(locked)
+        });
+        if self.frames.viewer_facts.wants_memory || in_guest_pages {
+            self.make_viewer_slots(None);
             return;
+        }
+        // NVIDIA's EGL takes 10-bit frames in rows only as external images, which GNOME can't draw. A
+        // viewer that takes the card's tiles gets slots of its own laid out in them, and a copy of
+        // each frame as it lands.
+        let tiles_wanted = self.frames.viewer_facts.takes_ring_tiling && !self.frames.tiles_failed;
+        if let Some(tiling) = self.backend.ring_tiling().filter(|_| tiles_wanted) {
+            if self.make_viewer_slots(Some(tiling)) {
+                return;
+            }
+            self.give_up_on_tiles("its slots couldn't be made");
         }
         let Some(indirect) = self.frames.indirect.as_ref() else { return };
         let slots = indirect.slots.clone();
@@ -425,56 +486,94 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
         }
     }
 
-    /// Slots in memory here, one for each of the guest's, for a viewer whose screen is on another
-    /// GPU. That GPU can't take the card's buffers, so each frame is copied over as it lands. A frame
-    /// that's already waiting is copied now, as a still desktop sends no more.
-    fn make_memory_slots(&mut self) {
+    /// Slots of the viewer's own, one for each of the guest's, which each frame is copied into as it
+    /// lands. They're in memory here for a viewer whose screen is on another GPU, which can't take the
+    /// card's buffers, or on the card: in `tiling`, or in rows when the guest's own slots lie in its
+    /// pages and so can't be handed out. A frame that's already waiting is copied now, as a
+    /// still desktop sends no more.
+    ///
+    /// Says whether the viewer has them. Slots in memory that can't be made leave it with nothing,
+    /// as there's no other way to it. Tiled ones leave the caller to send the frames in rows.
+    fn make_viewer_slots(&mut self, tiling: Option<RingTiling>) -> bool {
         let (Some(indirect), Some(ring)) = (self.frames.indirect.as_ref(), self.frames.ring.as_ref()) else {
-            return;
+            return false;
         };
         let sizes: Vec<u64> = indirect.slots.iter().map(|slot| slot.size).collect();
-        let space = ring.space;
+        let (space, picture) = (ring.space, ring.picture);
         let mut memory = Vec::new();
         let mut buffers = Vec::new();
         for size in sizes {
-            match self.make_host_slot(size, space) {
+            let made = match tiling {
+                Some(tiling) => self.make_tiled_slot(picture, tiling, space),
+                // In memory here for a viewer that asked for that, and on the card for one that
+                // takes the card's buffers.
+                None => self.make_slot(size, space),
+            };
+            match made {
                 Ok((slot, buffer)) => {
                     memory.push(slot);
                     buffers.push(buffer);
                 }
                 Err(error) => {
-                    log::warn!("no slots in memory for the viewer: {error}");
+                    log::warn!("no slots of its own for the viewer: {error}");
                     memory.iter().for_each(|slot| self.free_slot(slot, space));
-                    if let Some(indirect) = self.frames.indirect.as_mut() {
+                    if let Some(indirect) = self.frames.indirect.as_mut().filter(|_| tiling.is_none()) {
                         indirect.export_refused = true;
                     }
-                    return;
+                    return false;
                 }
             }
         }
-        let (Some(indirect), Some(ring)) = (self.frames.indirect.as_mut(), self.frames.ring.as_mut()) else {
-            return;
+        let Some(ring) = self.frames.ring.as_mut() else {
+            memory.iter().for_each(|slot| self.free_slot(slot, space));
+            return false;
         };
         ring.memory = memory;
-        ring.unsent = Some(buffers);
-        indirect.needs_export = false;
+        ring.tiling = tiling;
         let waiting = ring.slots.pending().map(|(slot, _)| slot);
         if let Some(slot) = waiting
             && self.copy_to_memory_slot(slot) != Status::SUCCESS
-            && let Some(ring) = self.frames.ring.as_mut()
         {
-            ring.slots.abandoned(slot);
+            if tiling.is_some() {
+                self.drop_memory_slots();
+                return false;
+            }
+            if let Some(ring) = self.frames.ring.as_mut() {
+                ring.slots.abandoned(slot);
+            }
         }
+        if let (Some(indirect), Some(ring)) = (self.frames.indirect.as_mut(), self.frames.ring.as_mut()) {
+            ring.unsent = Some(buffers);
+            indirect.needs_export = false;
+        }
+        true
     }
 
-    /// The viewer's slots in memory go. Copies here are waited for, so none is writing them.
+    /// The card's tiles didn't work out, so this viewer and every later one gets its frames in
+    /// rows, as a viewer that never asked for tiles does. It's said once, for a report.
+    fn give_up_on_tiles(&mut self, why: &str) {
+        log::warn!("no frames in the card's tiles from here on, as {why}: they go in rows");
+        self.frames.tiles_failed = true;
+    }
+
+    /// A copy into a tiled slot failed with the viewer already holding the tiled buffers. They go,
+    /// and it gets the guest's own in rows under a new generation, as a new viewer would.
+    fn fall_back_to_rows(&mut self) -> bool {
+        self.give_up_on_tiles("a frame couldn't be copied into them");
+        self.drop_memory_slots();
+        self.keep_ring_for_next_viewer();
+        true
+    }
+
+    /// The viewer's own slots go. Copies here are waited for, so none is writing them.
     pub(super) fn drop_memory_slots(&mut self) {
         let Some(ring) = self.frames.ring.as_mut() else { return };
+        ring.tiling = None;
         let (memory, space) = (std::mem::take(&mut ring.memory), ring.space);
         memory.iter().for_each(|slot| self.free_slot(slot, space));
     }
 
-    /// Copies the frame in one of the guest's slots to the viewer's slot in memory. It has the copy
+    /// Copies the frame in one of the guest's slots to the viewer's own slot. It has the copy
     /// engine to itself, and waits, as a frame is one short copy.
     fn copy_to_memory_slot(&mut self, slot: u32) -> Status {
         let (Some(indirect), Some(ring)) = (self.frames.indirect.as_ref(), self.frames.ring.as_ref()) else {
@@ -484,8 +583,8 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
         else {
             return Status::UNSUCCESSFUL;
         };
-        let (allocation, slot_address, picture, own_space) =
-            (guest.allocation, host.address, ring.picture, ring.space);
+        let (allocation, slot_address, picture, own_space, tiling) =
+            (guest.allocation, host.address, ring.picture, ring.space, ring.tiling);
         let Ok(source_address) = self.surface_address(allocation) else { return Status::UNSUCCESSFUL };
         let source = SurfaceShape {
             width: picture.width,
@@ -505,10 +604,29 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
             width: picture.width,
             height: picture.height,
             own_space,
+            slot_tiling: tiling.map(|tiling| tiling.block),
         };
         match self.backend.start_slot_copy(&mut services!(self), &copy) {
             StagingStart::Running => self.wait_for_copy(),
             StagingStart::Finished(status) => status,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_ring_that_cant_be_made_says_what_each_buffer_began_with() {
+        let mut stamped = [0; STAMP_SIZE];
+        stamped[..4].copy_from_slice(b"GHOU");
+        let said = what_was_read(&[(0x4007_da40, stamped), (0x4007_dac0, [0; STAMP_SIZE])]);
+        assert_eq!(
+            said,
+            "read 0x4007da40 starts 47484f55000000000000000000000000, \
+             0x4007dac0 starts 00000000000000000000000000000000"
+        );
+        assert_eq!(what_was_read(&[]), "no buffer of the right size to read");
     }
 }

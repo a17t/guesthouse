@@ -15,13 +15,21 @@ path = "src/main.rs"
 # Answers messages with no GPU behind them, to try the sockets by hand. Never for a real guest.
 stand-in = ["dep:guesthouse-backend-standin"]
 # The real backend, which opens the host's GPU.
-nvidia = ["dep:guesthouse-backend-nvidia", "dep:serde_json", "dep:guesthouse-sensors"]
+nvidia = ["dep:guesthouse-backend-nvidia", "dep:serde_json"]
 # The AMD backend. With nvidia on as well, each run opens the card the app named for its guest.
 amd = ["dep:guesthouse-backend-amd", "dep:serde_json"]
+# The Intel backend. It runs the guest's work on the card through xe where the card passes its own
+# test at the start, and otherwise only logs what the guest's driver sends. With another backend on
+# as well, each run opens the card the app named, the same way.
+intel = ["dep:guesthouse-backend-intel", "dep:serde_json"]
+# For the lab only, never in a build for people: a recorded Intel card with
+# GUESTHOUSE_INTEL_LAB_FAKE_CARD=1 runs the work path against a stand-in for xe. See the Intel backend.
+intel-lab-fake-card = ["intel", "guesthouse-backend-intel/lab-fake-card"]
 
-[dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
 guesthouse-backend.workspace = true
 guesthouse-backend-amd = { workspace = true, optional = true }
+guesthouse-backend-intel = { workspace = true, optional = true }
 guesthouse-backend-nvidia = { workspace = true, optional = true }
 guesthouse-backend-standin = { workspace = true, optional = true }
 guesthouse-core.workspace = true
@@ -30,14 +38,15 @@ guesthouse-frame-socket.workspace = true
 guesthouse-jail.workspace = true
 guesthouse-messages.workspace = true
 guesthouse-transport.workspace = true
-# mmap and ppoll, which the standard library does not offer.
-libc = "0.2"
-# The sensors' snapshot file, which the jail has to name.
-guesthouse-sensors = { workspace = true, optional = true }
+# The sensors' snapshot file, which the jail has to name, and the file the guest's video memory goes
+# in for the app.
+guesthouse-sensors.workspace = true
 # The facade, for the logger in logger.rs to serve.
 log = "0.4"
 # The app writes what setup found as JSON, and this reads it.
 serde_json = { version = "1", optional = true }
+# mmap and ppoll, which the standard library does not offer.
+libc = "0.2"
 
 [dev-dependencies]
 guesthouse-backend-standin.workspace = true
@@ -50,3 +59,7 @@ workspace = true
 [[test]]
 name = "jail"
 harness = false
+
+[[example]]
+name = "card_processes"
+required-features = ["nvidia"]

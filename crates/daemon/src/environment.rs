@@ -20,9 +20,33 @@ pub fn video_cap(value: Option<&str>) -> Option<u64> {
     value.and_then(gibibytes).filter(|&bytes| bytes != 0)
 }
 
+/// The guest's video memory cap: the person's own, and never more than the card itself allows.
+pub fn within_the_cards(asked: Option<u64>, card: Option<u64>) -> Option<u64> {
+    match (asked, card) {
+        (Some(asked), Some(card)) => Some(asked.min(card)),
+        (asked, card) => asked.or(card),
+    }
+}
+
+/// Whether the guest keeps a locked allocation's CPU view until the allocation goes, from
+/// `GUESTHOUSE_UNMAP_AT_UNLOCK`. Only `1` turns it off, so the guest takes the view away at each
+/// last unlock as it did before.
+pub fn keep_cpu_views(value: Option<&str>) -> bool {
+    value != Some("1")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cards_own_cap_holds_whatever_a_person_asks() {
+        assert_eq!(within_the_cards(None, None), None, "as before for a card that sets none");
+        assert_eq!(within_the_cards(Some(8 << 30), None), Some(8 << 30));
+        assert_eq!(within_the_cards(None, Some(6 << 30)), Some(6 << 30));
+        assert_eq!(within_the_cards(Some(8 << 30), Some(6 << 30)), Some(6 << 30));
+        assert_eq!(within_the_cards(Some(4 << 30), Some(6 << 30)), Some(4 << 30));
+    }
 
     #[test]
     fn ram_defaults_when_unset_or_unreadable() {
@@ -37,5 +61,13 @@ mod tests {
         assert_eq!(video_cap(Some("0G")), None);
         assert_eq!(video_cap(Some("G")), None);
         assert_eq!(video_cap(Some("8G")), Some(8 << 30));
+    }
+
+    #[test]
+    fn cpu_views_are_kept_unless_the_switch_is_one() {
+        assert!(keep_cpu_views(None));
+        assert!(keep_cpu_views(Some("0")));
+        assert!(keep_cpu_views(Some("yes")));
+        assert!(!keep_cpu_views(Some("1")));
     }
 }

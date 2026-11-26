@@ -1,0 +1,37 @@
+//! Bug reports for a Windows host. The Windows app builds a report with these, and sends it to the
+//! same server the Linux host's reports go to, so what's on the wire is the same. The service only
+//! hands over its files. It never builds or sends a report.
+//!
+//! - `contract` holds what the server and the Linux host agree on, pinned to the Linux sources.
+//! - `answer` reads the server's answer to a sent report.
+//! - `kind` and `summary` are what sorts a report before anyone opens it.
+//! - `parts` is how the service's files come over the pipe, and are put back together.
+//! - `stage` makes the files from what was gathered, `send` is how they are posted, and `issue` is
+//!   the link that opens an issue about a sent report.
+//! - `clock` writes times in UTC.
+//! - `scrub` and `trim` make each file fit to send, and `manifest` says what the bundle holds.
+//!
+//! Nothing here calls into Windows, so it builds and is tested anywhere.
+
+pub mod answer;
+pub mod clock;
+pub mod contract;
+pub mod issue;
+pub mod kind;
+pub mod manifest;
+pub mod parts;
+pub mod scrub;
+pub mod send;
+pub mod stage;
+pub mod summary;
+pub mod trim;
+
+pub use answer::read_answer;
+pub use contract::{KEPT_DAYS, MOST_REPORT_BYTES, NEW_ISSUE, report_address};
+pub use issue::issue_link;
+pub use kind::ProblemKind;
+pub use manifest::{MANIFEST_FILE, manifest};
+pub use parts::{PIECE_BYTES, Parts, pieces};
+pub use scrub::Scrubber;
+pub use summary::Summary;
+pub use trim::keep_end;

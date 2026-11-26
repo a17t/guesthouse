@@ -5,10 +5,12 @@
 
 mod control;
 mod gpu_range;
+mod logical_gpus;
 mod node_list;
 mod processes;
 mod pstate;
 mod time_pairs;
+mod timer_page;
 mod video_memory;
 
 pub use gpu_range::{RUNTIME_GPU_RANGE, RUNTIME_PLACED_RANGE};
@@ -35,12 +37,18 @@ const FUNCTION_CHECK_DISPLAY: u32 = 0x0100_0001;
 /// Which GPUs there are.
 const FUNCTION_LIST_GPUS: u32 = 0x0700_0002;
 const FUNCTION_LIST_COMPUTE_GPUS: u32 = 0x0700_0003;
+/// Which logical GPUs there are, and which physical GPUs make each one up, for NVAPI.
+const FUNCTION_LIST_LOGICAL_GPUS: u32 = 0x0700_0004;
+const FUNCTION_LOGICAL_OF_PHYSICAL: u32 = 0x0700_0005;
+const FUNCTION_PHYSICAL_OF_LOGICAL: u32 = 0x0700_0006;
 /// Which GPU addresses the compute runtime may treat as its own.
 const FUNCTION_RUNTIME_GPU_RANGE: u32 = 0x0100_0113;
 /// How much video memory there is, for OpenGL's memory queries.
 const FUNCTION_VIDEO_MEMORY: u32 = 0x0100_0012;
 /// Which node is which engine, for the video runtime.
 const FUNCTION_LIST_NODES: u32 = 0x0100_000F;
+/// Maps the GPU's timer into the program, for the OpenCL runtime.
+const FUNCTION_TIMER_PAGE: u32 = 0x0100_0077;
 /// Asked before an encoding session opens, and the session is refused unless one says yes.
 const FUNCTIONS_ENCODE_ASK: [u32; 3] = [0x0100_0128, 0x0100_0119, 0x0100_011A];
 const ENCODE_ANSWER: usize = 0x30;
@@ -53,6 +61,13 @@ const GPU_KIND_DISPLAY_DRIVER: u32 = 1;
 
 fn get(data: &[u8], at: usize) -> Option<u32> {
     data.get(at..at + 4).map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four bytes")))
+}
+
+/// Writes a long word, for a guest whose buffer may be too short for it.
+fn put_long(data: &mut [u8], at: usize, value: u64) {
+    if let Some(field) = data.get_mut(at..at + 8) {
+        field.copy_from_slice(&value.to_le_bytes());
+    }
 }
 
 /// Writes a word, for a guest whose buffer may be too short for it.
@@ -100,10 +115,14 @@ pub fn answer<R: Rm>(device: &mut Device<R>, facts: EscapeFacts<'_>, data: &mut 
         }
         // A card under the display driver isn't a compute-only one, so this list stays empty.
         FUNCTION_LIST_COMPUTE_GPUS => {}
+        FUNCTION_LIST_LOGICAL_GPUS => logical_gpus::list(device.gpu_id()?, data),
+        FUNCTION_LOGICAL_OF_PHYSICAL => logical_gpus::logical_of(device.gpu_id()?, data),
+        FUNCTION_PHYSICAL_OF_LOGICAL => logical_gpus::physical_of(device.gpu_id()?, data),
         FUNCTION_CHECK_DISPLAY => {}
         FUNCTION_RUNTIME_GPU_RANGE => gpu_range::answer(data),
         FUNCTION_VIDEO_MEMORY => video_memory::answer((facts.books.memory)(), data),
         FUNCTION_LIST_NODES => node_list::answer(facts.nodes, data),
+        FUNCTION_TIMER_PAGE => timer_page::answer(data),
         _ => put(data, HEADER_SIZE_FIELD, HEADER_SIZE),
     }
     put(data, ANSWERED, 1);
@@ -174,6 +193,17 @@ pub(super) mod tests {
         answer(&mut device(), NO_FACTS, &mut data).unwrap();
         assert_eq!(get(&data, GPU_LIST_COUNT), Some(1));
         assert_eq!(get(&data, GPU_LIST_HANDLES), Some(0x300));
+    }
+
+    #[test]
+    fn the_logical_gpu_list_names_this_card_and_keeps_its_own_size() {
+        let mut data = escape(FUNCTION_LIST_LOGICAL_GPUS, 0x8538);
+        put(&mut data, HEADER_SIZE_FIELD, 0x8538);
+        answer(&mut device(), NO_FACTS, &mut data).unwrap();
+        assert_eq!(get(&data, HEADER_SIZE_FIELD), Some(0x8538));
+        assert_eq!(get(&data, GPU_LIST_COUNT), Some(1));
+        assert_eq!(get(&data, GPU_LIST_HANDLES + 4), Some(0x300), "its first physical GPU");
+        assert_eq!(get(&data, RESULT), Some(1));
     }
 
     #[test]

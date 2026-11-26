@@ -1,6 +1,8 @@
 //! What a map of depth memory asks the RM for on each generation.
 
-use guesthouse_backend::{Backend, GpuRange, MapMemoryType, MapRequest, MemoryKind, SpaceId};
+#![cfg(target_os = "linux")]
+
+use guesthouse_backend::{Backend, GpuRange, MapMemoryType, MapRequest, MemoryKind, RangeView, SpaceId};
 use guesthouse_backend_nvidia::NvidiaBackend;
 use guesthouse_backend_nvidia::fake_guest::start_on_card;
 use guesthouse_backend_nvidia::rm::fake::{Call, FakeRm};
@@ -60,6 +62,40 @@ fn a_map_with_no_depth_class_sets_no_kind() {
         let mut backend = started(FakeRm::new(), card);
         assert_eq!(kinds_mapped(&mut backend, 0x23), [None], "{}", card.device);
     }
+}
+
+/// What Blender's Vulkan depth image carries: 32 bit float depth with stencil, and a map of its
+/// heap that names no class.
+const FLOAT_DEPTH_STENCIL: MemoryKind = MemoryKind(0x2c_0005);
+const HEAP_MAP_PROTECTION: u64 = 0x1;
+const FLOAT_DEPTH_STENCIL_KIND: u32 = 0x04;
+
+#[test]
+fn a_heap_mapped_into_a_depth_surfaces_range_gets_the_surfaces_kind() {
+    let view = RangeView { surface: FLOAT_DEPTH_STENCIL, driver_protection: 0 };
+    for card in [&FAKE_TURING, &FAKE_AMPERE, &FAKE_ADA] {
+        let mut backend = started(FakeRm::new(), card);
+        let protection = backend.protection_for_view(view, HEAP_MAP_PROTECTION);
+        assert_eq!(
+            kinds_mapped(&mut backend, protection),
+            [Some(FLOAT_DEPTH_STENCIL_KIND)],
+            "{}",
+            card.device
+        );
+    }
+    let mut blackwell = started(FakeRm::new(), &FAKE_BLACKWELL);
+    assert_eq!(blackwell.protection_for_view(view, HEAP_MAP_PROTECTION), HEAP_MAP_PROTECTION);
+    assert_eq!(kinds_mapped(&mut blackwell, HEAP_MAP_PROTECTION), [None]);
+}
+
+#[test]
+fn a_ranges_own_depth_class_comes_before_the_surface_described() {
+    let backend = started(FakeRm::new(), &FAKE_ADA);
+    let view = RangeView { surface: FLOAT_DEPTH_STENCIL, driver_protection: Z24S8_PROTECTION };
+    assert_eq!(backend.protection_for_view(view, HEAP_MAP_PROTECTION), 0x0401);
+    let unknown = RangeView { surface: MemoryKind::PLAIN, driver_protection: 0x7f00 };
+    assert_eq!(backend.protection_for_view(unknown, HEAP_MAP_PROTECTION), HEAP_MAP_PROTECTION);
+    assert_eq!(backend.protection_for_view(RangeView::NONE, HEAP_MAP_PROTECTION), HEAP_MAP_PROTECTION);
 }
 
 #[test]

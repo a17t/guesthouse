@@ -27,6 +27,7 @@ refuse() {
 
 # Ninja's [DONE/TOTAL] lines, said to the host now and then, and shown here as a share.
 show_progress() {
+    # shellcheck disable=SC1010 # "done" here is the name of a variable, ninja's count of finished steps
     local line done total last=0 now
     while IFS= read -r line; do
         printf '%s\n' "$line" >> "$mesa_log"

@@ -6,31 +6,22 @@
 //! A card is found by AMD's vendor ID in the DRM class, as render node numbers move between boots.
 
 use crate::context::Context;
-use crate::machine::{Machine, sorted_names};
-use crate::setup::cards::{find_cards, product_name};
+use crate::gpu_maker::GpuMaker;
+use crate::machine::Machine;
+use crate::render_cards::{RenderCard, render_cards};
+use crate::setup::cards::find_cards;
 use crate::usb::sysfs_text;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-const AMD_VENDOR: &str = "0x1002";
-const AMD_NAMES_START: &str = "\n1002  ";
-const RENDER_PREFIX: &str = "renderD";
 const DRM_DEVICE_LINK: &str = "device";
-/// Where the render nodes are, which the DRM class names.
-const RENDER_NODES: &str = "/dev/dri";
+/// Under the card's PCI device, the major version of its first graphics block.
+const GRAPHICS_VERSION: &str = "ip_discovery/die/0/GC/0/major";
 /// Written in the machine's folder when the guest said native context failed, and why.
 const FALLBACK_FILE: &str = "amd-fallback";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AmdCard {
-    /// Where the card is on the PCI bus, as sysfs names it.
-    pub pci: String,
-    /// Its render node, as `/dev/dri/renderD128`.
-    pub render_node: PathBuf,
-    pub name: String,
-    /// Its PCI device id.
-    pub device: u32,
-}
+/// An AMD card here, found the way every maker's are.
+pub type AmdCard = RenderCard;
 
 /// How the guest's 3D reaches the card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,31 +42,18 @@ impl AmdMode {
     }
 }
 
-fn hex_number(text: &str) -> Option<u32> {
-    u32::from_str_radix(text.trim_start_matches("0x"), 16).ok()
-}
-
-fn card_of(drm_class: &Path, names: &Path, node: &str) -> Option<AmdCard> {
-    let device = drm_class.join(node).join(DRM_DEVICE_LINK);
-    if sysfs_text(&device.join("vendor")) != AMD_VENDOR {
-        return None;
-    }
-    let pci = fs::read_link(&device).ok()?.file_name()?.to_string_lossy().into_owned();
-    let number = hex_number(&sysfs_text(&device.join("device")))?;
-    let product =
-        product_name(AMD_NAMES_START, number, names).unwrap_or_else(|| format!("card {number:04x}"));
-    let render_node = Path::new(RENDER_NODES).join(node);
-    Some(AmdCard { pci, render_node, name: format!("AMD {product}"), device: number })
-}
-
 /// The AMD cards with a render node, by PCI address. Any of them will do, iGPU or not, and so will the
 /// one that drives the host's desktop.
 pub fn amd_cards(context: &Context) -> Vec<AmdCard> {
-    let nodes = sorted_names(&context.drm_class).into_iter().filter(|name| name.starts_with(RENDER_PREFIX));
-    let mut cards: Vec<AmdCard> =
-        nodes.filter_map(|node| card_of(&context.drm_class, &context.pci_names, &node)).collect();
-    cards.sort_by(|one, other| one.pci.cmp(&other.pci));
-    cards
+    render_cards(context, GpuMaker::Amd)
+}
+
+/// The major version of the card's graphics block, from amdgpu's IP discovery: 10 for RDNA and RDNA2, 11
+/// for RDNA3 and 12 for RDNA4. Cards from before RDNA have no IP discovery, or a version under 10.
+pub fn graphics_major(context: &Context, card: &AmdCard) -> Option<u32> {
+    let node = card.render_node.file_name()?;
+    let version = context.drm_class.join(node).join(DRM_DEVICE_LINK).join(GRAPHICS_VERSION);
+    sysfs_text(&version).parse().ok()
 }
 
 /// The card at this address, if it's still in this PC.
@@ -92,7 +70,8 @@ pub fn default_linux_gpu(context: &Context) -> String {
     amd_cards(context).into_iter().next().map(|card| card.pci).unwrap_or_default()
 }
 
-fn fallback_file(context: &Context, machine: &Machine) -> PathBuf {
+/// Where the reason this machine fell back to Venus is kept.
+pub fn fallback_file(context: &Context, machine: &Machine) -> PathBuf {
     machine.folder(context).join(FALLBACK_FILE)
 }
 
@@ -129,6 +108,11 @@ pub mod stand_in {
         std::fs::create_dir_all(&folder).unwrap();
         symlink(scratch.path(&format!("pci/{pci}")), folder.join("device")).unwrap();
     }
+
+    /// What amdgpu's IP discovery says of the card's graphics block, 10 and up being RDNA.
+    pub fn fake_graphics(scratch: &Scratch, pci: &str, major: u32) {
+        scratch.write(&format!("pci/{pci}/ip_discovery/die/0/GC/0/major"), format!("{major}\n"));
+    }
 }
 
 #[cfg(test)]
@@ -160,6 +144,16 @@ mod tests {
         assert_eq!(found, [("0000:03:00.0", "/dev/dri/renderD130"), ("0000:7c:00.0", "/dev/dri/renderD128")]);
         assert_eq!(cards[0].name, "AMD Radeon RX 9070/9070 XT/9070 GRE");
         assert_eq!(cards[1].name, "AMD Radeon 610M");
+    }
+
+    #[test]
+    fn an_intel_card_is_never_a_linux_guests_gpu() {
+        let scratch = Scratch::new();
+        fake_render_node(&scratch, 128, "0000:00:02.0", "0x8086", 0x64a0);
+        let context = context(&scratch);
+        assert!(amd_cards(&context).is_empty());
+        assert_eq!(default_linux_gpu(&context), "", "a new Linux guest gets no Intel card");
+        assert!(amd_card(&context, "0000:00:02.0").is_none());
     }
 
     #[test]

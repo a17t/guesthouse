@@ -81,6 +81,8 @@ ctrl 0x204 NV0000_CTRL_CMD_GPU_GET_DEVICE_IDS
 ctrl 0x301 NV0000_CTRL_CMD_GSYNC_GET_ATTACHED_IDS
 class 0xc661 HOPPER_USERMODE_A doorbell page
 class 0xc761 BLACKWELL_USERMODE_A doorbell page
+class 0xc461 TURING_USERMODE_A doorbell page, on the 20, 30 and 40 series. It takes no parameters
+class 0xc361 VOLTA_USERMODE_A usermode page. Vulkan asks for it on a 4060 Ti. It takes no parameters
 class 0x9096 GF100_ZBC_CLEAR
 memclass 0x40 NV01_MEMORY_LOCAL_USER
 memclass 0x3e NV01_MEMORY_SYSTEM
@@ -93,6 +95,7 @@ class 0xa06c KEPLER_CHANNEL_GROUP_A
 class 0x9067 FERMI_CONTEXT_SHARE_A
 ctrl 0xd01 NV0000_CTRL_CMD_CLIENT_GET_ADDR_SPACE_TYPE
 ctrl 0x102 NV0000_CTRL_CMD_SYSTEM_GET_CPU_INFO
+ctrl 0x136 NV0000_CTRL_CMD_SYSTEM_GET_FABRIC_STATUS read only, one number out. CUDA asks for it on a 4060 Ti
 ctrl 0x20800147 NV2080_CTRL_CMD_GPU_GET_ENGINE_PARTNERLIST
 ctrl 0x20800170 NV2080_CTRL_CMD_GPU_GET_ENGINES_V2
 ctrl 0x20802a03 NV2080_CTRL_CMD_CE_GET_CAPS_V2
@@ -101,12 +104,22 @@ ctrl 0x102 NV0000_CTRL_CMD_SYSTEM_GET_CPU_INFO
 ctrl 0x20803d07 NV2080_CTRL_CMD_OS_UNIX_VIDMEM_PERSISTENCE_STATUS read only
 class 0xca6f BLACKWELL_CHANNEL_GPFIFO_B
 class 0xc96f BLACKWELL_CHANNEL_GPFIFO_A
+class 0xc56f AMPERE_CHANNEL_GPFIFO_A the 30 and 40 series
+class 0xc46f TURING_CHANNEL_GPFIFO_A the 20 series
 class 0xcec0 BLACKWELL_COMPUTE_B
 class 0xcdc0 BLACKWELL_COMPUTE_A
+class 0xc9c0 ADA_COMPUTE_A the 40 series
+class 0xc7c0 AMPERE_COMPUTE_B the 30 series
+class 0xc5c0 TURING_COMPUTE_A the 20 series
 class 0xce97 BLACKWELL_B
 class 0xcd97 BLACKWELL_A
+class 0xc997 ADA_A the 40 series
+class 0xc797 AMPERE_B the 30 series
+class 0xc597 TURING_A the 20 series
 class 0xcab5 BLACKWELL_DMA_COPY_B
 class 0xc9b5 BLACKWELL_DMA_COPY_A
+class 0xc7b5 AMPERE_DMA_COPY_B the 30 and 40 series
+class 0xc5b5 TURING_DMA_COPY_A the 20 series
 ctrl 0x20800123 NV2080_CTRL_CMD_GPU_GET_ENGINES
 ctrl 0x90960106 NV9096_CTRL_CMD_GET_ZBC_CLEAR_TABLE_SIZE
 ctrl 0x801c02 NV0080_CTRL_CMD_NVDEC_GET_CAPS_V2
@@ -118,6 +131,7 @@ ctrl 0xc36f010a NVC36F_CTRL_CMD_GPFIFO_SET_WORK_SUBMIT_TOKEN_NOTIF_INDEX own cha
 ctrl 0xc36f0108 NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN own channel
 class 0x902d FERMI_TWOD_A
 class 0xcd40 BLACKWELL_INLINE_TO_MEMORY_A
+class 0xa140 KEPLER_INLINE_TO_MEMORY_B the same on the 20, 30 and 40 series
 ctrl 0x801707 NV0080_CTRL_CMD_FIFO_GET_ENGINE_CONTEXT_PROPERTIES
 ctrl 0x906f0101 NV906F_CTRL_GET_CLASS_ENGINE read only, own channel
 ctrl 0x20801208 NV2080_CTRL_CMD_GR_CTXSW_ZCULL_BIND own channel
@@ -202,8 +216,17 @@ ctrl 0x90960102 NV9096_CTRL_CMD_SET_ZBC_DEPTH_CLEAR GPU-wide clear table
 ctrl 0x90960105 NV9096_CTRL_CMD_SET_ZBC_STENCIL_CLEAR GPU-wide clear table
 ioctl 0x41 RM_IDLE_CHANNELS pointers translated, own channels
 class 0xcfb0 NVCFB0_VIDEO_DECODER NVDEC context on own channel, non-privileged, params have no pointers
+class 0xc9b0 NVC9B0_VIDEO_DECODER the 40 series, same parameters
+class 0xc7b0 NVC7B0_VIDEO_DECODER the 30 series, same parameters
+class 0xc4b0 NVC4B0_VIDEO_DECODER the 20 series, same parameters
 class 0xcfb7 NVCFB7_VIDEO_ENCODER NVENC context on own channel, non-privileged, params have no pointers
+class 0xc9b7 NVC9B7_VIDEO_ENCODER the 40 series, same parameters
+class 0xc7b7 NVC7B7_VIDEO_ENCODER the 30 series, same parameters
+class 0xc4b7 NVC4B7_VIDEO_ENCODER the 20 series, same parameters
+class 0xb4b7 NVB4B7_VIDEO_ENCODER the GTX 1650, same parameters
 class 0xcffa NVCFFA_VIDEO_OFA optical flow context on own channel, non-privileged, params have no pointers
+class 0xc9fa NVC9FA_VIDEO_OFA the 40 series, same parameters
+class 0xc7fa NVC7FA_VIDEO_OFA the 30 series, same parameters
 ctrl 0x20809009 a clock reading for nvidia-smi
 ctrl 0x20809064 a clock reading for nvidia-smi, by domain
 ctrl 0x2080a618 a power reading for nvidia-smi
@@ -216,3 +239,6 @@ ctrl 0x801f02 NV0080_CTRL_CMD_NVJPG_GET_CAPS_V2 video encoding reads what the ca
 ctrl 0x2080016c NV2080_CTRL_CMD_GPU_GET_ENCODER_CAPACITY video encoding asks how much it may use. Read only, no pointers
 ctrl 0x20808163 no public name. NVENC won't open a session without the driver's own answer. The device forwards it at 4 bytes and no other size
 class 0x2 NV01_CONTEXT_DMA video encoding wants a window on its own memory. The same object as RM_ALLOC_CONTEXT_DMA2 makes
+ctrl 0x20802209 NV2080_CTRL_CMD_RC_GET_WATCHDOG_INFO the CUDA runtime reads it as it starts. Read only, one NvU32 the driver writes, and the device forwards it at 4 bytes and no other size
+ctrl 0x20809001 no public name. The CUDA runtime won't start without the driver's answer. The device sends its own copy of the one question NVIDIA's library asks, at 8 bytes, never the guest's bytes
+ctrl 0x2080a026 no public name. The CUDA runtime won't start without the driver's answer. The device sends its own copy of the one question NVIDIA's library asks, at 532 bytes, never the guest's bytes

@@ -1,0 +1,254 @@
+//! A driver escape: private data the guest's driver sends to the vendor's kernel driver directly.
+//!
+//! Every escape here starts with a 16-byte header, GFX_ESCAPE_HEADER as compute-runtime defines it:
+//! the payload's size, a checksum, the escape code, and a minor code or a reserved word. This
+//! backend judges each escape by a few rules: it must be at least its header, its code must be
+//! below [`CODES`], and its length must be the header's size and the header, except for the codes
+//! in [`ANY_SIZE`]. The checksum is logged and not judged. A payload starting with
+//! [`DONE_AT_ONCE`] counts as answered at once, and an escape of [`OLDER_FORM_SIZE`] bytes that
+//! fails the rules counts as an older form whose rules aren't known. The memory manager's escapes
+//! use [`GMM_CONTROL`], with what they ask for in the payload's first dword, and so do the media
+//! driver's, [`super::media_escape::MEDIA`].
+//!
+//! The partition escape is answered, in [`answer_partition`], and some of the media driver's, in
+//! [`super::media_escape`]. Any other comes back as the guest sent it. The core gives an escape no
+//! status of its own, so the verdict only goes to the log.
+
+use super::bytes::dword;
+use super::partition::{self, Range};
+
+pub const HEADER_SIZE: usize = 16;
+const PAYLOAD_SIZE: usize = 0x0;
+const CHECKSUM: usize = 0x4;
+pub const CODE: usize = 0x8;
+const MINOR_CODE: usize = 0xC;
+/// Codes below this are judged known.
+const CODES: u32 = 0x70;
+/// Codes whose length isn't judged.
+const ANY_SIZE: [u32; 4] = [0x01, 0x14, 0x15, 0x6A];
+/// GFX_ESCAPE_GMM_CONTROL, from compute-runtime.
+pub const GMM_CONTROL: u32 = 2;
+/// A payload starting with these four letters counts as answered at once.
+const DONE_AT_ONCE: [u8; 4] = *b"GOOG";
+/// An escape this long that fails the rules counts as an older form.
+const OLDER_FORM_SIZE: usize = 0x30;
+
+/// A memory manager escape about the partition: an action, a dword of padding, the partition, and
+/// two dwords after it. Which action number asks and which sets isn't settled here, so which one
+/// came is told by the partition: an ask carries it empty.
+const PARTITION_PAYLOAD: usize = 8 + partition::SIZE + 8;
+const PARTITION_AT: usize = HEADER_SIZE + 8;
+
+/// What a partition escape was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionAsk {
+    /// It came empty and goes back with `ours`.
+    Get,
+    /// It came with the guest's own partition, which goes back as it came.
+    Set([Range; 11]),
+}
+
+/// Answers a partition escape with `ours`, if this is one.
+pub fn answer_partition(data: &mut [u8], ours: &[Range; 11]) -> Option<PartitionAsk> {
+    let is_partition =
+        data.len() == HEADER_SIZE + PARTITION_PAYLOAD && dword(data, CODE) == Some(GMM_CONTROL);
+    if !is_partition {
+        return None;
+    }
+    let block = &mut data[PARTITION_AT..PARTITION_AT + partition::SIZE];
+    if block.iter().any(|&byte| byte != 0) {
+        return Some(PartitionAsk::Set(partition::read(block)));
+    }
+    partition::write(block, ours);
+    Some(PartitionAsk::Get)
+}
+
+/// What this backend's rules make of an escape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Verdict {
+    Taken,
+    /// Answered as done without looking further.
+    DoneAtOnce,
+    /// An older form, whose rules aren't known.
+    OlderForm,
+    Refused(&'static str),
+}
+
+impl Verdict {
+    /// One word for the log.
+    pub fn word(&self) -> &'static str {
+        match self {
+            Self::Taken => "take",
+            Self::DoneAtOnce => "answer-at-once",
+            Self::OlderForm => "pass-to-older-handler",
+            Self::Refused(_) => "refuse",
+        }
+    }
+
+    /// Why it would be refused, or `-`.
+    pub fn why(&self) -> &'static str {
+        if let Self::Refused(why) = self { why } else { "-" }
+    }
+}
+
+/// What an escape says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Escape {
+    pub length: usize,
+    pub payload_size: u32,
+    pub checksum: u32,
+    pub code: u32,
+    pub minor_code: u32,
+    /// What a memory manager escape asks for.
+    pub gmm_action: Option<u32>,
+    /// What a media driver's escape asks for.
+    pub media_action: Option<u32>,
+    pub verdict: Verdict,
+}
+
+impl Escape {
+    pub fn parse(data: &[u8]) -> Self {
+        let field = |at| dword(data, at).unwrap_or(0);
+        let mut escape = Self {
+            length: data.len(),
+            payload_size: field(PAYLOAD_SIZE),
+            checksum: field(CHECKSUM),
+            code: field(CODE),
+            minor_code: field(MINOR_CODE),
+            gmm_action: None,
+            media_action: None,
+            verdict: Verdict::Taken,
+        };
+        let payload = data.get(HEADER_SIZE..).unwrap_or_default();
+        match escape.code {
+            GMM_CONTROL => escape.gmm_action = dword(payload, 0),
+            super::media_escape::MEDIA => escape.media_action = dword(payload, 0),
+            _ => {}
+        }
+        escape.verdict = escape.judge(payload);
+        escape
+    }
+
+    fn judge(&self, payload: &[u8]) -> Verdict {
+        let refused = if self.length < HEADER_SIZE {
+            Some("shorter than its header")
+        } else if self.code >= CODES {
+            Some("a code past those judged known")
+        } else if !ANY_SIZE.contains(&self.code)
+            && self.length as u64 != u64::from(self.payload_size) + HEADER_SIZE as u64
+        {
+            Some("its size isn't the header's and the header")
+        } else {
+            None
+        };
+        match refused {
+            Some(_) if self.length == OLDER_FORM_SIZE => Verdict::OlderForm,
+            Some(why) => Verdict::Refused(why),
+            None if payload.starts_with(&DONE_AT_ONCE) => Verdict::DoneAtOnce,
+            None => Verdict::Taken,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::protocol::bytes::put_dword;
+
+    /// A memory manager escape asking for `action`, with `payload` bytes after the header.
+    pub fn gmm(action: u32, payload: usize) -> Vec<u8> {
+        let mut data = vec![0u8; HEADER_SIZE + payload];
+        put_dword(&mut data, PAYLOAD_SIZE, payload as u32);
+        put_dword(&mut data, CODE, GMM_CONTROL);
+        put_dword(&mut data, HEADER_SIZE, action);
+        data
+    }
+
+    #[test]
+    fn a_memory_manager_escape_is_taken_and_says_what_it_asks() {
+        let escape = Escape::parse(&gmm(0x1D, 0xC0));
+        assert_eq!(
+            (escape.code, escape.gmm_action, escape.verdict),
+            (GMM_CONTROL, Some(0x1D), Verdict::Taken)
+        );
+        assert_eq!(escape.length, HEADER_SIZE + 0xC0);
+    }
+
+    #[test]
+    fn an_empty_partition_is_answered_with_ours_and_a_set_one_is_left_as_it_came() {
+        let ours = partition::ours();
+        let mut asked = gmm(0x1D, PARTITION_PAYLOAD);
+        assert_eq!(answer_partition(&mut asked, &ours), Some(PartitionAsk::Get));
+        assert_eq!(partition::read(&asked[PARTITION_AT..]), ours);
+        assert_eq!(dword(&asked, HEADER_SIZE), Some(0x1D), "the action is kept");
+
+        let mut set = gmm(0x1E, PARTITION_PAYLOAD);
+        set[PARTITION_AT] = 0x40;
+        let before = set.clone();
+        let Some(PartitionAsk::Set(theirs)) = answer_partition(&mut set, &ours) else { panic!("a set") };
+        assert_eq!(theirs[0].base, 0x40);
+        assert_eq!(set, before);
+    }
+
+    #[test]
+    fn other_escapes_are_not_partitions() {
+        let ours = partition::ours();
+        assert_eq!(answer_partition(&mut gmm(0x1D, PARTITION_PAYLOAD - 4), &ours), None);
+        let mut other_code = gmm(0x1D, PARTITION_PAYLOAD);
+        put_dword(&mut other_code, CODE, 3);
+        assert_eq!(answer_partition(&mut other_code, &ours), None);
+    }
+
+    #[test]
+    fn a_media_escape_says_what_it_asks_and_a_memory_manager_one_is_not_one() {
+        let mut data = gmm(0x10, 0x160);
+        put_dword(&mut data, CODE, crate::protocol::media_escape::MEDIA);
+        let escape = Escape::parse(&data);
+        assert_eq!((escape.media_action, escape.gmm_action), (Some(0x10), None));
+        assert_eq!(Escape::parse(&gmm(0x10, 0x160)).media_action, None);
+    }
+
+    #[test]
+    fn the_checksum_is_read_but_never_judged() {
+        let mut data = gmm(0x0F, 0x10);
+        put_dword(&mut data, CHECKSUM, 0xDEAD_BEEF);
+        let escape = Escape::parse(&data);
+        assert_eq!((escape.checksum, escape.verdict), (0xDEAD_BEEF, Verdict::Taken));
+    }
+
+    #[test]
+    fn a_size_that_disagrees_with_the_header_is_refused_except_for_a_few_codes() {
+        let mut data = gmm(0x0F, 0x10);
+        put_dword(&mut data, PAYLOAD_SIZE, 0x20);
+        assert!(matches!(Escape::parse(&data).verdict, Verdict::Refused(_)));
+        for code in ANY_SIZE {
+            put_dword(&mut data, CODE, code);
+            assert_eq!(Escape::parse(&data).verdict, Verdict::Taken, "{code:#x}");
+        }
+    }
+
+    #[test]
+    fn short_escapes_and_codes_past_the_table_are_refused() {
+        assert!(matches!(Escape::parse(&[0; 8]).verdict, Verdict::Refused(_)));
+        let mut data = gmm(0, 0x10);
+        put_dword(&mut data, CODE, CODES);
+        assert!(matches!(Escape::parse(&data).verdict, Verdict::Refused(_)));
+        assert_eq!(Escape::parse(&data).gmm_action, None);
+    }
+
+    #[test]
+    fn a_refused_escape_of_the_older_size_goes_to_the_older_handler() {
+        let mut data = vec![0u8; OLDER_FORM_SIZE];
+        put_dword(&mut data, CODE, CODES + 1);
+        assert_eq!(Escape::parse(&data).verdict, Verdict::OlderForm);
+    }
+
+    #[test]
+    fn the_marker_payload_is_done_at_once() {
+        let mut data = vec![0u8; HEADER_SIZE + 8];
+        put_dword(&mut data, PAYLOAD_SIZE, 8);
+        put_dword(&mut data, CODE, 0x10);
+        data[HEADER_SIZE..HEADER_SIZE + 4].copy_from_slice(&DONE_AT_ONCE);
+        assert_eq!(Escape::parse(&data).verdict, Verdict::DoneAtOnce);
+    }
+}

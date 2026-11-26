@@ -7,17 +7,23 @@
 
 use super::arguments::{MONITOR_SOCKETS, words};
 use super::forwarding_jail::DEVICES as CARD_NODES;
+use super::ubuntu::{FORWARDED_INPUT_SOCKET, FRAMES_SOCKET};
 use super::{Boot, QemuJail, VmPlan};
-use crate::disk_image::backing::backing_files;
+use crate::disk_image::backing::backing_files as backing_files_of;
 use crate::failure::{Failure, Result};
 use crate::network::{Mode, Protocol, bridge_helper};
-use guesthouse_jail::launch::{Launch, Passt, Tap, UnixSocket};
-use guesthouse_jail::{Grant, Network, Plan, Ports};
+use guesthouse_jail::launch::{self, Launch, Passt, Tap, UnixSocket};
+use guesthouse_jail::{Grant, Network, Plan, Ports, system};
 use std::path::{Path, PathBuf};
 
-/// Where the launcher leaves QEMU's unix sockets, when it opens them: monitors first, then clients.
+/// Where the launcher leaves QEMU's unix sockets, when it opens them: monitors first, then the rest.
 const FIRST_UNIX_FD: i32 = 20;
-const CLIENT_SOCKETS: [(&str, &str); 3] = [("gpg", "global.sock"), ("gpv", "vgpu.sock"), ("tpm", "tpm.sock")];
+/// The daemon's sockets, which a Windows guest's QEMU connects to.
+pub(super) const GLOBAL_SOCKET: &str = "global.sock";
+pub(super) const VGPU_SOCKET: &str = "vgpu.sock";
+const DAEMON_SOCKETS: [&str; 2] = [GLOBAL_SOCKET, VGPU_SOCKET];
+/// swtpm's, which QEMU connects to.
+pub(super) const TPM_SOCKET: &str = "tpm.sock";
 const RECONNECT_MS: u32 = 500;
 /// QEMU's pid file, which names the run folder in its words when no monitor socket does.
 pub const PID_FILE: &str = "qemu.pid";
@@ -38,11 +44,11 @@ const QEMU_SANDBOX: &str = "on,obsolete=deny,spawn=allow,resourcecontrol=deny";
 /// context, with no shared folder.
 const QEMU_SANDBOX_NO_SPAWN: &str = "on,obsolete=deny,spawn=deny,resourcecontrol=deny";
 
-/// What any QEMU reads. `/proc` and `/sys` give nothing away, as Landlock doesn't let a jailed
-/// process look into one outside its jail.
+/// What any QEMU reads, besides the system's programs. `/proc` and `/sys` give nothing away, as
+/// Landlock doesn't let a jailed process look into one outside its jail.
 const SYSTEM: [(Grant, &str); 11] = [
-    (Grant::Run, "/usr"),
     (Grant::Read, "/etc/ld.so.cache"),
+    (Grant::Read, system::LINKED_SETTINGS),
     (Grant::Read, "/etc/nsswitch.conf"),
     (Grant::Read, "/etc/passwd"),
     (Grant::Read, "/etc/group"),
@@ -59,12 +65,16 @@ const DEVICES: [&str; 5] = ["/dev/kvm", "/dev/null", "/dev/zero", "/dev/random",
 /// group, and the filter refuses typing into a terminal instead. The pid namespace is left out too:
 /// in one, the viewer's pid reads as 0, and QEMU's D-Bus display then refuses to let it in. Landlock
 /// still keeps QEMU from tracing what's outside its jail, and from signalling it where it has scopes.
-const NAMESPACES: &str = "bwrap --unshare-user --unshare-ipc --unshare-uts --unshare-cgroup-try \
+const NAMESPACES: &str = "--unshare-user --unshare-ipc --unshare-uts --unshare-cgroup-try \
     --tmpfs /tmp --ro-bind /usr /usr --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/bin /bin \
     --symlink usr/sbin /sbin --proc /proc --dev /dev --ro-bind /sys /sys";
+/// Given by its full path, see [`super::program_word`].
+const BUBBLEWRAP: &str = "bwrap";
 /// Already in the namespaces' base.
 const IN_THE_BASE: [&str; 3] = ["/usr", "/proc", "/sys"];
-const PATH: &str = "/usr/bin:/usr/sbin";
+/// A jailed QEMU's `PATH`, which `setarch`, `taskset` and `prlimit` in front of the launcher are also
+/// found on. NixOS has them in its system's programs, which are among the folders a jail grants.
+const PATH: &str = "/usr/bin:/usr/sbin:/run/current-system/sw/bin";
 
 /// The folder above the one QEMU is in: a QEMU in its build folder finds its firmware and libraries
 /// through links to there, and for the system's it's `/usr`.
@@ -85,12 +95,15 @@ impl VmPlan {
         !matches!(self.boot, Boot::Ubuntu(_) | Boot::UbuntuInstall(_))
     }
 
-    /// What QEMU's user network listens on: the agent and the forwards, or for Ubuntu its SSH.
+    /// What QEMU's user network listens on: the agent, the files helper and the forwards, or for
+    /// Ubuntu its SSH.
     fn listened_ports(&self) -> Vec<u16> {
         if !self.has_machine_line() {
             return vec![self.ssh_port()];
         }
         let mut ports = vec![self.agent_port];
+        ports.extend(self.files_port);
+        ports.extend(self.app_windows_port);
         ports.extend(self.forwarded_ports(Protocol::Tcp));
         ports
     }
@@ -122,6 +135,9 @@ impl VmPlan {
     }
 
     fn firmware_code(&self) -> &Path {
+        if let Some(boot) = self.macos_boot() {
+            return &boot.firmware_code;
+        }
         if self.tpm.is_some() { &self.firmware.code_secure } else { &self.firmware.code }
     }
 
@@ -137,6 +153,7 @@ impl VmPlan {
     /// The same, with the card's nodes looked for under `devices`.
     pub(super) fn qemu_jail_plan_under(&self, jail: &QemuJail, devices: &Path) -> Plan {
         let mut plan = Plan { network: self.jail_network(), ..Plan::default() };
+        system::grant_programs(&mut plan);
         for (grant, path) in SYSTEM {
             plan.grant(grant, path);
         }
@@ -156,7 +173,10 @@ impl VmPlan {
         for device in DEVICES {
             plan.grant(Grant::Device, device);
         }
-        plan.grant(Grant::Write, &self.disk);
+        // A throwaway run's disk is the overlay QEMU is handed open, and its own disk is a backing file.
+        if self.throwaway.is_none() {
+            plan.grant(Grant::Write, &self.disk);
+        }
         if self.is_gpu()
             && let Some(disc) = &self.tools_disc
         {
@@ -164,6 +184,8 @@ impl VmPlan {
         }
         self.grant_forwarding(&mut plan, devices);
         self.grant_amd(&mut plan);
+        self.grant_macos(&mut plan);
+        self.grant_android(&mut plan);
         if let Some(folder) = self.shared_folder() {
             plan.grant(Grant::Run, &self.share_program).grant(Grant::Own, folder);
         }
@@ -181,7 +203,15 @@ impl VmPlan {
     /// The jail with the files the disk is built on. Refuses a chain QEMU couldn't open, and a
     /// backing file in the shared folder, where QEMU may write anything.
     pub fn with_backing_files(&self, jail: QemuJail) -> Result<QemuJail> {
-        let backing_files = backing_files(Path::new(&self.disk))?;
+        let mut backing_files = Vec::new();
+        if let Some(disk) = &self.throwaway {
+            backing_files.push(PathBuf::from(disk));
+        }
+        backing_files.extend(backing_files_of(Path::new(self.throwaway.as_ref().unwrap_or(&self.disk)))?);
+        // A throwaway run's Android data disk is an overlay on the machine's own.
+        if let Some(boot) = self.android_boot() {
+            backing_files.extend(backing_files_of(&boot.data)?);
+        }
         let shared = |file: &&PathBuf| self.shared_folder().is_some_and(|folder| file.starts_with(folder));
         if let Some(file) = backing_files.iter().find(shared) {
             return Err(Failure(format!(
@@ -200,6 +230,10 @@ impl VmPlan {
             fd: PASST_FD,
             pid_file: self.run_folder.join(super::PASST_PID_FILE),
             words: self.passt_words(),
+            only_through: self.network.only_through.as_ref().map(|through| launch::OnlyThrough {
+                interface: through.interface.clone(),
+                cut_file: self.run_folder.join(launch::CUT_FILE),
+            }),
         })
     }
 
@@ -219,7 +253,8 @@ impl VmPlan {
     /// bubblewrap's words, with each path of the plan bound at its own place, so the plan means the
     /// same inside.
     fn namespace_words(plan: &Plan, launcher: &Path) -> Vec<String> {
-        let mut words: Vec<String> = NAMESPACES.split_whitespace().map(str::to_owned).collect();
+        let mut words = vec![super::program_word(BUBBLEWRAP)];
+        words.extend(NAMESPACES.split_whitespace().map(str::to_owned));
         let bind = |kind: &str, path: &Path| {
             [kind.to_owned(), path.display().to_string(), path.display().to_string()]
         };
@@ -241,13 +276,34 @@ impl VmPlan {
         words
     }
 
+    /// What goes in front of QEMU with no jail: nothing, but for a machine held to one interface, whose
+    /// passt the launcher starts and guards, as it opens passt and runs QEMU as it is.
+    fn unjailed_words(&self, before_jail: &[String]) -> Vec<String> {
+        let Some(passt) = self.network.only_through.as_ref().and_then(|_| self.passt()) else {
+            return before_jail.to_vec();
+        };
+        let opening = Launch {
+            plan: None,
+            passt: Some(passt),
+            tap: None,
+            unix_sockets: Vec::new(),
+            no_new_unix_sockets: false,
+            reads_own_memory: false,
+            program: Vec::new(),
+        };
+        let mut words = vec![self.launcher.display().to_string()];
+        words.extend(opening.words());
+        words.extend(before_jail.iter().cloned());
+        words
+    }
+
     /// What goes in front of QEMU for a jailed GPU machine, up to the program's own words, with
     /// `before_jail` right before the launcher that jails it. In namespaces, passt and a bridged
     /// network's helper go before bubblewrap: passt has a sandbox of its own, and the helper has to
     /// gain its privileges, which it can't inside. So the launcher runs twice, once to start those
     /// and once inside to jail QEMU.
     pub(super) fn jail_words(&self, before_jail: &[String]) -> Vec<String> {
-        let Some(jail) = &self.jail else { return before_jail.to_vec() };
+        let Some(jail) = &self.jail else { return self.unjailed_words(before_jail) };
         let plan = self.qemu_jail_plan(jail);
         let mut jailing = Launch {
             plan: Some(plan.clone()),
@@ -255,6 +311,7 @@ impl VmPlan {
             tap: self.tap(),
             unix_sockets: self.unix_sockets(),
             no_new_unix_sockets: self.passes_unix_sockets(),
+            reads_own_memory: self.macos_boot().is_some(),
             program: Vec::new(),
         };
         let launcher = jail.launcher.display().to_string();
@@ -267,6 +324,7 @@ impl VmPlan {
                     tap: jailing.tap.take(),
                     unix_sockets: Vec::new(),
                     no_new_unix_sockets: false,
+                    reads_own_memory: false,
                     program: Vec::new(),
                 };
                 words.push(launcher.clone());
@@ -283,74 +341,84 @@ impl VmPlan {
     /// The launcher opens every unix socket QEMU needs, and QEMU may make none, so a QEMU that's been
     /// taken over can't reach the session bus or any other socket of the desktop's, whatever the
     /// kernel's Landlock and with or without namespaces. Only with no sound, as PipeWire's client
-    /// makes its own socket, and only for Windows: the forwarded GPU's device makes the socket its
-    /// frames are offered on.
+    /// makes its own socket.
     pub(super) fn passes_unix_sockets(&self) -> bool {
         self.jail.as_ref().is_some() && self.can_pass_unix_sockets()
     }
 
     /// Whether a jail would hand this QEMU its unix sockets.
     pub fn can_pass_unix_sockets(&self) -> bool {
-        self.sound.is_none() && self.is_gpu()
+        self.sound.is_none()
     }
 
-    fn client_names(&self) -> impl Iterator<Item = (usize, &'static str, &'static str)> + '_ {
-        let tpm = self.tpm.is_some();
-        CLIENT_SOCKETS
-            .into_iter()
-            .enumerate()
-            .filter(move |(_, (id, _))| *id != "tpm" || tpm)
-            .map(|(at, (id, file))| (at, id, file))
-    }
-
+    /// The unix sockets the launcher opens for QEMU, if it opens them, each at its descriptor. All are
+    /// in the run folder: the monitors, the daemon's for a Windows guest, the virtual TPM's, and for
+    /// the forwarded GPU the guest's input and the socket its frames are offered on.
     fn unix_sockets(&self) -> Vec<UnixSocket> {
         if !self.passes_unix_sockets() {
             return Vec::new();
         }
-        let monitors = MONITOR_SOCKETS.iter().enumerate().map(|(at, name)| UnixSocket {
-            path: self.run_folder.join(name),
-            fd: FIRST_UNIX_FD + at as i32,
-            listen: true,
-        });
-        let mut sockets: Vec<UnixSocket> = monitors.collect();
-        let first_client = FIRST_UNIX_FD + MONITOR_SOCKETS.len() as i32;
-        sockets.extend(self.client_names().map(|(at, _, file)| UnixSocket {
-            path: self.run_folder.join(file),
-            fd: first_client + at as i32,
-            listen: false,
-        }));
-        sockets
+        let listening = |file: &'static str| (file, true);
+        let connecting = |file: &'static str| (file, false);
+        let mut files: Vec<(&str, bool)> = MONITOR_SOCKETS.into_iter().map(listening).collect();
+        if self.is_gpu() {
+            files.extend(DAEMON_SOCKETS.map(connecting));
+        }
+        // Ubuntu's own line has no TPM.
+        if self.tpm.is_some() && self.has_machine_line() {
+            files.push(connecting(TPM_SOCKET));
+        }
+        if self.has_forwarded_gpu() {
+            // A Linux the user installed keeps QEMU's own keyboard and pointer.
+            if !self.has_machine_line() {
+                files.push(listening(FORWARDED_INPUT_SOCKET));
+            }
+            files.push(listening(FRAMES_SOCKET));
+        }
+        let at_descriptors = files.into_iter().zip(FIRST_UNIX_FD..);
+        at_descriptors
+            .map(|((file, listen), fd)| UnixSocket { path: self.run_folder.join(file), fd, listen })
+            .collect()
     }
 
-    /// The monitors on the descriptors the launcher opened, and a pid file that names the run folder.
-    pub(super) fn monitors_on_descriptors(&self) -> Vec<String> {
+    /// Where the launcher left this socket of QEMU's, if it opened it.
+    pub(super) fn socket_fd(&self, file: &str) -> Option<i32> {
+        let path = self.run_folder.join(file);
+        self.unix_sockets().into_iter().find(|socket| socket.path == path).map(|socket| socket.fd)
+    }
+
+    /// QEMU's monitors: on the descriptors the launcher opened, or at their paths.
+    pub(super) fn monitor_arguments(&self) -> Vec<String> {
         let mut arguments = Vec::new();
-        for at in 0..MONITOR_SOCKETS.len() {
-            let fd = FIRST_UNIX_FD + at as i32;
-            arguments.extend(words(&[
-                "-chardev",
-                &format!("socket,id=monitor{at},fd={fd},server=on,wait=off"),
-                "-mon",
-                &format!("chardev=monitor{at},mode=control"),
-            ]));
+        for (at, file) in MONITOR_SOCKETS.into_iter().enumerate() {
+            arguments.extend(match self.socket_fd(file) {
+                Some(fd) => words(&[
+                    "-chardev",
+                    &format!("socket,id=monitor{at},fd={fd},server=on,wait=off"),
+                    "-mon",
+                    &format!("chardev=monitor{at},mode=control"),
+                ]),
+                None => words(&["-qmp", &format!("unix:{},server=on,wait=off", self.in_run_folder(file))]),
+            });
         }
-        arguments.extend(words(&["-pidfile", &self.run_folder.join(PID_FILE).display().to_string()]));
         arguments
     }
 
     /// A socket QEMU connects to: on the launcher's descriptor, or by its path.
     pub(super) fn client_socket(&self, id: &str, file: &str) -> String {
-        let first_client = FIRST_UNIX_FD + MONITOR_SOCKETS.len() as i32;
-        let on_fd = self.client_names().find(|(_, name, _)| *name == id);
-        match on_fd {
-            Some((at, _, _)) if self.passes_unix_sockets() => {
-                format!("socket,id={id},fd={}", first_client + at as i32)
-            }
-            _ if id == "tpm" => format!("socket,id={id},path={}", self.run_folder.join(file).display()),
-            _ => format!(
-                "socket,id={id},path={},reconnect-ms={RECONNECT_MS}",
-                self.run_folder.join(file).display()
-            ),
+        let path = self.in_run_folder(file);
+        match self.socket_fd(file) {
+            Some(fd) => format!("socket,id={id},fd={fd}"),
+            None if file == TPM_SOCKET => format!("socket,id={id},path={path}"),
+            None => format!("socket,id={id},path={path},reconnect-ms={RECONNECT_MS}"),
+        }
+    }
+
+    /// A socket QEMU listens on for a device of its own: on the launcher's descriptor, or at its path.
+    pub(super) fn listening_socket(&self, id: &str, file: &str) -> String {
+        match self.socket_fd(file) {
+            Some(fd) => format!("socket,id={id},fd={fd},server=on,wait=off"),
+            None => format!("socket,id={id},path={},server=on,wait=off", self.in_run_folder(file)),
         }
     }
 

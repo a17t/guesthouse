@@ -178,6 +178,16 @@ fn submit(session: &mut TestSession, queue: u32, value: u64) {
     assert_eq!(send(session, &request), SUCCESS.to_le_bytes());
 }
 
+/// Holds a queue or context's later work back until a sync object reaches a value.
+fn gpu_wait(session: &mut TestSession, handle: u32, object: u32, value: u64) {
+    let mut request = message(Command::WaitOnGpu, 0x28);
+    set_u32(&mut request, 0x18, handle);
+    set_u32(&mut request, 0x1C, 1);
+    request.extend_from_slice(&value.to_le_bytes());
+    request.extend_from_slice(&object.to_le_bytes());
+    assert_eq!(status_of(&send(session, &request)), SUCCESS);
+}
+
 fn signal_message(objects: &[u32], contexts: &[u32], values: &[u64]) -> Vec<u8> {
     let mut request = message(Command::SignalSyncObject, 0x38);
     set_u32(&mut request, 0x18, objects.len() as u32);
@@ -189,6 +199,7 @@ fn signal_message(objects: &[u32], contexts: &[u32], values: &[u64]) -> Vec<u8> 
 
 mod copy_bounds;
 mod failing;
+mod first_lock;
 mod frame_ring;
 mod indirect;
 
@@ -199,6 +210,14 @@ mod dispatch {
     fn unknown_commands_are_not_supported() {
         let reply = send(&mut session(), &message(Command::Unknown(68), HEADER_SIZE));
         assert_eq!(status_of(&reply), Status::NOT_SUPPORTED.0);
+    }
+
+    #[test]
+    fn a_refused_command_is_shown_whole_in_hex_and_a_long_one_is_cut() {
+        assert_eq!(Refused(&[0x00, 0xbb, 0x0f]).to_string(), "00bb0f");
+        let long = Refused(&[0xaa; 1025]).to_string();
+        assert_eq!(long.len(), 2 * 1024 + 3);
+        assert!(long.ends_with("aa..."));
     }
 
     #[test]
@@ -441,8 +460,19 @@ mod adapter {
     fn identity_says_whether_messages_may_be_async() {
         let mut session = session();
         session.config.async_messages = true;
+        session.config.keep_cpu_views = false;
         let reply = send(&mut session, &message(Command::GetAdapterIdentity, HEADER_SIZE));
         assert_eq!(u32_at(&reply, 12), Ok(0x40));
+    }
+
+    #[test]
+    fn identity_tells_the_guest_to_keep_cpu_views_by_default() {
+        let reply = send(&mut session(), &message(Command::GetAdapterIdentity, HEADER_SIZE));
+        assert_eq!(u32_at(&reply, 12), Ok(0x20));
+        let mut session = session();
+        session.config.keep_cpu_views = false;
+        let reply = send(&mut session, &message(Command::GetAdapterIdentity, HEADER_SIZE));
+        assert_eq!(u32_at(&reply, 12), Ok(0));
     }
 
     #[test]
@@ -469,6 +499,24 @@ mod adapter {
         assert_eq!(u64_at(&reply, 0), Ok(6 << 30));
         assert_eq!(u64_at(&reply, 8), Ok(0x20000));
         assert_eq!(u64_at(&reply, 24), Ok(3 << 30));
+    }
+
+    #[test]
+    fn the_video_budget_follows_what_the_card_has_free() {
+        let mut session = session();
+        allocate(&mut session, private(0x20000));
+        session.backend_mut().card_free = Some(2 << 30);
+        let reply = send(&mut session, &message(Command::QueryVideoMemory, 0x20));
+        // What the guest has on the card is its own, and 512 MiB is left for the host.
+        assert_eq!(u64_at(&reply, 0), Ok(0x20000 + (2 << 30) - (512 << 20)));
+    }
+
+    #[test]
+    fn a_card_with_plenty_free_leaves_the_budget_as_it_was() {
+        let mut session = session();
+        session.backend_mut().card_free = Some(100 << 30);
+        let reply = send(&mut session, &message(Command::QueryVideoMemory, 0x20));
+        assert_eq!(u64_at(&reply, 0), Ok(6 << 30));
     }
 
     fn reserve(session: &mut TestSession, group: u32, bytes: u64) -> u32 {
@@ -569,6 +617,24 @@ mod allocations {
         assert_eq!(standard::StandardRecord::parse(&record).unwrap().pitch, 512);
     }
 
+    /// The guest locks as much of the program's memory as the answer says, and the memory ends
+    /// where the heap does.
+    #[test]
+    fn a_heap_of_guest_memory_is_made_at_its_own_size() {
+        let mut session = session();
+        let mut describe = message(Command::DescribeStandardAllocation, 0x40);
+        set_u32(&mut describe, 0x18, 4);
+        set_u32(&mut describe, 0x1C, 32);
+        set_u32(&mut describe, 0x28, 0x20_0000);
+        set_u32(&mut describe, 0x2C, 1);
+        set_u32(&mut describe, 0x34, 7);
+        let answer = send(&mut session, &describe);
+        let record = answer[36..68].to_vec();
+        let reply = send(&mut session, &create_message(0x20, &[record]));
+        assert_eq!(status_of(&reply), SUCCESS);
+        assert_eq!(u64_at(&reply, 0x20), Ok(0x20_0000));
+    }
+
     #[test]
     fn a_vendors_data_for_a_standard_surface_is_known_when_handed_back() {
         let mut session = session();
@@ -657,6 +723,27 @@ mod allocations {
     }
 
     #[test]
+    fn the_video_use_is_what_the_cap_counts() {
+        let mut session = session_with(Some(0x3000));
+        assert_eq!(session.video_use(), crate::VideoUse { on_card: 0, spilled: 0, cap: Some(0x3000) });
+        let reply = send(&mut session, &create_message(0, &[private(0x2000)]));
+        assert_eq!(status_of(&reply), SUCCESS);
+        assert_eq!(session.video_use().on_card, 0x2000);
+    }
+
+    #[test]
+    fn a_cap_refusal_says_why_in_the_log() {
+        // Marathon's on a 4 GiB cap: 30 MiB more, with nearly all of it in use.
+        let warning = super::allocation::cap_warning(4 << 30, (4 << 30) - (16 << 20), 30 << 20);
+        assert_eq!(
+            warning,
+            "the machine's video memory cap of 4096 MiB refused 30 MiB more, with 4080 MiB in use. \
+             The program that asked will likely fail. Raise the cap or set it to automatic in the \
+             machine's settings"
+        );
+    }
+
+    #[test]
     fn private_data_the_vendor_refuses_fails_the_whole_call() {
         let mut session = session();
         session.backend_mut().refuse_private_data = true;
@@ -698,12 +785,70 @@ mod allocations {
     }
 
     #[test]
+    fn a_full_card_puts_the_allocation_in_system_memory() {
+        let mut session = session_with(Some(0x3000));
+        session.backend_mut().spill_allowed = true;
+        session.backend_mut().fail_next_allocation = true;
+        let (_, spilled) = allocate(&mut session, private(0x2000));
+        assert!(session.allocations[&spilled].spilled);
+        assert_eq!(session.backend().spilled.len(), 1);
+        // It isn't on the card, so the cap still has room for this one.
+        let (_, on_card) = allocate(&mut session, private(0x2000));
+        assert!(!session.allocations[&on_card].spilled);
+    }
+
+    #[test]
+    fn system_memory_for_a_full_card_stops_at_half_the_guest_s_ram() {
+        // The test guest has 16 GiB, so 8 GiB can go to system memory.
+        let mut session = session();
+        session.backend_mut().spill_allowed = true;
+        session.backend_mut().fail_next_allocation = true;
+        let reply = send(&mut session, &create_message(0, &[private(9 << 30)]));
+        assert_eq!(reply, Status::UNSUCCESSFUL.0.to_le_bytes());
+        assert!(session.backend().spilled.is_empty());
+    }
+
+    #[test]
     fn destroying_a_resource_frees_its_memory() {
         let mut session = session();
         let (resource, _) = allocate(&mut session, private(0x1000));
         destroy(&mut session, resource, &[]);
         assert_eq!(session.backend().live_memory_blocks(), 0);
         assert!(session.allocations.is_empty());
+    }
+
+    /// A guest reset with no goodbye: nothing is destroyed, and all of it has to go anyway.
+    #[test]
+    fn a_guest_that_restarts_frees_what_its_last_start_had() {
+        let mut session = session();
+        let (_, on_card) = allocate(&mut session, private(0x1000));
+        map(&mut session, on_card, 0, 0, 0);
+        let reply = send(&mut session, &create_message(0x20, &[private(0x2000)]));
+        let guest_backed = u32_at(&reply, 0x10).unwrap();
+        let mut pages = message(Command::SetGuestPages, 0x28);
+        set_u32(&mut pages, 0x1C, guest_backed);
+        set_u32(&mut pages, 0x20, 2);
+        [7u64, 9].iter().for_each(|page| pages.extend_from_slice(&page.to_le_bytes()));
+        assert_eq!(status_of(&send(&mut session, &pages)), SUCCESS);
+        // The first map made the fences' block too, which is the daemon's own and stays.
+        assert!(session.fences.block.is_some());
+        assert_eq!(session.backend().live_memory_blocks(), 3);
+        assert_eq!(session.memory().views.len(), 1);
+        assert_eq!(session.backend().live_address_spaces(), 1);
+
+        session.guest_reset();
+        assert!(session.allocations.is_empty());
+        assert!(session.resources.is_empty());
+        assert_eq!(session.backend().live_memory_blocks(), 1);
+        assert!(session.memory().views.is_empty());
+        assert_eq!(session.backend().live_address_spaces(), 0);
+        assert!(session.spaces.is_empty());
+
+        // Each channel says the guest reset, so it comes twice, and the new start gets a fresh table.
+        session.guest_reset();
+        let (_, handle) = allocate(&mut session, private(0x1000));
+        assert_eq!(map(&mut session, handle, 0, 0, 0).1, SUCCESS);
+        assert_eq!(session.backend().live_memory_blocks(), 2);
     }
 
     #[test]
@@ -887,6 +1032,18 @@ mod allocations {
     }
 
     #[test]
+    fn a_lock_after_an_unlock_answers_the_first_address() {
+        // A guest told to keep CPU views uses only the first answer, so every later one must agree.
+        let mut session = session();
+        let (_, handle) = allocate(&mut session, private(0x1000));
+        let first = lock(&mut session, handle);
+        let mut unlock = message(Command::UnlockForCpu, 0x28);
+        set_u32(&mut unlock, 0x1C, handle);
+        assert_eq!(status_of(&send(&mut session, &unlock)), SUCCESS);
+        assert_eq!(lock(&mut session, handle), first);
+    }
+
+    #[test]
     fn locking_an_unknown_allocation_is_refused() {
         assert_eq!(lock(&mut session(), 0x999).0, Status::INVALID_PARAMETER.0);
     }
@@ -909,6 +1066,88 @@ mod allocations {
         let (_, second) = lock(&mut session, handle);
         assert_eq!(second, first);
         assert_eq!(session.memory().read_u64(second).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_hardware_queue_submissions_commands_reach_the_backend_and_a_contexts_names_none() {
+        let mut session = session();
+        let context = create_context(&mut session, 0);
+        let (queue, _, _) = create_queue(&mut session, context);
+        let mut request = message(Command::SubmitToHardwareQueue, 0x50);
+        set_u32(&mut request, 0x18, queue);
+        set_u64(&mut request, 0x20, 1);
+        set_u64(&mut request, 0x28, 0x255_F13C_0000);
+        set_u32(&mut request, 0x30, 0x1040);
+        assert_eq!(send(&mut session, &request), SUCCESS.to_le_bytes());
+        let named = guesthouse_backend::CommandBuffer { address: 0x255_F13C_0000, length: 0x1040 };
+        assert_eq!(session.backend().last_commands, Some(named));
+        let mut request = message(Command::SubmitToContext, 0x198);
+        set_u32(&mut request, 0x34, context);
+        send(&mut session, &request);
+        assert_eq!(session.backend().last_commands, None);
+    }
+
+    fn submit_to_context(session: &mut TestSession, context: u32, commands: u64, length: u32) {
+        let mut request = message(Command::SubmitToContext, 0x198);
+        set_u64(&mut request, 0x18, commands);
+        set_u32(&mut request, 0x20, length);
+        set_u32(&mut request, 0x34, context);
+        assert_eq!(send(session, &request), SUCCESS.to_le_bytes());
+    }
+
+    #[test]
+    fn a_backend_that_runs_a_contexts_commands_is_given_them_and_each_submission_counts_up() {
+        let mut session = session();
+        session.backend_mut().context_commands = true;
+        let context = create_context(&mut session, 0);
+        submit_to_context(&mut session, context, 0x6_0001_0040, 0x400);
+        let named = guesthouse_backend::CommandBuffer { address: 0x6_0001_0040, length: 0x400 };
+        assert_eq!(session.backend().last_commands, Some(named));
+        submit_to_context(&mut session, context, 0x6_0001_0040, 0);
+        assert_eq!(session.backend().last_commands, None, "a length of zero names none");
+        // The stand-in finishes each unrun, and the context's queue fence still counts up, so work
+        // that does start after it has a value nothing has written yet.
+        let queue = session.context_queues[&context][0];
+        let fence = session.queues[&queue].fence;
+        assert_eq!(session.memory().read_u64(fence).unwrap(), 2);
+        session.backend_mut().run_work = true;
+        submit_to_context(&mut session, context, 0x6_0001_0040, 0x400);
+        assert_eq!(session.queues[&queue].last_fence, Some(3));
+        assert_eq!(session.memory().read_u64(fence).unwrap(), 2, "running, so not written yet");
+    }
+
+    #[test]
+    fn a_backend_that_doesnt_keeps_its_context_queue_fence_at_one() {
+        let mut session = session();
+        let context = create_context(&mut session, 0);
+        submit_to_context(&mut session, context, 0x6_0001_0040, 0x400);
+        submit_to_context(&mut session, context, 0x6_0001_0040, 0x400);
+        let queue = session.context_queues[&context][0];
+        assert_eq!(session.queues[&queue].last_fence, None);
+        assert_eq!(session.memory().read_u64(session.queues[&queue].fence).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_monitored_fence_is_found_by_its_gpu_address_for_the_process_that_holds_it() {
+        let mut session = session();
+        let (_, gpu_address, fence) = create_fence(&mut session, 0);
+        session.backend_mut().ask_monitored = Some(gpu_address);
+        let context = create_context(&mut session, 0);
+        submit_to_context(&mut session, context, 0, 0);
+        assert_eq!(session.backend().monitored_found, Some(Some(fence)));
+        session.backend_mut().ask_monitored = Some(gpu_address + 8);
+        submit_to_context(&mut session, context, 0, 0);
+        assert_eq!(session.backend().monitored_found, Some(None), "no fence there");
+        // Another process's work may not name it.
+        session.backend_mut().ask_monitored = Some(gpu_address);
+        let mut request = message(Command::CreateContext, 0x34);
+        set_u32(&mut request, 8, PROCESS + 0x1000);
+        let other = u32_at(&send(&mut session, &request), 0x18).unwrap();
+        let mut request = message(Command::SubmitToContext, 0x198);
+        set_u32(&mut request, 8, PROCESS + 0x1000);
+        set_u32(&mut request, 0x34, other);
+        send(&mut session, &request);
+        assert_eq!(session.backend().monitored_found, Some(None));
     }
 
     #[test]
@@ -969,6 +1208,66 @@ mod allocations {
         map(&mut session, written, 0, 0, 0);
         submit(&mut session, queue, 1);
         assert_eq!(lock(&mut session, written).0, Status::SUCCESS.0);
+        assert_eq!(session.backend().preserved.len(), 1);
+    }
+
+    /// A session whose work runs to the end at once, on a card whose new memory is zero.
+    fn on_zeroing_card() -> (TestSession, u32) {
+        let mut session = session();
+        session.backend_mut().run_work = true;
+        session.backend_mut().run_work_at_once = true;
+        session.backend_mut().new_memory_is_zero = true;
+        let context = create_context(&mut session, 0);
+        let (queue, _, _) = create_queue(&mut session, context);
+        (session, queue)
+    }
+
+    #[test]
+    fn memory_nothing_wrote_since_it_was_mapped_moves_without_a_copy() {
+        let (mut session, queue) = on_zeroing_card();
+        submit(&mut session, queue, 1);
+        let (_, fresh) = allocate(&mut session, private(0x1000));
+        map(&mut session, fresh, 0, 0, 0);
+        let (status, address) = lock(&mut session, fresh);
+        assert_eq!(status, Status::SUCCESS.0);
+        assert!(session.backend().preserved.is_empty(), "the work ran before it was mapped");
+        let mut pages = [0xFFu8; 0x1000];
+        session.memory_mut().read_bytes(address, &mut pages);
+        assert_eq!(pages, [0u8; 0x1000], "and the guest reads what new video memory holds");
+    }
+
+    #[test]
+    fn memory_mapped_while_work_ran_is_copied_however_it_was_mapped_since() {
+        let (mut session, queue) = on_zeroing_card();
+        let (_, written) = allocate(&mut session, private(0x1000));
+        map(&mut session, written, 0, 0, 0);
+        submit(&mut session, queue, 1);
+        // A second mapping, made after the work, doesn't make the first one's time forgotten.
+        map(&mut session, written, 0, 0, 0);
+        assert_eq!(lock(&mut session, written).0, Status::SUCCESS.0);
+        assert_eq!(session.backend().preserved.len(), 1, "the work may have written it");
+    }
+
+    #[test]
+    fn memory_in_a_space_with_work_that_never_ends_is_always_copied() {
+        let (mut session, queue) = on_zeroing_card();
+        session.backend_mut().run_work_at_once = false;
+        session.backend_mut().work_stays = true;
+        submit(&mut session, queue, 1);
+        let (_, fresh) = allocate(&mut session, private(0x1000));
+        map(&mut session, fresh, 0, 0, 0);
+        assert_eq!(lock(&mut session, fresh).0, Status::SUCCESS.0);
+        assert_eq!(session.backend().preserved.len(), 1, "the ring writes without a word here");
+    }
+
+    #[test]
+    fn a_card_whose_new_memory_is_not_known_to_be_zero_is_always_copied() {
+        let (mut session, queue) = on_zeroing_card();
+        session.backend_mut().new_memory_is_zero = false;
+        submit(&mut session, queue, 1);
+        let (_, fresh) = allocate(&mut session, private(0x1000));
+        map(&mut session, fresh, 0, 0, 0);
+        assert_eq!(lock(&mut session, fresh).0, Status::SUCCESS.0);
         assert_eq!(session.backend().preserved.len(), 1);
     }
 }
@@ -1063,7 +1362,7 @@ mod mappings {
         assert_eq!(second - first, crate::ALLOCATION_ALIGN);
     }
 
-    fn operation(kind: u32, address: u64, size: u64, third: u64, offset: u64) -> Vec<u8> {
+    pub(super) fn operation(kind: u32, address: u64, size: u64, third: u64, offset: u64) -> Vec<u8> {
         let mut bytes = vec![0; 64];
         set_u32(&mut bytes, 0, kind);
         set_u64(&mut bytes, 8, address);
@@ -1077,7 +1376,7 @@ mod mappings {
         update_with_flags(session, fence, value, 0, operations)
     }
 
-    fn update_with_flags(
+    pub(super) fn update_with_flags(
         session: &mut TestSession,
         fence: u32,
         value: u64,
@@ -1159,6 +1458,128 @@ mod mappings {
         assert_eq!(held.map(|m| m.driver_protection), Some(0x0400));
     }
 
+    /// Private data for an allocation whose memory has a kind of its own, as a depth surface's has.
+    fn of_kind(size: u64, kind: u32) -> Vec<u8> {
+        let mut data = private(size);
+        data.resize(36, 0);
+        set_u32(&mut data, 32, kind);
+        data
+    }
+
+    fn reserve(session: &mut TestSession, size: u64) -> u64 {
+        let mut request = message(Command::ReserveGpuAddresses, 0x40);
+        set_u64(&mut request, 0x38, size);
+        u64_at(&send(session, &request), 0).unwrap()
+    }
+
+    /// The driver protection the backend was given for the last map at an address.
+    fn mapped_with(session: &mut TestSession, address: u64) -> Option<u64> {
+        let mapped = &session.backend_mut().mapped_protections;
+        mapped.iter().rev().find(|map| map.0 == address).map(|map| map.1)
+    }
+
+    #[test]
+    fn a_heap_mapped_into_a_described_surfaces_range_is_mapped_as_that_surface() {
+        let mut session = session();
+        let (_, heap) = allocate(&mut session, private(0x20_0000));
+        let (sync, _, _) = create_fence(&mut session, 0);
+        // The driver says what the image is, sets a range aside for it, then maps the heap there.
+        allocate(&mut session, of_kind(0x1_0000, 5));
+        let image = reserve(&mut session, 0x3_0000);
+        let next = reserve(&mut session, 0x2_0000);
+        allocate(&mut session, private(0x1_0000));
+        let other = reserve(&mut session, 0x2_0000);
+        update(&mut session, sync, 0, &[protected(image, 0x1_0000, heap, 0, 1)]);
+        update(&mut session, sync, 1, &[protected(image + 0x1_0000, 0x1_0000, heap, 0x1_0000, 1)]);
+        update(&mut session, sync, 2, &[protected(next, 0x1_0000, heap, 0x2_0000, 1)]);
+        update(&mut session, sync, 3, &[protected(other, 0x1_0000, heap, 0x3_0000, 1)]);
+        assert_eq!(mapped_with(&mut session, image), Some(0x0501));
+        assert_eq!(mapped_with(&mut session, image + 0x1_0000), Some(0x0501), "every piece of it");
+        assert_eq!(mapped_with(&mut session, next), Some(0x0501), "ranges up to the next allocation");
+        assert_eq!(mapped_with(&mut session, other), Some(1), "a range after another allocation");
+    }
+
+    #[test]
+    fn a_description_destroyed_before_its_range_still_describes_it() {
+        let mut session = session();
+        let (_, heap) = allocate(&mut session, private(0x20_0000));
+        let (sync, _, _) = create_fence(&mut session, 0);
+        let (resource, description) = allocate(&mut session, of_kind(0x1_0000, 5));
+        destroy(&mut session, resource, &[description]);
+        let image = reserve(&mut session, 0x3_0000);
+        update(&mut session, sync, 0, &[protected(image, 0x1_0000, heap, 0, 1)]);
+        assert_eq!(mapped_with(&mut session, image), Some(0x0501));
+    }
+
+    #[test]
+    fn a_description_from_another_process_describes_the_next_range() {
+        const DESCRIBING_PROCESS: u32 = 0x4000_3000;
+        let mut session = session();
+        let (_, heap) = allocate(&mut session, private(0x20_0000));
+        let (sync, _, _) = create_fence(&mut session, 0);
+        let mut request = create_message(0, &[of_kind(0x1_0000, 5)]);
+        set_u32(&mut request, 8, DESCRIBING_PROCESS);
+        assert_eq!(status_of(&send(&mut session, &request)), SUCCESS);
+        let image = reserve(&mut session, 0x3_0000);
+        update(&mut session, sync, 0, &[protected(image, 0x1_0000, heap, 0, 1)]);
+        assert_eq!(mapped_with(&mut session, image), Some(0x0501));
+    }
+
+    #[test]
+    fn a_later_range_of_a_described_ones_size_is_for_the_same_kind_of_surface() {
+        let mut session = session();
+        let (_, heap) = allocate(&mut session, private(0x20_0000));
+        let (sync, _, _) = create_fence(&mut session, 0);
+        allocate(&mut session, of_kind(0x1_0000, 5));
+        reserve(&mut session, 0x13_0000);
+        allocate(&mut session, of_kind(0x1_0000, 5));
+        reserve(&mut session, 0x3_0000);
+        allocate(&mut session, private(0x1_0000));
+        let second = reserve(&mut session, 0x13_0000);
+        let small = reserve(&mut session, 0x3_0000);
+        update(&mut session, sync, 0, &[protected(second, 0x1_0000, heap, 0, 1)]);
+        update(&mut session, sync, 1, &[protected(small, 0x1_0000, heap, 0x1_0000, 1)]);
+        assert_eq!(mapped_with(&mut session, second), Some(0x0501));
+        assert_eq!(mapped_with(&mut session, small), Some(1), "too common a size to go by");
+    }
+
+    #[test]
+    fn a_ranges_own_driver_protection_reaches_the_maps_made_in_it() {
+        let mut session = session();
+        let (_, heap) = allocate(&mut session, private(0x20_0000));
+        let (sync, _, _) = create_fence(&mut session, 0);
+        let mut request = message(Command::ReserveGpuAddresses, 0x50);
+        set_u64(&mut request, 0x38, 0x2_0000);
+        set_u64(&mut request, 0x48, 0x0300);
+        let range = u64_at(&send(&mut session, &request), 0).unwrap();
+        update(&mut session, sync, 0, &[protected(range, 0x1_0000, heap, 0, 1)]);
+        assert_eq!(mapped_with(&mut session, range), Some(0x0301));
+    }
+
+    #[test]
+    fn a_surface_with_an_address_of_its_own_describes_no_range() {
+        let mut session = session();
+        let (_, heap) = allocate(&mut session, private(0x20_0000));
+        let (sync, _, _) = create_fence(&mut session, 0);
+        let (_, depth) = allocate(&mut session, of_kind(0x1_0000, 5));
+        map(&mut session, depth, 0, 0, 16);
+        let range = reserve(&mut session, 0x2_0000);
+        update(&mut session, sync, 0, &[protected(range, 0x1_0000, heap, 0, 1)]);
+        assert_eq!(mapped_with(&mut session, range), Some(1));
+    }
+
+    #[test]
+    fn only_the_newest_allocation_describes_the_range_asked_for_next() {
+        let mut session = session();
+        let (_, heap) = allocate(&mut session, private(0x20_0000));
+        let (sync, _, _) = create_fence(&mut session, 0);
+        allocate(&mut session, of_kind(0x1_0000, 5));
+        allocate(&mut session, private(0x1_0000));
+        let range = reserve(&mut session, 0x2_0000);
+        update(&mut session, sync, 0, &[protected(range, 0x1_0000, heap, 0, 1)]);
+        assert_eq!(mapped_with(&mut session, range), Some(1));
+    }
+
     #[test]
     fn repeating_a_protected_map_is_skipped_but_another_value_maps_again() {
         let mut session = session();
@@ -1224,6 +1645,20 @@ mod mappings {
             session.allocations[&handle].mappings.iter().map(|m| (m.address, m.first)).collect();
         pieces.sort();
         assert_eq!(pieces, [(0x5000_0000, 0), (0x5000_2000, 0x2000)]);
+    }
+
+    #[test]
+    fn a_range_comes_back_once_an_update_unmaps_the_guest_s_own_page_in_it() {
+        use super::address_reuse::{map_buffer, padded_buffer};
+        let mut session = session();
+        let (base, buffer, _) = padded_buffer(&mut session);
+        destroy(&mut session, buffer, &[]);
+        let (elsewhere, status) = map_buffer(&mut session, PROCESS);
+        assert_eq!(status, SUCCESS);
+        assert_ne!(elsewhere, base);
+        let (sync, _, _) = create_fence(&mut session, 0);
+        update(&mut session, sync, 0, &[operation(1, base + 0x87_0000, 0x1_0000, 0, 0)]);
+        assert_eq!(map_buffer(&mut session, PROCESS), (base, SUCCESS));
     }
 
     #[test]
@@ -1716,6 +2151,27 @@ mod queues {
     }
 
     #[test]
+    fn a_reply_can_go_before_the_doorbell_which_is_then_rung_in_order() {
+        let mut session = session();
+        session.backend_mut().run_work = true;
+        let context = create_context(&mut session, 0);
+        let (queue, _, _) = create_queue(&mut session, context);
+        let mut request = message(Command::SubmitToHardwareQueue, 0x50);
+        set_u32(&mut request, 0x18, queue);
+        set_u64(&mut request, 0x20, 1);
+        let mut out = Vec::new();
+        let answer = session.handle_message_reply_first(&request, Some(ReplyTicket::default()), &mut out);
+        assert_eq!((answer, out), (Answer::Now, SUCCESS.to_le_bytes().to_vec()));
+        assert!(session.backend().doorbells.is_empty(), "the reply goes first");
+        session.ring_after_reply();
+        assert_eq!(session.backend().doorbells, [(queue, 1)]);
+        // Nothing is left for later, and plain handling rings at once as before.
+        session.ring_after_reply();
+        submit(&mut session, queue, 2);
+        assert_eq!(session.backend().doorbells, [(queue, 1), (queue, 2)]);
+    }
+
+    #[test]
     fn a_backend_can_take_gpu_addresses_for_its_channels() {
         let mut session = session();
         session.backend_mut().run_work = true;
@@ -1743,15 +2199,6 @@ mod queues {
         assert_eq!(session.memory().read_u64(session.queues[&queue].fence).unwrap(), 1);
         assert_eq!(status_of(&send(&mut session, &request)), SUCCESS);
         assert_eq!(session.context_queues[&context], [queue]);
-    }
-
-    fn gpu_wait(session: &mut TestSession, handle: u32, object: u32, value: u64) {
-        let mut request = message(Command::WaitOnGpu, 0x28);
-        set_u32(&mut request, 0x18, handle);
-        set_u32(&mut request, 0x1C, 1);
-        request.extend_from_slice(&value.to_le_bytes());
-        request.extend_from_slice(&object.to_le_bytes());
-        assert_eq!(status_of(&send(session, &request)), SUCCESS);
     }
 
     #[test]
@@ -1790,6 +2237,48 @@ mod queues {
         assert!(!session.queues[&queue].failed);
         assert_eq!(session.memory().read_u64(fence).unwrap(), 0, "the GPU writes the fence, not the host");
         assert!(session.gates.is_empty());
+    }
+
+    #[test]
+    fn a_doorbell_refused_until_a_time_is_rung_then_without_hurry_and_other_queues_go_on() {
+        let mut session = session();
+        session.backend_mut().run_work = true;
+        let start = Instant::now();
+        let not_before = start + Duration::from_millis(1500);
+        session.backend_mut().ring_not_before = Some(not_before);
+        let context = create_context(&mut session, 0);
+        let (queue, _, _) = create_queue(&mut session, context);
+        let (other, _, _) = create_queue(&mut session, context);
+        submit(&mut session, queue, 1);
+        submit(&mut session, queue, 2);
+        assert!(session.backend().doorbells.is_empty());
+        // Nothing is urgent while the queue waits for its time: the daemon polls at its own pace.
+        assert_eq!(session.poll(start), Waiting::Background);
+        // Another queue's work goes on at once.
+        submit(&mut session, other, 1);
+        assert_eq!(session.backend().doorbells, [(other, 1)]);
+        // The doorbell isn't rung again before its time, which the stand-in would take.
+        assert_eq!(session.poll(not_before - Duration::from_millis(1)), Waiting::Background);
+        assert_eq!(session.backend().doorbells, [(other, 1)]);
+        let _ = session.poll(not_before);
+        assert_eq!(session.backend().doorbells, [(other, 1), (queue, 1), (queue, 2)]);
+        assert!(session.gates.is_empty() && session.rings_not_before.is_empty());
+    }
+
+    #[test]
+    fn a_queue_that_goes_while_it_waits_for_its_time_leaves_nothing_behind() {
+        let mut session = session();
+        session.backend_mut().run_work = true;
+        let start = Instant::now();
+        session.backend_mut().ring_not_before = Some(start + Duration::from_secs(1));
+        let context = create_context(&mut session, 0);
+        let (queue, _, _) = create_queue(&mut session, context);
+        submit(&mut session, queue, 1);
+        assert_eq!(session.rings_not_before.len(), 1);
+        session.close_queue(queue);
+        assert!(session.rings_not_before.is_empty());
+        assert_eq!(session.poll(start + Duration::from_secs(2)), Waiting::Nothing);
+        assert!(session.backend().doorbells.is_empty());
     }
 
     #[test]
@@ -2176,6 +2665,32 @@ mod held_replies {
     }
 
     #[test]
+    fn an_update_maps_over_a_free_still_waiting_for_the_gpu() {
+        // Marathon on an RTX 3070: a freed allocation's unmap waited behind busy queues, its range
+        // came back to the guest, and an update mapping something else there was refused by the
+        // driver, as the old pages were still in place. The device failed straight after.
+        let (mut session, queue, _) = busy_queue(1000);
+        let (sync, _, _) = create_fence(&mut session, 0);
+        let (first_resource, first) = allocate(&mut session, private(0x2000));
+        let (_, second) = allocate(&mut session, private(0x2000));
+        let at = 0x5000_0000;
+        let map_first = [super::mappings::operation(0, at, 0x2000, u64::from(first), 0)];
+        assert_eq!(
+            status_of(&super::mappings::update_with_flags(&mut session, sync, 1, 1, &map_first)),
+            SUCCESS
+        );
+        let _ = send_with_ticket(&mut session, &submission(queue, 1));
+        destroy(&mut session, first_resource, &[first]);
+        assert!(!session.deferred.is_empty(), "the free should wait for the queue");
+        let map_second = [super::mappings::operation(0, at, 0x2000, u64::from(second), 0)];
+        assert_eq!(
+            status_of(&super::mappings::update_with_flags(&mut session, sync, 2, 1, &map_second)),
+            SUCCESS
+        );
+        assert_eq!(session.allocations[&second].mappings.len(), 1);
+    }
+
+    #[test]
     fn a_ring_with_room_answers_at_once() {
         let (mut session, queue, _) = busy_queue(100);
         assert_eq!(send_with_ticket(&mut session, &submission(queue, 1)).0, Answer::Now);
@@ -2330,6 +2845,60 @@ mod held_replies {
         submit(&mut session, queue, 1);
         let _ = send_with_ticket(&mut session, &copy(context, source, target));
         let _ = session.poll(Instant::now() + Duration::from_secs(1));
+        assert_eq!(session.backend().copies.len(), 1);
+    }
+
+    #[test]
+    fn a_blocking_copy_of_an_unfinished_frame_goes_to_a_card_that_holds_it() {
+        let mut session = session();
+        session.backend_mut().run_work = true;
+        session.backend_mut().copies_after_work = true;
+        session.config.frame_wait = Duration::from_secs(60);
+        let context = create_context(&mut session, 0);
+        let (queue, _, fence) = create_queue(&mut session, context);
+        let (_, source, _, target) = surfaces(&mut session);
+        session.set_copy_order(crate::CopyOrder::Blocking);
+        submit(&mut session, queue, 1);
+        let started = Instant::now();
+        let (answer, reply) = send_with_ticket(&mut session, &copy(context, source, target));
+        assert_eq!(answer, Answer::Now);
+        assert_eq!(reply, Status::SUCCESS.0.to_le_bytes());
+        assert!(started.elapsed() < Duration::from_secs(10), "the message thread didn't wait for the frame");
+        assert_eq!(session.backend().copied_after, vec![vec![(fence, 1)]]);
+        assert_eq!(session.backend().copies.len(), 1);
+    }
+
+    #[test]
+    fn a_blocking_copy_of_a_finished_frame_is_copied_the_usual_way() {
+        let mut session = session();
+        session.backend_mut().run_work = true;
+        session.backend_mut().copies_after_work = true;
+        session.config.frame_wait = Duration::from_secs(60);
+        let context = create_context(&mut session, 0);
+        let (queue, _, fence) = create_queue(&mut session, context);
+        let (_, source, _, target) = surfaces(&mut session);
+        session.set_copy_order(crate::CopyOrder::Blocking);
+        submit(&mut session, queue, 1);
+        session.memory_mut().write_u64(fence, 1).unwrap();
+        let _ = send_with_ticket(&mut session, &copy(context, source, target));
+        assert!(session.backend().copied_after.is_empty());
+        assert_eq!(session.backend().copies.len(), 1);
+    }
+
+    #[test]
+    fn a_blocking_copy_waits_for_its_frame_when_the_card_cant_hold_it() {
+        let mut session = session();
+        session.backend_mut().run_work = true;
+        session.config.frame_wait = Duration::from_millis(20);
+        let context = create_context(&mut session, 0);
+        let (queue, _, _) = create_queue(&mut session, context);
+        let (_, source, _, target) = surfaces(&mut session);
+        session.set_copy_order(crate::CopyOrder::Blocking);
+        submit(&mut session, queue, 1);
+        let started = Instant::now();
+        let (answer, _) = send_with_ticket(&mut session, &copy(context, source, target));
+        assert_eq!(answer, Answer::Now);
+        assert!(started.elapsed() >= Duration::from_millis(20), "it waited out the frame's time");
         assert_eq!(session.backend().copies.len(), 1);
     }
 
@@ -2555,6 +3124,93 @@ mod address_reuse {
         assert_eq!(reserve(&mut session, 0x10000), reserved);
         let (_, handle) = allocate(&mut session, private(0x1000));
         assert_eq!(map(&mut session, handle, 0, 0, 0).0, mapped);
+    }
+
+    /// Intel's driver asks to map a page more than a buffer holds, then maps a page of its own over
+    /// that last page. Returns where the buffer went, its resource, and the page's resource.
+    pub(super) fn padded_buffer(session: &mut TestSession) -> (u64, u32, u32) {
+        let (buffer_resource, buffer) = allocate(session, private(0x87_0000));
+        let (base, status) = map(session, buffer, 0, 0, 0x880);
+        assert_eq!(status, SUCCESS);
+        let (pad_resource, pad) = allocate(session, private(0x1_0000));
+        assert_eq!(map(session, pad, base + 0x87_0000, 0, 0x10), (base + 0x87_0000, SUCCESS));
+        (base, buffer_resource, pad_resource)
+    }
+
+    /// A buffer as [`padded_buffer`] makes, mapped where the host chooses.
+    pub(super) fn map_buffer(session: &mut TestSession, process: u32) -> (u64, u32) {
+        let mut request = create_message(0, &[private(0x87_0000)]);
+        set_u32(&mut request, 8, process);
+        let reply = send(session, &request);
+        assert_eq!(status_of(&reply), SUCCESS);
+        let mut request = message(Command::MapGpuAddresses, 0x50);
+        set_u32(&mut request, 8, process);
+        set_u32(&mut request, 0x38, u32_at(&reply, 0x10).unwrap());
+        set_u64(&mut request, 0x48, 0x880);
+        let reply = send(session, &request);
+        (u64_at(&reply, 0).unwrap(), u32_at(&reply, 16).unwrap())
+    }
+
+    #[test]
+    fn a_freed_reservation_is_reserved_again_with_the_guest_s_pages_still_in_it() {
+        let mut session = session();
+        let range = reserve(&mut session, 0x2_0000);
+        let (_, page) = allocate(&mut session, private(0x1_0000));
+        assert_eq!(map(&mut session, page, range + 0x1_0000, 0, 0x10), (range + 0x1_0000, SUCCESS));
+        free(&mut session, range);
+        // The guest's next map there clears what it left, as it does in any range it holds.
+        assert_eq!(reserve(&mut session, 0x2_0000), range);
+    }
+
+    #[test]
+    fn a_range_with_the_guest_s_own_page_in_it_is_not_handed_out_again() {
+        let mut session = session();
+        let (base, buffer, _) = padded_buffer(&mut session);
+        destroy(&mut session, buffer, &[]);
+        let (address, status) = map_buffer(&mut session, PROCESS);
+        assert_eq!(status, SUCCESS);
+        assert_ne!(address, base, "the guest's page is still at {:#x}", base + 0x87_0000);
+    }
+
+    #[test]
+    fn a_range_comes_back_once_the_guest_s_own_page_in_it_goes() {
+        let mut session = session();
+        let (base, buffer, pad) = padded_buffer(&mut session);
+        destroy(&mut session, buffer, &[]);
+        assert_eq!(map_buffer(&mut session, PROCESS).1, SUCCESS);
+        destroy(&mut session, pad, &[]);
+        assert_eq!(map_buffer(&mut session, PROCESS), (base, SUCCESS));
+    }
+
+    #[test]
+    fn the_guest_s_own_page_in_a_range_keeps_it_from_other_processes_too() {
+        let mut session = session();
+        let (base, buffer, _) = padded_buffer(&mut session);
+        destroy(&mut session, buffer, &[]);
+        let (address, status) = map_buffer(&mut session, PROCESS + 0x1000);
+        assert_eq!(status, SUCCESS);
+        assert_ne!(address, base, "an address handed out has to work in every space");
+    }
+}
+
+mod backend_polling {
+    use super::*;
+
+    #[test]
+    fn work_only_polling_notices_is_polled_with_nothing_else_waiting_and_soon_again() {
+        let mut session = session();
+        assert_eq!(session.poll(Instant::now()), Waiting::Nothing);
+        assert_eq!(session.backend().work_polls, 0, "nothing to look at");
+        session.backend_mut().needs_polling = true;
+        assert_eq!(session.poll(Instant::now()), Waiting::Background, "looked at again before long");
+        assert_eq!(session.backend().work_polls, 1);
+    }
+
+    #[test]
+    fn a_wake_from_the_gpu_is_handed_to_the_backend() {
+        let mut session = session();
+        session.gpu_woke(Instant::now());
+        assert_eq!(session.backend().wakes, 1);
     }
 }
 

@@ -74,7 +74,7 @@ make_toolbox() {
     for tool in $TOOLS; do
         ln -s "$(command -v "$tool")" "$T/bin/$tool"
     done
-    for stand_in in curl sudo pkexec ldconfig chown; do
+    for stand_in in curl sudo pkexec ldconfig chown apparmor_parser; do
         ln -s "$HERE/stand-ins/$stand_in" "$T/bin/$stand_in"
     done
     for manager in dnf apt-get pacman zypper usermod gpasswd; do
@@ -125,7 +125,7 @@ new_test() {
     for library in libepoxy.so.0 libgbm.so.1 libEGL.so.1 libdrm.so.2; do printf 'gl' >"$T/libraries/$library"; done
     printf 'amdgpu_device_initialize2' >"$T/libraries/libdrm_amdgpu.so.1"
     printf 'capng' >"$T/libraries/libcap-ng.so.0"
-    unset LIBRARIES_PRESENT SUDO_FAILS FAKE_GPU_REFUSED FAKE_GTK FAKE_AMD HELPER_VERSION
+    unset LIBRARIES_PRESENT SUDO_FAILS FAKE_GPU_REFUSED FAKE_GTK FAKE_AMD FAKE_INTEL HELPER_VERSION
     FIRMWARE_HERE=no
     OSTREE=no
     KVM_CLOSED=no
@@ -139,6 +139,9 @@ new_test() {
 sandbox() {
     local options=(--ro-bind / / --dev-bind /dev /dev --bind "$T" "$T" --tmpfs /run
         --ro-bind "$T/os-release" /usr/lib/os-release)
+    # Some distros, CachyOS for one, keep /etc/os-release as a file of its own. Where it's a link, as on
+    # Ubuntu, it leads to the one above, and bubblewrap can't mount onto a link.
+    [ -L /etc/os-release ] || options+=(--ro-bind "$T/os-release" /etc/os-release)
     [ "$OSTREE" = no ] || options+=(--ro-bind "$T/os-release" /run/ostree-booted)
     [ "$KVM_CLOSED" = no ] || options+=(--ro-bind "$T/closed-kvm" /dev/kvm)
     mkdir -p "$T/firmware"
@@ -150,7 +153,7 @@ sandbox() {
     [ "$WITHOUT_NAMESPACE" = no ] || wrapper=()
     env -i HOME="$H" PATH="$T/bin" XDG_RUNTIME_DIR="$T/runtime" STAND_IN_LOG="$T/log" \
         FAKE_RELEASES="$T/releases" FAKE_LIBRARIES="$T/libraries" LIBRARIES_PRESENT="${LIBRARIES_PRESENT:-}" \
-        FAKE_FIRMWARE="$T/firmware" SUDO_FAILS="${SUDO_FAILS:-}" FAKE_GPU_REFUSED="${FAKE_GPU_REFUSED:-}" FAKE_AMD="${FAKE_AMD:-}" FAKE_GTK="${FAKE_GTK-4.20}" \
+        DBUS_SESSION_BUS_ADDRESS="${FAKE_SESSION_BUS:-}" FAKE_FIRMWARE="$T/firmware" SUDO_FAILS="${SUDO_FAILS:-}" FAKE_GPU_REFUSED="${FAKE_GPU_REFUSED:-}" FAKE_AMD="${FAKE_AMD:-}" FAKE_INTEL="${FAKE_INTEL:-}" FAKE_GTK="${FAKE_GTK-4.20}" \
         "${wrapper[@]}" "$@"
 }
 
@@ -183,9 +186,11 @@ install_version() {
     answering 'yes\n' "$SHELL_UNDER_TEST" "$(script_for "$1")" "${@:2}"
 }
 
-# The repo's, with the helper's folder in reach.
+# The repo's, with the helper's folder and AppArmor's files in reach.
 uninstaller() {
-    sed "s|^BRIDGE_HELPER_FOLDER=.*|BRIDGE_HELPER_FOLDER=$T/system/libexec/guesthouse|" "$REPO/uninstall.sh" \
+    sed -e "s|^BRIDGE_HELPER_FOLDER=.*|BRIDGE_HELPER_FOLDER=$T/system/libexec/guesthouse|" \
+        -e "s|^SWTPM_PROFILE=.*|SWTPM_PROFILE=$T/system/apparmor.d/usr.bin.swtpm|" \
+        -e "s|^SWTPM_LOCAL=.*|SWTPM_LOCAL=$T/system/apparmor.d/local/usr.bin.swtpm|" "$REPO/uninstall.sh" \
         >"$T/uninstall.sh"
     printf '%s' "$T/uninstall.sh"
 }
@@ -213,6 +218,7 @@ done
 whole_run=
 if [ $# -eq 0 ]; then
     whole_run=yes
+    # shellcheck disable=SC2046 # one word for each test function, split on purpose
     set -- $(declare -F | awk '$3 ~ /^t_/ { print $3 }')
 fi
 for name in "$@"; do

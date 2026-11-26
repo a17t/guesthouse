@@ -8,7 +8,7 @@ use crate::pending::{
     SharedWait, Signal, Target, Waiting,
 };
 use crate::session::{Answer, HeldReply, ReplyTicket};
-use crate::tables::Queue;
+use crate::tables::{Queue, Rung};
 use crate::timing::{HeldFor, Stage};
 use guesthouse_backend::{Backend, Doorbell, GuestMemory, SpaceId, UnmapRequest, WorkStart};
 use guesthouse_messages::Status;
@@ -133,7 +133,7 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
         let one = [handle];
         let queues = self.context_queues.get(&handle).map_or(&one[..], Vec::as_slice);
         queues.iter().filter_map(|queue| self.queues.get(queue)).all(|queue| {
-            let live = queue.last_fence.is_some() && !queue.failed;
+            let live = queue.last_fence.is_some() && !queue.failed && !queue.stays;
             !live || visit(queue)
         })
     }
@@ -168,6 +168,15 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
             self.run_queue_action(action);
         } else {
             let targets = self.queue_targets(handles);
+            self.after_targets(targets, action);
+        }
+    }
+
+    /// Does something once these fences reach their values, or now if they have.
+    pub(crate) fn after_targets(&mut self, targets: Vec<Target>, action: QueueAction) {
+        if self.targets_reached(&targets) {
+            self.run_queue_action(action);
+        } else {
             let deadline = Instant::now() + self.queue_timeout();
             self.pending.push(Pending::AfterQueues { targets, deadline, action });
         }
@@ -336,7 +345,8 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
                     self.leave_wait(id, &signals, can_go);
                 }
                 GateStep::Ring { doorbell, fence, value } => {
-                    if !self.ring(queue, doorbell, fence, value) {
+                    let early = self.rings_not_before.get(&queue).is_some_and(|&not_before| now < not_before);
+                    if early || !self.ring(queue, doorbell, fence, value) {
                         let held = GateStep::Ring { doorbell, fence, value };
                         self.gates.get_mut(&queue).expect("just read").push_front(held);
                         return false;
@@ -382,6 +392,10 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
     /// Lets work run, or leaves it behind the queue's gate if there is one. A doorbell the backend
     /// refuses for now starts a gate, so it is rung again before anything after it on the queue.
     pub(crate) fn ring_or_hold(&mut self, queue: u32, doorbell: u64, fence: u64, value: u64) {
+        if self.reply_first {
+            self.rings_after_reply.push((queue, doorbell, fence, value));
+            return;
+        }
         let step = GateStep::Ring { doorbell, fence, value };
         if let Some(gate) = self.gates.get_mut(&queue) {
             gate.push_back(step);
@@ -391,14 +405,48 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
         }
     }
 
+    /// Notes that a queue's work may have written what is mapped in its address space.
+    fn space_written(&mut self, queue: u32) {
+        if let Some(record) = self.queues.get(&queue) {
+            *self.space_writes.entry(record.space).or_insert(0) += 1;
+        }
+    }
+
+    /// Notes that the engine has a queue's work up to this value.
+    fn note_rung(&mut self, queue: u32, value: u64) {
+        let Some(record) = self.queues.get_mut(&queue) else { return };
+        let space_writes = self.space_writes.get(&record.space).copied().unwrap_or(0);
+        record.rung = Some(Rung { value, space_writes });
+    }
+
     /// Rings a doorbell. False if the backend refused it for now, and it must be rung again.
     fn ring(&mut self, queue: u32, doorbell: u64, fence: u64, value: u64) -> bool {
+        self.space_written(queue);
+        self.rings_not_before.remove(&queue);
         match self.backend.ring_doorbell(queue, doorbell) {
             Ok(Doorbell::Rung) => {
                 self.timings.mark(Stage::Rung);
+                self.note_rung(queue, value);
+                if let Some(record) = self.queues.get_mut(&queue) {
+                    record.stays = false;
+                }
                 self.pending.push(Pending::Watch { queue, fence, value, rung: Instant::now() });
             }
+            // Work that runs until the guest ends it reaches its fence only then. A watch would
+            // call that a hang, and take a healthy program off the GPU.
+            Ok(Doorbell::RungToStay) => {
+                self.timings.mark(Stage::Rung);
+                self.note_rung(queue, value);
+                if let Some(record) = self.queues.get_mut(&queue) {
+                    record.stays = true;
+                    self.ring_spaces.insert(record.space);
+                }
+            }
             Ok(Doorbell::NotYet) => return false,
+            Ok(Doorbell::NotBefore(not_before)) => {
+                self.rings_not_before.insert(queue, not_before);
+                return false;
+            }
             Err(error) => {
                 log::warn!("queue {queue:#x} couldn't start its work: {error}");
                 if let Some(record) = self.queues.get_mut(&queue) {
@@ -536,11 +584,12 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
         if self.frames.has_work() {
             self.service_frames(now);
         }
+        let watching = self.pending.iter().any(|item| matches!(item, Pending::Watch { .. }));
+        if watching || self.backend.needs_polling() {
+            self.backend.poll_work(&mut services!(self), now);
+        }
         if self.pending.is_empty() {
             return self.how_soon();
-        }
-        if self.pending.iter().any(|item| matches!(item, Pending::Watch { .. })) {
-            self.backend.poll_work(&mut services!(self), now);
         }
         // The two lists swap places, so polling does not allocate.
         let spare = std::mem::take(&mut self.pending_spare);
@@ -556,8 +605,17 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
 
     fn how_soon(&self) -> Waiting {
         let copies_or_frames = !self.copies.is_empty() || self.frames.is_urgent();
-        let waiting = Waiting::of(self.pending.iter(), copies_or_frames);
-        if waiting == Waiting::Nothing && self.frames.wants_a_look() { Waiting::Background } else { waiting }
+        // A gate held only until a doorbell's time comes needs no hurry.
+        let resting = |queue: u32| self.rings_not_before.contains_key(&queue);
+        let waiting = Waiting::of(self.pending.iter(), copies_or_frames, resting);
+        let look_again = self.frames.wants_a_look() || self.backend.needs_polling();
+        if waiting == Waiting::Nothing && look_again { Waiting::Background } else { waiting }
+    }
+
+    /// The backend's wake descriptor became readable. What the backend writes for the guest then is
+    /// seen by the next [`Session::poll`].
+    pub fn gpu_woke(&mut self, now: Instant) {
+        self.backend.gpu_woke(&mut services!(self), now);
     }
 
     /// Finishes an item if it can. Otherwise hands it back.
@@ -646,6 +704,7 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
         queue: u32,
         source: guesthouse_backend::WorkSource,
         private: &[u8],
+        commands: Option<guesthouse_backend::CommandBuffer>,
         value: u64,
     ) -> GpuTook {
         let Some(record) = self.queues.get(&queue) else { return GpuTook::Nothing };
@@ -656,7 +715,9 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
             space: record.space,
             node: self.context_nodes.get(&record.context).copied().unwrap_or(0),
             client_hint: self.context_hints.get(&record.context).copied().unwrap_or(0),
+            context_queues: self.context_queues.get(&record.context).map_or(1, |queues| queues.len() as u32),
             private,
+            commands,
             fence,
             fence_gpu_address,
             fence_value: value,
@@ -672,6 +733,7 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
             WorkStart::Finished => GpuTook::Nothing,
             WorkStart::Ran => {
                 self.work_started += 1;
+                self.space_written(queue);
                 GpuTook::Nothing
             }
             WorkStart::Busy => GpuTook::NoRoom,
@@ -681,6 +743,7 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
             }
             WorkStart::Started { doorbell, work } => {
                 self.work_started += 1;
+                self.space_written(queue);
                 self.queues.get_mut(&queue).expect("read above").last_fence = Some(value);
                 self.ring_or_hold(queue, doorbell, fence, value);
                 GpuTook::Work(work)

@@ -1,0 +1,21 @@
+name: Feature request
+description: Something you would like it to do.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: want
+    attributes:
+      label: What you would like
+      description: What it should do, and what you are trying to get done.
+    validations:
+      required: true
+  - type: textarea
+    id: now
+    attributes:
+      label: What happens today
+      description: What you do now, or why it doesn't work for you.
+  - type: input
+    id: card
+    attributes:
+      label: Your graphics card and guest OS
+      description: Only if it matters to this.

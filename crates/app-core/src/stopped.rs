@@ -2,6 +2,7 @@
 //! its parent, so all it sees is a VM that's gone. A guest that shut itself down looks the same.
 
 use crate::context::Context;
+use crate::ending::{GUEST_SHUTDOWN, take_reason};
 use crate::log::write_log;
 use crate::machine::Machine;
 use crate::slots;
@@ -29,14 +30,28 @@ pub fn note_if_stopped_by_itself(context: &Context, machine: &Machine, slot: u8)
     let number = Some(slots::number(slot));
     let mut task = read_task(context, number);
     if task.machine == machine.id && STOPPING_ACTIONS.contains(&task.action.as_str()) {
+        // Taken all the same, so it can't be read as the reason for a later VM in this slot.
+        take_reason(context, slot);
         return;
+    }
+    let Some(error) = said_for_a_stop(context, machine, slot) else { return };
+    task.machine.clone_from(&machine.id);
+    task.pid = 0;
+    task.error = error.to_owned();
+    let _ = write_task(context, number, &task);
+}
+
+/// What to tell the user about a VM in `slot` that went with nobody here stopping it, if anything.
+/// The log gets a line either way. A guest that powered itself off, from its own menu or on its own,
+/// is nothing gone wrong.
+pub fn said_for_a_stop(context: &Context, machine: &Machine, slot: u8) -> Option<&'static str> {
+    if take_reason(context, slot).as_deref() == Some(GUEST_SHUTDOWN) {
+        let _ = write_log(context, &format!("{} was shut down from inside the guest.", machine.id));
+        return None;
     }
     let words = last_words(context, slot);
     let _ = write_log(context, &format!("{} stopped by itself. QEMU's last words: {words}", machine.id));
-    task.machine.clone_from(&machine.id);
-    task.pid = 0;
-    task.error = STOPPED_BY_ITSELF.to_owned();
-    let _ = write_task(context, number, &task);
+    Some(STOPPED_BY_ITSELF)
 }
 
 #[cfg(test)]
@@ -67,6 +82,21 @@ mod tests {
         note_if_stopped_by_itself(&context, &machine(), 1);
         assert_eq!(read_task(&context, Some(slots::number(1))).error, STOPPED_BY_ITSELF);
         assert!(crate::log::read_log(&context).contains("second third fourth"));
+    }
+
+    #[test]
+    fn a_guest_that_powered_itself_off_is_only_logged() {
+        let scratch = Scratch::new();
+        let context = scratch_context(&scratch);
+        after_action(&context, "start");
+        let folder = context.run_folder(Some(slots::number(1)));
+        fs::write(folder.join("ended-as"), GUEST_SHUTDOWN).unwrap();
+        note_if_stopped_by_itself(&context, &machine(), 1);
+        assert_eq!(read_task(&context, Some(slots::number(1))).error, "");
+        assert!(crate::log::read_log(&context).contains("vm was shut down from inside the guest."));
+        // The reason was for that VM. The next to go with no word from QEMU says so as before.
+        note_if_stopped_by_itself(&context, &machine(), 1);
+        assert_eq!(read_task(&context, Some(slots::number(1))).error, STOPPED_BY_ITSELF);
     }
 
     #[test]

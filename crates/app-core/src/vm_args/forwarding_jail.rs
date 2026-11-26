@@ -88,7 +88,12 @@ mod tests {
             image: "/images/driver.iso".into(),
             allow_list: "/p/linux/allow.txt".into(),
             sensor_daemon: "/q/nvfwd-sensord".into(),
-            card: ForwardedCard { pci: "0000:02:00.0".into(), minor, render_node: Some(render_node.into()) },
+            card: ForwardedCard {
+                pci: "0000:02:00.0".into(),
+                minor,
+                render_node: Some(render_node.into()),
+                memory_mib: None,
+            },
         })
     }
 

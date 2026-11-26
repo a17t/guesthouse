@@ -1,0 +1,80 @@
+guesthouse-intel-card 1
+# An Arc B580 on xe, from a tester's intel-probe 0.4.1-intel.1 output. That build printed memory
+# in MiB, so the two totals and the card memory the processor reaches are the exact bytes the
+# daemon logged on the same card (system_memory and card_memory); the used figures are rounded.
+address 0000:03:00.0
+kernel 7.2.15-1-omarchy
+xe-source 82CB5E7AA7F10E3B74ED286
+driver xe
+pci 0x8086 0xe20b 0x0 0x8086 0x1100 0x30000
+config 0xe20b 0 0x3f 0x1000 48 1
+memory 0 0 0x1000 0x7bf7db000 0x900000 0x0
+memory 1 1 0x1000 0x2fb800000 0x2b500000 0x2fb800000
+engine 0 0 0
+engine 1 0 0
+engine 4 0 0
+engine 2 0 1
+engine 2 1 1
+engine 3 0 1
+engine 3 1 1
+gt 0 0 0 20 1 0 19200000 0x2 0x1
+gt 1 1 0 13 1 1 19200000 0x2 0x1
+topology 0 1 ffff0f00000000000000000000000000
+topology 0 2 ffff0f00000000000000000000000000
+topology 0 3 ffffff0000000000
+topology 0 5 ff00000000000000
+topology 1 1 00000000000000000000000000000000
+topology 1 2 00000000000000000000000000000000
+topology 1 3 0000000000000000
+topology 1 5 ff00000000000000
+hwconfig 1 5
+hwconfig 70 20
+hwconfig 71 8
+hwconfig 4 2
+hwconfig 63 1
+hwconfig 64 768
+hwconfig 10 2
+hwconfig 11 4
+hwconfig 12 1
+hwconfig 13 1075908608
+hwconfig 73 160
+hwconfig 15 8
+hwconfig 16 546
+hwconfig 17 312
+hwconfig 18 336
+hwconfig 19 546
+hwconfig 21 96
+hwconfig 66 16
+hwconfig 23 1
+hwconfig 24 2
+hwconfig 25 2
+hwconfig 26 2
+hwconfig 27 1
+hwconfig 81 1
+hwconfig 68 768
+hwconfig 29 64
+hwconfig 30 5888
+hwconfig 31 0
+hwconfig 32 0
+hwconfig 33 0
+hwconfig 34 1548
+hwconfig 35 2
+hwconfig 36 1952
+hwconfig 37 50
+hwconfig 38 4480
+hwconfig 77 0
+hwconfig 78 1548
+hwconfig 79 4
+hwconfig 80 1952
+hwconfig 39 32768
+hwconfig 41 8192
+hwconfig 42 64
+hwconfig 44 192
+hwconfig 45 324
+hwconfig 46 2048
+hwconfig 47 127
+hwconfig 59 0
+hwconfig 60 26
+firmware guc 0 1 38 1
+firmware huc 0 8 2 10
+frequency 2850 400 400 400 2850

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and chat
+    url: https://discord.gg/rN3VARayZV
+    about: Ask on the Discord. Bugs and ideas go in an issue, so they don't get lost.
+  - name: Discussions
+    url: https://github.com/ruxnhq/guesthouse/discussions
+    about: Longer questions and open-ended talk.

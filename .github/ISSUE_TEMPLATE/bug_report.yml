@@ -1,0 +1,54 @@
+name: Bug report
+description: Something doesn't work, or works wrong.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you got instead.
+    validations:
+      required: true
+  - type: input
+    id: card
+    attributes:
+      label: Your graphics card
+      placeholder: NVIDIA GeForce RTX 4070
+    validations:
+      required: true
+  - type: input
+    id: driver
+    attributes:
+      label: Host driver version
+      description: The driver on the PC itself, as nvidia-smi or your distro shows it.
+      placeholder: "595.58.03"
+    validations:
+      required: true
+  - type: input
+    id: guest
+    attributes:
+      label: Guest OS
+      placeholder: Windows 11 24H2, or Ubuntu 24.04
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Guesthouse version
+      description: The release you installed.
+      placeholder: 0.6.0
+    validations:
+      required: true
+  - type: input
+    id: host
+    attributes:
+      label: Host distro and desktop
+      placeholder: CachyOS, KDE Plasma on Wayland
+  - type: textarea
+    id: log
+    attributes:
+      label: The log
+      description: The end of guesthouse.log in your state folder. In a terminal, `guesthouse-vm log` shows where it is and the end of it. It can be long.
+      render: text
+    validations:
+      required: true

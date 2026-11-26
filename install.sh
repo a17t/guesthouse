@@ -6,7 +6,7 @@
 # will do and every command that needs root, and waits for you to say yes.
 #
 # It never installs or changes a GPU driver, kernel arguments or services, and it never needs root for
-# anything but packages and QEMU's bridge helper. --dry-run shows the plan and stops. Everything it puts on this PC is listed in
+# anything but packages, QEMU's bridge helper and one AppArmor rule for swtpm. --dry-run shows the plan and stops. Everything it puts on this PC is listed in
 # ~/.local/lib/guesthouse/manifest, and uninstall.sh removes that and nothing else.
 #
 # The checksums below only prove that the download is the release this file names. They can't protect
@@ -14,13 +14,14 @@
 set -eu
 
 # A release sets these three, last of all, once its files are up. Until the first one they're empty.
-RELEASE_VERSION="0.5.1"
-PAYLOAD_SHA256="71ee628708382f8e6ed1b7ebe7c8195c06bde15a55d46f7bbc68e740a91ed032"
-SOURCE_SHA256="a9f147a929d629dcf6020a2712793c547edae637969671e0d57029527af11bb3"
+RELEASE_VERSION="0.10.0"
+PAYLOAD_SHA256="4aa5f2c4cc2fd477f48f9d826a0ec5fb5e9022224d7c437fd637a7b5b228e66e"
+SOURCE_SHA256="2dd6ad037f97f3711262c5c4089b0c3cd2773c414c38174635d439bf74926d38"
 
-REPO_URL=https://github.com/xnixy/guesthouse
+REPO_URL=https://github.com/ruxnhq/guesthouse
+DISCORD_URL=https://discord.gg/rN3VARayZV
 RELEASE_URL=$REPO_URL/releases/download
-LATEST_SCRIPT_URL=https://raw.githubusercontent.com/xnixy/guesthouse/main/install.sh
+LATEST_SCRIPT_URL=https://raw.githubusercontent.com/ruxnhq/guesthouse/main/install.sh
 
 APP_ID=io.github.xnixy.Guesthouse
 ARCH=x86_64
@@ -32,6 +33,16 @@ QEMU_PROGRAM=qemu/build/qemu-system-x86_64
 BRIDGE_HELPER_SOURCE=qemu/build/qemu-bridge-helper
 BRIDGE_HELPER_FOLDER=/usr/local/libexec/guesthouse
 BRIDGE_HELPER=$BRIDGE_HELPER_FOLDER/qemu-bridge-helper
+# Ubuntu's swtpm runs under an AppArmor profile that lets it write in your home folder and /tmp, but not
+# in /run/user, where a machine's run folder is, and it takes the data channel QEMU hands it only from
+# libvirt's QEMU, not from one in the jail. So a Windows machine's virtual TPM couldn't start. Root adds
+# these two rules to the profile's local file, which is there for additions like them.
+SWTPM_PROFILE=/etc/apparmor.d/usr.bin.swtpm
+SWTPM_LOCAL=/etc/apparmor.d/local/usr.bin.swtpm
+SWTPM_RULE='owner /run/user/[0-9]*/guesthouse/** rwk,'
+SWTPM_SOCKET_RULE='unix (send, receive) type=stream addr=none,'
+SWTPM_COMMENT='# Guesthouse: the virtual TPM keeps its log and socket in the run folder.'
+SECURITY_MODULES=/sys/kernel/security/lsm
 # The first GTK the app with HDR loads on.
 HDR_GTK=4.16
 FIRMWARE_DESCRIPTORS=/usr/share/qemu/firmware
@@ -50,6 +61,7 @@ DRY_RUN=no
 UPDATE=no
 CHECK_UPDATE=no
 FROM_SOURCE=no
+PAYLOAD_DIR=""
 # The app's own process, when the app runs this: it's the one thing from this install that may be running.
 FROM_APP=""
 
@@ -64,6 +76,8 @@ LINK_FLIPPED=no
 MANIFEST_BEFORE=""
 PACKAGES_ADDED=""
 HELPER_PLACED=no
+SWTPM_RULE_ADDED=no
+HELPER_LEFT_OUT=no
 
 say() {
     printf '%s\n' "$*"
@@ -91,6 +105,7 @@ updates to that one.
                   password is asked for in a window
   --dry-run       Check everything, download and verify, show the plan, and stop
   --from-source   Build the release's source on this PC, and install that
+  --payload=DIR   Install the release unpacked in DIR, such as the AppImage's own, with no download
   --help          Show this
 EOF
 }
@@ -102,6 +117,7 @@ parse_arguments() {
             --update) UPDATE=yes ;;
             --check-update) CHECK_UPDATE=yes ;;
             --from-source) FROM_SOURCE=yes ;;
+            --payload=*) PAYLOAD_DIR=${argument#--payload=} ;;
             --from-app=*) FROM_APP=${argument#--from-app=} ;;
             --help)
                 usage
@@ -189,7 +205,7 @@ refuse_unsupported() {
     [ "$(uname -m)" = "$ARCH" ] ||
         die "Guesthouse only runs on $ARCH, and this PC is $(uname -m). KVM can't run these guests anywhere else."
     [ "$FAMILY" != nixos ] && [ ! -e /etc/NIXOS ] ||
-        die "NixOS isn't supported: the release's programs expect a normal /lib and /usr, and this script can't declare anything in your configuration."
+        die "on NixOS, install Guesthouse through its flake instead: $REPO_URL/blob/main/docs/nixos.md. This script can't declare anything in your configuration."
     if ldd --version 2>&1 | grep -qi musl; then
         die "musl isn't supported: the release is built against glibc, and the app needs it."
     fi
@@ -391,15 +407,33 @@ build_from_source() {
     mv "$STAGING/built/guesthouse-$RELEASE_VERSION-$ARCH.tar.xz" "$STAGING/"
 }
 
+# The AppImage carries a release already unpacked, and the copy of this script inside it installs that
+# one. There's nothing to download, and no hash to check it against: the AppImage is what was downloaded.
+use_payload_folder() {
+    [ -n "$PAYLOAD_DIR" ] || return 0
+    [ "$UPDATE" = no ] && [ "$CHECK_UPDATE" = no ] && [ "$FROM_SOURCE" = no ] ||
+        die "--payload installs the release it names, so it can't go with --update, --check-update or --from-source."
+    PAYLOAD_DIR=$(CDPATH='' cd -- "$PAYLOAD_DIR" 2>/dev/null && pwd) || die "there's no folder called $PAYLOAD_DIR."
+    [ -f "$PAYLOAD_DIR/RELEASE" ] || die "$PAYLOAD_DIR has no RELEASE file, so it's not a Guesthouse release."
+    RELEASE_VERSION=$(sed -n 's/^version=//p' "$PAYLOAD_DIR/RELEASE" | head -n 1)
+    is_version "$RELEASE_VERSION" || die "$PAYLOAD_DIR/RELEASE names no version."
+}
+
 get_payload() {
     payload=guesthouse-$RELEASE_VERSION-$ARCH.tar.xz
-    if [ "$FROM_SOURCE" = yes ]; then
-        build_from_source
-    else
-        download_verified "$payload" "$PAYLOAD_SHA256"
-    fi
-    tar -xJf "$STAGING/$payload" -C "$STAGING" --no-same-owner || die "$payload wouldn't unpack."
     TREE=$STAGING/guesthouse-$RELEASE_VERSION-$ARCH
+    if [ -n "$PAYLOAD_DIR" ]; then
+        # A copy, as the AppImage's folder is read-only, and gone once it stops.
+        payload=$PAYLOAD_DIR
+        cp -R "$PAYLOAD_DIR" "$TREE" && chmod -R u+w "$TREE" || die "couldn't copy $PAYLOAD_DIR."
+    else
+        if [ "$FROM_SOURCE" = yes ]; then
+            build_from_source
+        else
+            download_verified "$payload" "$PAYLOAD_SHA256"
+        fi
+        tar -xJf "$STAGING/$payload" -C "$STAGING" --no-same-owner || die "$payload wouldn't unpack."
+    fi
     [ -f "$TREE/RELEASE" ] || die "$payload has no RELEASE file, so it's not a Guesthouse release."
     [ "$(release_field version)" = "$RELEASE_VERSION" ] ||
         die "$payload says it's version $(release_field version), not $RELEASE_VERSION."
@@ -425,10 +459,12 @@ ask_the_release() {
     HOST_REPORT=$STAGING/host-report
     GPU_ANSWER=no
     AMD_ANSWER=no
+    INTEL_ANSWER=no
     if [ -x "$TREE/guesthouse-check" ] &&
         GUESTHOUSE_PROGRAM=$TREE "$TREE/guesthouse-check" >"$HOST_REPORT" 2>/dev/null; then
         GPU_ANSWER=$(awk -F "$TAB" '$1 == "gpu" { print $2 }' "$HOST_REPORT")
         AMD_ANSWER=$(awk -F "$TAB" '$1 == "amd" { print $2 }' "$HOST_REPORT")
+        INTEL_ANSWER=$(awk -F "$TAB" '$1 == "intel" { print $2 }' "$HOST_REPORT")
     else
         : >"$HOST_REPORT"
     fi
@@ -459,6 +495,9 @@ decide_mode() {
     elif [ "$AMD_ANSWER" = yes ]; then
         MODE=gpu
         GPU_NOTE="The checks above say this PC can't run NVIDIA's GPU machines, but its AMD card can be a Linux guest's GPU."
+    elif [ "$INTEL_ANSWER" = yes ]; then
+        MODE=gpu
+        GPU_NOTE="The checks above say this PC can't run NVIDIA's GPU machines, but it has an Intel card that a Windows machine can be set up on, as an experiment."
     elif [ "$previous" = gpu ]; then
         MODE=gpu
         GPU_NOTE="The checks above say this PC can't run GPU machines right now. Often that's a driver update that moved to another branch: host and guest have to match. This update doesn't change that, and doesn't touch your driver. GPU machines won't start until it's fixed, your machines and disks stay as they are, and plain VMs still run."
@@ -611,14 +650,33 @@ helper_needs_work() {
 # Root checks the copy against the hash taken here, before it makes it setuid, as the source is in a
 # folder you can write. A copy that fails goes.
 helper_command() {
-    source=$TREE/$BRIDGE_HELPER_SOURCE
     # shellcheck disable=SC2016 # $f and $n are for root's shell
     printf '{ f="%s"; n="$f/%s.new"; { mkdir -p "$f" && chmod 755 "$f" && cp "%s" "$n" && chown 0:0 "$n" && echo "%s  $n" | sha256sum -c --quiet && chmod 4755 "$n" && mv -f "$n" "$f/%s"; } || { rm -f "$n"; false; }; }' \
-        "$BRIDGE_HELPER_FOLDER" "${BRIDGE_HELPER##*/}" "$source" "$(hash_of "$source")" "${BRIDGE_HELPER##*/}"
+        "$BRIDGE_HELPER_FOLDER" "${BRIDGE_HELPER##*/}" "$1" "$(hash_of "$1")" "${BRIDGE_HELPER##*/}"
+}
+
+# With AppArmor on: swtpm's profile is there without the rule, or swtpm is about to be installed and its
+# profile with it. Root looks for the profile again, as it only comes with the package.
+swtpm_rule_needed() {
+    grep -qw apparmor "$SECURITY_MODULES" 2>/dev/null || return 1
+    case " ${PACKAGES:-} " in
+        *" swtpm "*) [ "$IMMUTABLE" = yes ] || return 0 ;;
+    esac
+    [ -f "$SWTPM_PROFILE" ] || return 1
+    ! grep -qxF "$SWTPM_RULE" "$SWTPM_LOCAL" 2>/dev/null || ! grep -qxF "$SWTPM_SOCKET_RULE" "$SWTPM_LOCAL" 2>/dev/null
+}
+
+# Each line goes in only if it isn't there, so an install that added the first rule gets the second.
+swtpm_rule_command() {
+    # shellcheck disable=SC2016 # $line is for root's shell
+    printf '{ [ ! -f "%s" ] || { grep -qxF "%s" "%s" 2>/dev/null && grep -qxF "%s" "%s" 2>/dev/null; } || { for line in "%s" "%s" "%s"; do grep -qxF "$line" "%s" 2>/dev/null || printf "%%s\\n" "$line" >>"%s" || exit 1; done && apparmor_parser -r "%s"; }; }' \
+        "$SWTPM_PROFILE" "$SWTPM_RULE" "$SWTPM_LOCAL" "$SWTPM_SOCKET_RULE" "$SWTPM_LOCAL" \
+        "$SWTPM_COMMENT" "$SWTPM_RULE" "$SWTPM_SOCKET_RULE" "$SWTPM_LOCAL" "$SWTPM_LOCAL" "$SWTPM_PROFILE"
 }
 
 # What root does, as one string, so what's shown is exactly what runs. An immutable system gets no
-# packages, but its /usr/local takes the helper all the same.
+# packages, but its /usr/local takes the helper all the same. With no sudo the helper is left out: only
+# bridged networking needs it, and a command that copies from staging can't be run once this has stopped.
 plan_root_work() {
     ROOT_COMMAND=""
     ADD_TO_KVM=no
@@ -629,9 +687,17 @@ plan_root_work() {
             ROOT_COMMAND="${ROOT_COMMAND:+$ROOT_COMMAND && }usermod -aG kvm $(id -un)"
         fi
     fi
-    if helper_needs_work "$TREE/$BRIDGE_HELPER_SOURCE"; then
+    if ! helper_needs_work "$TREE/$BRIDGE_HELPER_SOURCE"; then
+        :
+    elif [ -n "$FROM_APP" ] || command -v sudo >/dev/null 2>&1; then
         HELPER_PLACED=yes
-        ROOT_COMMAND="${ROOT_COMMAND:+$ROOT_COMMAND && }$(helper_command)"
+        ROOT_COMMAND="${ROOT_COMMAND:+$ROOT_COMMAND && }$(helper_command "$TREE/$BRIDGE_HELPER_SOURCE")"
+    else
+        HELPER_LEFT_OUT=yes
+    fi
+    if swtpm_rule_needed; then
+        SWTPM_RULE_ADDED=yes
+        ROOT_COMMAND="${ROOT_COMMAND:+$ROOT_COMMAND && }$(swtpm_rule_command)"
     fi
 }
 
@@ -743,8 +809,13 @@ print_root_plan() {
     elif [ "$IMMUTABLE" = no ] || [ -z "$PACKAGES" ]; then
         say "Nothing here needs root."
     fi
+    [ -z "$PACKAGES" ] || [ "$IMMUTABLE" = yes ] || say "That adds the packages Guesthouse needs: $PACKAGES"
     [ "$HELPER_PLACED" = no ] ||
         say "That puts QEMU's bridge helper in $BRIDGE_HELPER_FOLDER, setuid root, for bridged networking."
+    [ "$SWTPM_RULE_ADDED" = no ] ||
+        say "It lets swtpm, the virtual TPM a Windows machine needs, write in your run folder under /run/user and take the jailed QEMU's data channel. Its AppArmor profile doesn't."
+    [ "$HELPER_LEFT_OUT" = no ] ||
+        say "There's no sudo here, so QEMU's bridge helper is left out. Only bridged networking needs it, and once the rest is installed I'll show what root can run to put it in."
     [ -z "$ROOT_COMMAND" ] || [ "$ADD_TO_KVM" = no ] ||
         say "You'd join the kvm group to open /dev/kvm, and that takes a new login."
 }
@@ -775,8 +846,11 @@ run_root_work() {
 
 # The app has no terminal for sudo to ask in, so pkexec asks in a window. It shows the command too.
 run_root_work_in_a_window() {
-    command -v pkexec >/dev/null 2>&1 ||
+    if ! command -v pkexec >/dev/null 2>&1; then
+        [ -z "$PAYLOAD_DIR" ] ||
+            die "this needs root, and there's no pkexec to ask for it in a window. Install in a terminal instead."
         die "this update needs root, and there's no pkexec to ask for it in a window. Run install.sh --update in a terminal."
+    fi
     pkexec sh -c "$ROOT_COMMAND" </dev/null || die "root's part didn't run, so I'm stopping. Nothing of Guesthouse's was changed."
     [ "$IMMUTABLE" = yes ] || PACKAGES_ADDED=$PACKAGES
 }
@@ -862,7 +936,10 @@ list_root_work() {
         manifest_line package - "$package"
     done
     [ "$ADD_TO_KVM" = no ] || manifest_line group - kvm
-    [ "$HELPER_PLACED" = no ] || manifest_line root-file "$(hash_of "$TREE/$BRIDGE_HELPER_SOURCE")" "$BRIDGE_HELPER"
+    # A helper left for root is listed too, so that uninstall.sh takes it away if root did put it in.
+    [ "$HELPER_PLACED" = no ] && [ "$HELPER_LEFT_OUT" = no ] ||
+        manifest_line root-file "$(hash_of "$TREE/$BRIDGE_HELPER_SOURCE")" "$BRIDGE_HELPER"
+    [ "$SWTPM_RULE_ADDED" = no ] || manifest_line apparmor-rule - "$SWTPM_LOCAL"
 }
 
 write_manifest_header() {
@@ -952,13 +1029,25 @@ refresh_icons() {
     theme=$ICON_FOLDER/hicolor
     [ -d "$theme" ] || return 0
     touch "$theme" 2>/dev/null || true
-    [ -f "$theme/icon-theme.cache" ] || return 0
+    update_icon_cache "$theme"
+    tell_kde_about_icons
+}
+
+update_icon_cache() {
+    [ -f "$1/icon-theme.cache" ] || return 0
     for tool in gtk-update-icon-cache gtk4-update-icon-cache; do
         if command -v "$tool" >/dev/null 2>&1; then
-            "$tool" -q -t -f "$theme" >/dev/null 2>&1 || true
+            "$tool" -q -t -f "$1" >/dev/null 2>&1 || true
             return 0
         fi
     done
+}
+
+# Plasma keeps the icons it looked up until it's told they changed, so a new app shows with no icon in
+# the launcher until the next login. This is the signal KDE's own settings send. Nothing else listens.
+tell_kde_about_icons() {
+    [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] && command -v dbus-send >/dev/null 2>&1 || return 0
+    dbus-send --session --type=signal /KIconLoader org.kde.KIconLoader.iconChanged int32:0 >/dev/null 2>&1 || true
 }
 
 # Until this one step, the old version is what runs.
@@ -1070,8 +1159,19 @@ say_done() {
     say "Guesthouse $RELEASE_VERSION is installed. It's in your apps, or run it with:"
     say "  env \"GUESTHOUSE_PROGRAM=$CURRENT_LINK\" \"$CURRENT_LINK/guesthouse\""
     say "To remove it: sh \"$CURRENT_LINK/uninstall.sh\""
+    say "Questions and chat: $DISCORD_URL"
+    say "Bugs: $REPO_URL/issues"
     [ "$ADD_TO_KVM" = no ] || say "Log out and in again, so that you're in the kvm group."
     [ "$IMMUTABLE" = no ] || [ -z "$PACKAGES" ] || say "Add the packages listed above before you open it."
+    [ "$HELPER_LEFT_OUT" = no ] || say_how_root_adds_the_helper
+}
+
+# The copy that's installed is the source, as staging is gone by the time root reads this. The line is
+# for pasting, so a quote in your home folder's name is written the way a shell reads one inside quotes.
+say_how_root_adds_the_helper() {
+    say ""
+    say "There's no sudo here, so this release's bridge helper isn't in $BRIDGE_HELPER_FOLDER. Bridged networking needs it, and nothing else does. This puts it in, as root:"
+    say "  sh -c '$(helper_command "$CURRENT_LINK/$BRIDGE_HELPER_SOURCE" | sed "s/'/'\\\\''/g")'"
 }
 
 # Which release this run is about, and whether there's anything to do.
@@ -1096,7 +1196,7 @@ choose_release() {
 
 stop_if_nothing_changes() {
     if [ "$(manifest_value version)" = "$RELEASE_VERSION" ] && [ "$(manifest_value mode)" = "$MODE" ] &&
-        ! helper_needs_work "$TREE/$BRIDGE_HELPER_SOURCE"; then
+        ! helper_needs_work "$TREE/$BRIDGE_HELPER_SOURCE" && ! swtpm_rule_needed; then
         say "Guesthouse $RELEASE_VERSION is the latest release, and it's installed the way this PC can run it."
         exit 0
     fi
@@ -1104,6 +1204,7 @@ stop_if_nothing_changes() {
 
 main() {
     parse_arguments "$@"
+    use_payload_folder
     refuse_root
     check_home
     set_paths

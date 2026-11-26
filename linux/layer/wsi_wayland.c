@@ -30,6 +30,17 @@ static void wl_frame_done(void *data, struct wl_callback *cb, uint32_t time)
 
 static const struct wl_callback_listener wl_frame_events = { wl_frame_done };
 
+/* How long a frame the compositor hasn't asked for holds back the next. A hidden window is never asked. */
+#define FRAME_WAIT_MS 100
+
+static int64_t now_ms(void)
+{
+    struct timespec t;
+
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
 /* A readback buffer, a copy per image, and shared memory buffers the compositor can read. */
 int wl_setup(struct swapchain *s, struct surface *surface, const VkSwapchainCreateInfoKHR *c)
 {
@@ -136,6 +147,17 @@ void wl_present(struct swapchain *s)
             wl_display_dispatch_queue_pending(s->wl_display, s->wl_queue);
         }
     }
+    if (!s->fifo && s->frame_flag && *s->frame_flag && now_ms() - s->frame_asked_ms < FRAME_WAIT_MS) {
+        /*
+         * The other modes show the newest picture and wait for nothing. The compositor takes one a
+         * refresh and gives a shared buffer back as soon as it has copied it, so a program drawing
+         * thousands of frames a second had every one of them copied, and the compositor's memory for
+         * those copies grew faster than it was freed, until its GPU memory ran out. A frame the
+         * compositor hasn't asked for is dropped here.
+         */
+        s->dropped++;
+        return;
+    }
     for (int i = 0; i < WL_BUFFERS; i++) {
         if (!s->wl_busy[i]) {
             size_t one = (size_t)s->width * 4 * s->height;
@@ -143,11 +165,10 @@ void wl_present(struct swapchain *s)
             s->wl_busy[i] = 1;
             wl_surface_attach(s->wl_wrapper, s->wl_buffer[i], 0, 0);
             wl_surface_damage_buffer(s->wl_wrapper, 0, 0, s->width, s->height);
-            if (s->fifo) {
-                s->frame_flag = calloc(1, sizeof(int)); /* outlives the swapchain if the callback comes late */
-                *s->frame_flag = 1;
-                wl_callback_add_listener(wl_surface_frame(s->wl_wrapper), &wl_frame_events, s->frame_flag);
-            }
+            s->frame_flag = calloc(1, sizeof(int)); /* outlives the swapchain if the callback comes late */
+            *s->frame_flag = 1;
+            s->frame_asked_ms = now_ms();
+            wl_callback_add_listener(wl_surface_frame(s->wl_wrapper), &wl_frame_events, s->frame_flag);
             wl_surface_commit(s->wl_wrapper);
             wl_display_flush(s->wl_display);
             s->shown++;

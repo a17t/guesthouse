@@ -22,6 +22,9 @@ pub struct ForwardedCard {
     pub minor: u32,
     /// Its render node in `/dev/dri`, which the device shows the guest's frames through.
     pub render_node: Option<String>,
+    /// Its video memory in MiB, if the driver says. A machine with no cap of its own is held to this
+    /// less the host's share.
+    pub memory_mib: Option<u64>,
 }
 
 /// The card setup chose, or before setup the one it would choose, as a Linux machine needs no setup.
@@ -30,7 +33,8 @@ pub fn forwarded_card(context: &Context) -> Option<ForwardedCard> {
     let card = card_in_use(context)?;
     let minor = minor_of(&context.nvidia_cards, &card.pci)?;
     let render_node = render_node_of(&context.drm_class, &card.pci);
-    Some(ForwardedCard { pci: card.pci, minor, render_node })
+    let memory_mib = crate::setup::cards::memory_mib(context, &card.pci);
+    Some(ForwardedCard { pci: card.pci, minor, render_node, memory_mib })
 }
 
 /// The device file number in the driver's list of cards, which has a folder for each by address.
@@ -107,10 +111,16 @@ mod tests {
         let scratch = Scratch::new();
         let context = context_with_two_cards(&scratch);
         choose(&context, "0000:05:00.0");
-        let card = forwarded_card(&context).unwrap();
+        // What this PC's own driver says of a card at that address is not this test's to check.
+        let card = ForwardedCard { memory_mib: None, ..forwarded_card(&context).unwrap() };
         assert_eq!(
             card,
-            ForwardedCard { pci: "0000:05:00.0".into(), minor: 1, render_node: Some("renderD129".into()) }
+            ForwardedCard {
+                pci: "0000:05:00.0".into(),
+                minor: 1,
+                render_node: Some("renderD129".into()),
+                memory_mib: None
+            }
         );
         choose(&context, "0000:01:00.0");
         assert_eq!(forwarded_card(&context).unwrap().minor, 0);

@@ -1,8 +1,15 @@
 use super::desktop::{BOOTS_FILE, SERIAL_FILE};
-use super::guest_files::{place_driver_files, place_profile_store};
+use super::gpu_check::gpu_found;
+use super::guest_files::{
+    name_display, place_amd_runtime, place_driver_files, place_nvapi_wrapper, place_profile_store,
+    register_media_transforms,
+};
+use super::guest_upload::stand_in::FilesGuest;
+use super::window_speed::apply_window_speed;
 use super::*;
 use crate::agent::stand_in::ScriptedAgent;
 use crate::clock::Clock;
+use crate::gpu_identity::{IdentityState, Shown, read_state, write_state};
 use crate::machine::Kind;
 use crate::processes::stand_in::fake_process;
 use crate::slots;
@@ -115,7 +122,9 @@ fn a_gpu_machine_with_no_setup_is_refused_before_anything_starts() {
 #[test]
 fn a_gpu_machine_with_no_token_is_refused_before_anything_starts() {
     let scratch = Scratch::new();
-    let context = plain_task_context(&scratch);
+    let mut context = plain_task_context(&scratch);
+    context.pci_names = scratch.write("pci.ids", crate::setup::cards::stand_in::NAMES);
+    crate::setup::cards::stand_in::fake_pci(&scratch, "0000:01:00.0", 0x2704, "0x10de", "0x030000");
     fs::create_dir_all(crate::settings::driver_folder(&context)).unwrap();
     let card = serde_json::json!({"card": {"device": 1}});
     crate::settings::write_setup(&context, card.as_object().cloned().unwrap()).unwrap();
@@ -149,6 +158,7 @@ fn a_gpu_machine_starts_through_the_same_host_and_sets_up_its_desktop() {
     let vm = machine(&context);
     crate::agent::make_token(&context, &vm).unwrap();
     fs::create_dir_all(context.run_folder(None)).unwrap();
+    with_vm_running(&context);
     let host = RecordingHost::default();
     let mut task = Task::new(&context, &host, "start", vm);
     boot(&mut task).unwrap();
@@ -159,6 +169,37 @@ fn a_gpu_machine_starts_through_the_same_host_and_sets_up_its_desktop() {
     assert!(asked[2].2.contains("DEVPKEY"), "then the display driver");
     assert!(asked[3].2.contains("WriteAllBytes"), "a script goes to the guest first");
     assert!(asked[4].2.contains("New-ScheduledTaskPrincipal"), "and runs in the user's session");
+}
+
+#[test]
+fn a_start_with_less_ram_gives_the_vm_less_and_the_machine_keeps_its_own() {
+    let scratch = Scratch::new();
+    let mut context = plain_task_context(&scratch);
+    scratch.write("program/guest/display.ps1", "what the session sees");
+    let agent = Arc::new(ScriptedAgent::answering(&[
+        "3\n",
+        "gpu working 1\n",
+        "device missing",
+        "",
+        "screen basic 1920x1080 64 hdr 0",
+        "",
+        "screen 1920x1080\n",
+        "",
+        "screen basic 1920x1080 64 hdr 0",
+    ]));
+    context.agent = agent;
+    let vm = Machine { ram_gib: 6, ..machine(&context) };
+    crate::agent::make_token(&context, &vm).unwrap();
+    fs::create_dir_all(context.run_folder(None)).unwrap();
+    with_vm_running(&context);
+    let host = RecordingHost::default();
+    let mut task = Task::new(&context, &host, "start", vm);
+    task.ram_this_run = Some(5);
+    boot(&mut task).unwrap();
+    assert_eq!(host.plans.lock().unwrap()[0].ram, "5G");
+    assert_eq!(task.machine.ram_gib, 6, "the next start asks for all of it again");
+    let note = smaller_start_note(5, 6);
+    assert!(note.starts_with("Only room for 5 GiB of RAM, so Windows has 5 GiB this time, not 6."), "{note}");
 }
 
 #[test]
@@ -190,6 +231,7 @@ fn a_desktop_at_the_wrong_size_is_set_and_checked_again() {
     let vm = machine(&context);
     crate::agent::make_token(&context, &vm).unwrap();
     fs::create_dir_all(context.run_folder(None)).unwrap();
+    with_vm_running(&context);
     let host = RecordingHost::default();
     let mut task = Task::new(&context, &host, "start", vm);
     boot(&mut task).unwrap();
@@ -235,6 +277,56 @@ fn a_guest_with_no_gpu_fails_the_start_says_so_and_turns_off() {
     assert!(error.0.contains("without its GPU"), "{error}");
     assert!(error.0.contains("/dev/shm/window: No such file"), "{error}");
     assert_eq!(host.said(), ["start gpu", "stop 30"]);
+}
+
+/// The software desktop for this build, as after a fallback: the hardware desktop is the default.
+fn on_the_software_desktop(context: &Context, vm: &Machine) {
+    fs::create_dir_all(vm.folder(context)).unwrap();
+    crate::intel_desktop::fall_back(context, vm, "a test of the software desktop").unwrap();
+}
+
+#[test]
+fn an_intel_guest_with_no_gpu_is_left_running_and_says_why() {
+    let scratch = Scratch::new();
+    let mut context = plain_task_context(&scratch);
+    let mut vm = guest_saying(&mut context, "gpu working 0\n");
+    vm.use_windows_card(GpuMaker::Intel, "0000:03:00.0");
+    on_the_software_desktop(&context, &vm);
+    fs::write(context.run_folder(None).join(crate::daemon::OUTPUT_FILE), "ERROR no xe engine\n").unwrap();
+    let host = RecordingHost::default();
+    let mut task = Task::new(&context, &host, "start", vm);
+    assert_eq!(boot(&mut task), Ok(()));
+    assert_eq!(host.said(), ["start gpu"], "nothing turned it off");
+    for said in [&task.error, &fs::read_to_string(context.paths.log_file()).unwrap()] {
+        assert!(said.contains("without its GPU") && said.contains("left running"), "{said}");
+        assert!(said.contains("no xe engine"), "{said}");
+    }
+}
+
+#[test]
+fn an_intel_guest_shown_intels_number_keeps_it_after_a_failed_check() {
+    let scratch = Scratch::new();
+    let mut context = plain_task_context(&scratch);
+    let mut vm = guest_saying(&mut context, "gpu working 0\n");
+    vm.use_windows_card(GpuMaker::Intel, "0000:03:00.0");
+    on_the_software_desktop(&context, &vm);
+    let package_vendor = crate::gpu_identity::INTEL_RENDER.vendor;
+    let state = IdentityState { shown: Shown::Maker, package_vendor, ..IdentityState::default() };
+    write_state(&context, &vm, &state).unwrap();
+    let host = RecordingHost::default();
+    let mut task = Task::new(&context, &host, "start", vm.clone());
+    assert_eq!(boot(&mut task), Ok(()));
+    assert!(task.error.contains("keeps Intel's vendor ID"), "{}", task.error);
+    assert_eq!(read_state(&context, &vm).shown, Shown::Maker);
+    assert_eq!(host.said(), ["start gpu"]);
+}
+
+#[test]
+fn only_intel_runs_without_its_gpu() {
+    use super::gpu_check::runs_without_gpu;
+    assert!(runs_without_gpu(Some(GpuMaker::Intel)));
+    assert!(!runs_without_gpu(Some(GpuMaker::Nvidia)) && !runs_without_gpu(Some(GpuMaker::Amd)));
+    assert!(!runs_without_gpu(None));
 }
 
 /// What a start says when the daemon's output file holds `log` and the guest has no GPU.
@@ -283,7 +375,7 @@ fn a_gpu_that_is_a_moment_late_is_waited_for() {
     context.agent = Arc::new(ScriptedAgent::answering(&["gpu working 0\n", "", "gpu working 1\n"]));
     let host = RecordingHost::default();
     let task = Task::new(&context, &host, "start", vm);
-    assert_eq!(check_gpu(&task), Ok(()));
+    assert!(gpu_found(&task));
 }
 
 #[test]
@@ -467,6 +559,123 @@ fn a_file_that_fails_is_said_and_the_start_goes_on() {
     assert!(task.error.contains("did not reach Windows"));
 }
 
+/// The list a request sent the guest.
+fn sent_list(script: &str) -> String {
+    let data = script.split("FromBase64String('").nth(1).unwrap().split('\'').next().unwrap();
+    String::from_utf8(crate::text::base64_decode(data).unwrap()).unwrap()
+}
+
+#[test]
+fn with_the_wrapper_nvidias_nvapi_is_left_out_of_the_list() {
+    let scratch = Scratch::new();
+    let mut context = plain_task_context(&scratch);
+    with_driver_files(&scratch, &context);
+    let inf = crate::setup::guest_files::stand_in::FILES_INF.replace("one.dll", "nvapi64.dll");
+    fs::write(crate::settings::driver_folder(&context).join("nv_dispi.inf"), inf).unwrap();
+    let agent = Arc::new(ScriptedAgent::answering(&["", "missing 0\r\n", "", "missing 0\r\n"]));
+    context.agent = agent.clone();
+    let host = RecordingHost::default();
+    place_driver_files(&mut placing_task(&context, &host)).unwrap();
+    let nvidias = "System32\tnvapi64.dll\tnvapi64.dll\n";
+    assert!(sent_list(&agent.requests.lock().unwrap()[0].2).contains(nvidias), "no wrapper here yet");
+    scratch.write("program/guest/nvapi64.dll", "wrapper");
+    place_driver_files(&mut placing_task(&context, &host)).unwrap();
+    let list = sent_list(&agent.requests.lock().unwrap()[2].2);
+    assert!(!list.contains(nvidias) && list.contains("two.dll"));
+}
+
+#[test]
+fn the_wrapper_goes_to_system32_when_the_guest_lacks_this_copy() {
+    let scratch = Scratch::new();
+    let mut context = plain_task_context(&scratch);
+    scratch.write("program/guest/nvapi64.dll", "wrapper");
+    let guest = Arc::new(FilesGuest::default());
+    *guest.other_answer.lock().unwrap() = "nvapi needed\r\nnvapi placed\r\n".into();
+    context.agent = guest.clone();
+    let host = RecordingHost::default();
+    let mut task = placing_task(&context, &host);
+    place_nvapi_wrapper(&mut task).unwrap();
+    assert_eq!(task.error, "");
+    assert_eq!(guest.files.lock().unwrap().get(r"C:\gpupv\nvapi64.dll").unwrap(), b"wrapper");
+    let requests = guest.requests.lock().unwrap();
+    assert!(requests[0].contains("Get-FileHash"), "it asks first");
+    assert!(requests.last().unwrap().contains("Copy-Item"));
+}
+
+#[test]
+fn a_guest_with_this_copy_of_the_wrapper_gets_nothing_sent() {
+    let scratch = Scratch::new();
+    let mut context = plain_task_context(&scratch);
+    scratch.write("program/guest/nvapi64.dll", "wrapper");
+    let guest = Arc::new(FilesGuest::default());
+    *guest.other_answer.lock().unwrap() = "nvapi kept\r\n".into();
+    context.agent = guest.clone();
+    let host = RecordingHost::default();
+    place_nvapi_wrapper(&mut placing_task(&context, &host)).unwrap();
+    assert_eq!(guest.requests.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn with_the_wrapper_turned_off_nvidias_nvapi_stays_in_the_list() {
+    let scratch = Scratch::new();
+    let mut context = plain_task_context(&scratch);
+    with_driver_files(&scratch, &context);
+    let inf = crate::setup::guest_files::stand_in::FILES_INF.replace("one.dll", "nvapi64.dll");
+    fs::write(crate::settings::driver_folder(&context).join("nv_dispi.inf"), inf).unwrap();
+    scratch.write("program/guest/nvapi64.dll", "wrapper");
+    let agent = Arc::new(ScriptedAgent::answering(&["", "missing 0\r\n"]));
+    context.agent = agent.clone();
+    let host = RecordingHost::default();
+    let mut task = placing_task(&context, &host);
+    task.machine.nvapi_wrapper_off = true;
+    place_driver_files(&mut task).unwrap();
+    assert!(sent_list(&agent.requests.lock().unwrap()[0].2).contains("System32\tnvapi64.dll\tnvapi64.dll\n"));
+}
+
+#[test]
+fn with_the_wrapper_turned_off_nvidias_goes_back_and_nothing_is_sent() {
+    let scratch = Scratch::new();
+    let mut context = plain_task_context(&scratch);
+    scratch.write("program/guest/nvapi64.dll", "wrapper");
+    let guest = Arc::new(FilesGuest::default());
+    *guest.other_answer.lock().unwrap() = "nvapi restored\r\n".into();
+    context.agent = guest.clone();
+    let host = RecordingHost::default();
+    let mut task = placing_task(&context, &host);
+    task.machine.nvapi_wrapper_off = true;
+    place_nvapi_wrapper(&mut task).unwrap();
+    assert_eq!(task.error, "");
+    assert!(guest.files.lock().unwrap().is_empty(), "the wrapper isn't sent");
+    let requests = guest.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].contains("HostDriverStore") && requests[0].contains("Copy-Item"));
+}
+
+#[test]
+fn nvidias_nvapi_that_does_not_go_back_is_said() {
+    let scratch = Scratch::new();
+    let mut context = plain_task_context(&scratch);
+    let guest = Arc::new(FilesGuest::default());
+    *guest.other_answer.lock().unwrap() = "FAILED nvapi: in use\r\n".into();
+    context.agent = guest.clone();
+    let host = RecordingHost::default();
+    let mut task = placing_task(&context, &host);
+    task.machine.nvapi_wrapper_off = true;
+    place_nvapi_wrapper(&mut task).unwrap();
+    assert!(task.error.contains("NVAPI wrapper may still be there"));
+}
+
+#[test]
+fn with_no_wrapper_in_the_program_the_guest_is_not_asked_about_it() {
+    let scratch = Scratch::new();
+    let mut context = plain_task_context(&scratch);
+    let guest = Arc::new(FilesGuest::default());
+    context.agent = guest.clone();
+    let host = RecordingHost::default();
+    place_nvapi_wrapper(&mut placing_task(&context, &host)).unwrap();
+    assert!(guest.requests.lock().unwrap().is_empty());
+}
+
 #[test]
 fn with_no_card_known_the_guest_is_not_asked() {
     let scratch = Scratch::new();
@@ -502,11 +711,44 @@ fn the_profile_store_script_goes_to_the_guest_and_a_failure_is_said() {
     let mut task = placing_task(&context, &host);
     place_profile_store(&mut task).unwrap();
     assert_eq!(task.error, "");
+    task.machine.window_speed_off = true;
     place_profile_store(&mut task).unwrap();
     assert!(task.error.contains("settings store"));
     let asked = agent.requests.lock().unwrap();
     assert_eq!(asked.len(), 2);
-    assert_eq!(asked[0].2, "make the store");
+    // The present method follows "Faster programs in a window".
+    assert_eq!(asked[0].2, "$on = $true\nmake the store");
+    assert_eq!(asked[1].2, "$on = $false\nmake the store");
+}
+
+#[test]
+fn the_display_is_named_by_the_vendor_number_windows_sees() {
+    let scratch = Scratch::new();
+    let mut context = plain_task_context(&scratch);
+    scratch.write("program/guest/display-name.ps1", "name it");
+    scratch.write("program/guest/setmode.ps1", "set the mode");
+    let agent = Arc::new(ScriptedAgent::answering(&[
+        "kept RDPUDD Chained DD\r\n",
+        "script placed\r\n",
+        "named Guesthouse Display from the next start (was RDPUDD Chained DD)\r\n",
+        "script placed\r\n",
+        "FAILED display name: denied\r\n",
+    ]));
+    context.agent = agent.clone();
+    let host = RecordingHost::default();
+    let mut task = placing_task(&context, &host);
+    name_display(&mut task).unwrap();
+    let maker = IdentityState { shown: Shown::Maker, ..Default::default() };
+    write_state(&context, &task.machine, &maker).unwrap();
+    name_display(&mut task).unwrap();
+    assert_eq!(task.error, "");
+    name_display(&mut task).unwrap();
+    assert!(task.error.contains("display's name"), "{}", task.error);
+    let asked = agent.requests.lock().unwrap();
+    assert_eq!(asked[0].2, "$name = 'RDPUDD Chained DD'\nname it");
+    // The renamed display needs the logon task's script that knows the new name.
+    assert!(asked[1].2.contains("C:\\gpupv\\setmode.ps1"), "{}", asked[1].2);
+    assert_eq!(asked[2].2, "$name = 'Guesthouse Display'\nname it");
 }
 
 #[test]
@@ -517,6 +759,138 @@ fn with_no_profile_store_script_the_guest_is_not_asked() {
     context.agent = agent.clone();
     let host = RecordingHost::default();
     place_profile_store(&mut placing_task(&context, &host)).unwrap();
+    assert!(agent.requests.lock().unwrap().is_empty());
+}
+
+fn setup_chose_card(context: &Context, card: serde_json::Value) {
+    let fields = serde_json::json!({ "card": card });
+    crate::settings::write_setup(context, fields.as_object().cloned().unwrap()).unwrap();
+}
+
+#[test]
+fn the_transforms_script_goes_to_the_guest_and_only_a_change_is_logged() {
+    let scratch = Scratch::new();
+    let mut context = plain_task_context(&scratch);
+    setup_chose_card(&context, serde_json::json!({"device": 0x2B85}));
+    scratch.write("program/guest/nv-media-foundation.ps1", "register the transforms");
+    let answers = [
+        "kept 12 values of 2 transforms in 380 ms\r\n",
+        "nothing to register: the INF has no transforms for the card, read in 350 ms\r\n",
+        "skipped a line that can't be read: HKCR,one\r\nregistered 11 of 11 values of 2 transforms, failed 0, in 412 ms\r\n",
+        "left HKLM\\a\\key Name as it is set\r\nregistered 0 of 12, failed 0, left 1 of the switch's as set, in 9 ms\r\n",
+    ];
+    let agent = Arc::new(ScriptedAgent::answering(&answers));
+    context.agent = agent.clone();
+    let host = RecordingHost::default();
+    let mut task = placing_task(&context, &host);
+    register_media_transforms(&mut task).unwrap();
+    register_media_transforms(&mut task).unwrap();
+    assert!(!crate::log::read_log(&context).contains("media transforms"));
+    register_media_transforms(&mut task).unwrap();
+    let log = crate::log::read_log(&context);
+    assert!(log.contains("media transforms: skipped a line that can't be read: HKCR,one"), "{log}");
+    assert!(log.contains("registered 11 of 11 values of 2 transforms, failed 0, in 412 ms"), "{log}");
+    assert!(!log.contains("the switch's"), "{log}");
+    register_media_transforms(&mut task).unwrap();
+    let log = crate::log::read_log(&context);
+    assert!(log.contains("media transforms: left HKLM\\a\\key Name as it is set"), "{log}");
+    assert!(log.contains("failed 0, left 1 of the switch's as set"), "{log}");
+    assert_eq!(task.error, "", "a guest without them is as it was");
+    let asked = agent.requests.lock().unwrap();
+    assert_eq!(asked.len(), 4);
+    assert_eq!(asked[0].2, "$card = '2B85'\nregister the transforms", "setup's card, as the INF writes it");
+}
+
+/// The driver's INF gives each card its own transforms, so a machine on the PC's second NVIDIA card
+/// must not be given the ones of the card setup chose.
+#[test]
+fn the_transforms_script_is_told_the_card_the_machine_runs_on() {
+    use crate::setup::cards::stand_in::{NAMES, fake_pci};
+    let scratch = Scratch::new();
+    let mut context = plain_task_context(&scratch);
+    context.pci_devices = scratch.path("pci");
+    context.pci_names = scratch.write("pci.ids", NAMES);
+    fake_pci(&scratch, "0000:01:00.0", 0x2B85, "0x10de", "0x030000");
+    fake_pci(&scratch, "0000:02:00.0", 0x2C02, "0x10de", "0x030000");
+    setup_chose_card(&context, serde_json::json!({"device": 0x2B85, "pci": "0000:01:00.0"}));
+    scratch.write("program/guest/nv-media-foundation.ps1", "register the transforms");
+    let agent = Arc::new(ScriptedAgent::answering(&["kept\r\n", "kept\r\n"]));
+    context.agent = agent.clone();
+    let host = RecordingHost::default();
+    let mut task = placing_task(&context, &host);
+    task.machine.use_windows_card(GpuMaker::Nvidia, "0000:02:00.0");
+    register_media_transforms(&mut task).unwrap();
+    task.machine.use_windows_card(GpuMaker::Nvidia, "0000:03:00.0");
+    register_media_transforms(&mut task).unwrap();
+    let asked = agent.requests.lock().unwrap();
+    assert_eq!(asked.len(), 1, "a card that has gone has no number to give");
+    assert!(asked[0].2.starts_with("$card = '2C02'\n"), "{}", asked[0].2);
+    assert!(crate::log::read_log(&context).contains("media transforms: the machine's card isn't known"));
+}
+
+#[test]
+fn with_no_transforms_script_or_no_card_the_guest_is_not_asked() {
+    let scratch = Scratch::new();
+    let mut context = plain_task_context(&scratch);
+    let agent = Arc::new(ScriptedAgent::answering(&[]));
+    context.agent = agent.clone();
+    let host = RecordingHost::default();
+    scratch.write("program/guest/nv-media-foundation.ps1", "register the transforms");
+    register_media_transforms(&mut placing_task(&context, &host)).unwrap();
+    assert!(crate::log::read_log(&context).contains("media transforms: the machine's card isn't known"));
+    fs::remove_file(context.paths.guest_files().join("nv-media-foundation.ps1")).unwrap();
+    setup_chose_card(&context, serde_json::json!({"device": 0x2B85}));
+    register_media_transforms(&mut placing_task(&context, &host)).unwrap();
+    assert!(agent.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn the_window_speed_script_carries_the_machines_setting() {
+    let scratch = Scratch::new();
+    let mut context = plain_task_context(&scratch);
+    scratch.write("program/guest/window-speed.ps1", "write the entries");
+    let agent = Arc::new(ScriptedAgent::answering(&["on for C:\\Games\\\r\n", "off, entries removed\r\n"]));
+    context.agent = agent.clone();
+    let host = RecordingHost::default();
+    let mut task = placing_task(&context, &host);
+    apply_window_speed(&mut task).unwrap();
+    task.machine.window_speed_off = true;
+    apply_window_speed(&mut task).unwrap();
+    assert_eq!(task.error, "");
+    let asked = agent.requests.lock().unwrap();
+    assert_eq!(asked[0].2, "$on = $true\nwrite the entries");
+    assert_eq!(asked[1].2, "$on = $false\nwrite the entries");
+}
+
+#[test]
+fn a_window_speed_failure_is_said_and_the_start_goes_on() {
+    let scratch = Scratch::new();
+    let mut context = plain_task_context(&scratch);
+    scratch.write("program/guest/window-speed.ps1", "write the entries");
+    context.agent = Arc::new(ScriptedAgent::answering(&[
+        "kept 3 folders\r\n",
+        "FAILED window speed: access denied\r\n",
+        "FAILED window speed: access denied\r\n",
+    ]));
+    let host = RecordingHost::default();
+    let mut task = placing_task(&context, &host);
+    apply_window_speed(&mut task).unwrap();
+    assert_eq!(task.error, "");
+    apply_window_speed(&mut task).unwrap();
+    assert!(task.error.contains("could not be told"), "{}", task.error);
+    task.machine.window_speed_off = true;
+    apply_window_speed(&mut task).unwrap();
+    assert!(task.error.contains("still in Windows"), "{}", task.error);
+}
+
+#[test]
+fn with_no_window_speed_script_the_guest_is_not_asked() {
+    let scratch = Scratch::new();
+    let mut context = plain_task_context(&scratch);
+    let agent = Arc::new(ScriptedAgent::answering(&[]));
+    context.agent = agent.clone();
+    let host = RecordingHost::default();
+    apply_window_speed(&mut placing_task(&context, &host)).unwrap();
     assert!(agent.requests.lock().unwrap().is_empty());
 }
 
@@ -532,4 +906,263 @@ fn an_install_with_no_room_to_boot_ends_well_and_stays_off() {
     start_if_there_is_room(&mut task, "Windows").unwrap();
     assert_eq!(task.error, "Windows is installed. There isn't room to start it right now.");
     assert!(host.said().is_empty(), "nothing may start");
+}
+
+#[test]
+fn a_run_that_ends_is_kept_where_a_reboot_leaves_it() {
+    let scratch = Scratch::new();
+    let context = scratch_context(&scratch);
+    let vm = machine(&context);
+    let run = context.run_folder(None);
+    fs::create_dir_all(&run).unwrap();
+    fs::write(run.join(crate::vm_host::MACHINE_NOTE), &vm.id).unwrap();
+    fs::write(run.join("daemon.out"), "the daemon's last words").unwrap();
+    let host = RecordingHost::default();
+    run_task(&context, &host, "clean_up", &vm.id, &[]).unwrap();
+    let kept = crate::kept_logs::kept_folder(&context, &vm.id).join("daemon.out");
+    assert_eq!(fs::read_to_string(kept).unwrap(), "the daemon's last words");
+}
+
+#[test]
+fn an_intel_machine_is_given_neither_nvidias_files_nor_amds_only_its_device_key() {
+    let scratch = Scratch::new();
+    let mut context = plain_task_context(&scratch);
+    let agent = Arc::new(ScriptedAgent::answering(&["device key set\r\n"]));
+    context.agent = agent.clone();
+    let mut intel = machine(&context);
+    intel.use_windows_card(GpuMaker::Intel, "0000:00:02.0");
+    crate::agent::make_token(&context, &intel).unwrap();
+    let host = RecordingHost::default();
+    let mut task = Task::new(&context, &host, "start", intel);
+    place_files_for_maker(&mut task).unwrap();
+    let asked = agent.requests.lock().unwrap();
+    assert_eq!(asked.len(), 1, "the device key alone");
+    assert!(asked[0].2.contains("OpenCLDriverName"), "{}", asked[0].2);
+    assert_eq!(task.error, "");
+}
+
+#[test]
+fn an_intel_machine_is_given_the_loaders_from_the_drivers_list_out_of_intels_store_folder() {
+    let scratch = Scratch::new();
+    let mut context = plain_task_context(&scratch);
+    crate::setup::intel::stand_in::lay_out_driver(&scratch, "intel-driver");
+    let folder = scratch.path("intel-driver");
+    scratch.write("intel-driver/system-files.txt", "System32\tvulkan-1-64.dll\tvulkan-1.dll\n");
+    crate::setup::intel::write_intel_setup(&context, &folder, "32.0.101.9175").unwrap();
+    scratch.write("program/guest/nv-files.ps1", "copies files");
+    let agent = Arc::new(ScriptedAgent::answering(&[
+        "device key set\r\n",
+        "",
+        "missing 1\r\n",
+        "",
+        "copied vulkan-1.dll\r\n",
+    ]));
+    context.agent = agent.clone();
+    let mut intel = machine(&context);
+    intel.use_windows_card(GpuMaker::Intel, "0000:00:02.0");
+    crate::agent::make_token(&context, &intel).unwrap();
+    let host = RecordingHost::default();
+    let mut task = Task::new(&context, &host, "start", intel);
+    place_files_for_maker(&mut task).unwrap();
+    assert_eq!(task.error, "");
+    let asked = agent.requests.lock().unwrap();
+    assert_eq!(asked.len(), 5, "the device key, the list, the count, the script and the run");
+    assert!(asked[4].2.contains("-StoreFolder iigd_dch.inf_amd64_gpupv"), "{}", asked[4].2);
+}
+
+/// A machine on an AMD card whose driver has the media runtime, and a guest that answers as told.
+fn amd_runtime_machine(scratch: &Scratch, answers: &[&str]) -> (Context, Arc<ScriptedAgent>, Machine) {
+    let mut context = plain_task_context(scratch);
+    let files = ["amfrt64.dll", "amfrt32.dll"];
+    let folder = crate::setup::amd_system_files::stand_in::driver_with_runtime(scratch, &files);
+    crate::setup::amd::write_amd_setup(&context, &folder, "32.0.32015.12012").unwrap();
+    scratch.write("program/guest/nv-files.ps1", "copies files");
+    let agent = Arc::new(ScriptedAgent::answering(answers));
+    context.agent = agent.clone();
+    let mut amd = machine(&context);
+    amd.use_windows_card(GpuMaker::Amd, "0000:7c:00.0");
+    crate::agent::make_token(&context, &amd).unwrap();
+    (context, agent, amd)
+}
+
+#[test]
+fn an_amd_machine_is_given_the_media_runtime_in_its_system_folders_from_amds_store_folder() {
+    let scratch = Scratch::new();
+    let answers = ["", "missing 2\r\n", "", "copied System32\\amfrt64.dll\r\n"];
+    let (context, agent, amd) = amd_runtime_machine(&scratch, &answers);
+    let host = RecordingHost::default();
+    let mut task = Task::new(&context, &host, "start", amd);
+    place_amd_runtime(&mut task).unwrap();
+    assert_eq!(task.error, "");
+    let asked = agent.requests.lock().unwrap();
+    assert_eq!(asked.len(), 4, "the list, the count, the script and the run");
+    assert!(asked[0].2.contains(&crate::text::base64_encode(
+        b"System32\tamfrt64.dll\tamfrt64.dll\nSysWOW64\tamfrt32.dll\tamfrt32.dll\n"
+    )));
+    assert!(asked[3].2.contains("-StoreFolder amdxc.inf_amd64_gpupv"), "{}", asked[3].2);
+}
+
+#[test]
+fn an_amd_guest_that_has_the_media_runtime_is_only_asked_what_it_lacks() {
+    let scratch = Scratch::new();
+    let (context, agent, amd) = amd_runtime_machine(&scratch, &["", "missing 0\r\n"]);
+    let host = RecordingHost::default();
+    let mut task = Task::new(&context, &host, "start", amd);
+    place_amd_runtime(&mut task).unwrap();
+    assert_eq!((task.error.as_str(), agent.requests.lock().unwrap().len()), ("", 2));
+}
+
+#[test]
+fn a_driver_with_no_media_runtime_is_said_and_the_guest_is_asked_nothing() {
+    let scratch = Scratch::new();
+    let (context, agent, amd) = amd_runtime_machine(&scratch, &[]);
+    let host = RecordingHost::default();
+    let mut task = Task::new(&context, &host, "start", amd);
+    fs::remove_file(scratch.path("Display/WT6A_INF/B026716/amfrt64.dll")).unwrap();
+    fs::remove_file(scratch.path("Display/WT6A_INF/B026716/amfrt32.dll")).unwrap();
+    place_amd_runtime(&mut task).unwrap();
+    assert!(agent.requests.lock().unwrap().is_empty());
+    assert_eq!(task.error, "");
+    assert!(crate::log::read_log(&context).contains("no media runtime"));
+}
+
+#[test]
+fn an_intel_guest_whose_list_predates_the_64_bit_runtime_is_sent_it_for_system32() {
+    let scratch = Scratch::new();
+    let mut context = plain_task_context(&scratch);
+    crate::setup::intel::stand_in::lay_out_driver(&scratch, "intel-driver");
+    scratch.write("intel-driver/msvcp140.dll", "runtime");
+    let old = "System32\tIntel_OpenCL_ICD64.dll\tOpenCL.dll\n";
+    scratch.write("intel-driver/system-files.txt", old);
+    crate::setup::intel::write_intel_setup(&context, &scratch.path("intel-driver"), "32.0.101.9175").unwrap();
+    let agent = Arc::new(ScriptedAgent::answering(&["device key set\r\n", "", "missing 0\r\n"]));
+    context.agent = agent.clone();
+    let mut intel = machine(&context);
+    intel.use_windows_card(GpuMaker::Intel, "0000:00:02.0");
+    crate::agent::make_token(&context, &intel).unwrap();
+    let host = RecordingHost::default();
+    let mut task = Task::new(&context, &host, "start", intel);
+    place_files_for_maker(&mut task).unwrap();
+    let sent = crate::text::base64_encode(format!("{old}System32\tmsvcp140.dll\tmsvcp140.dll\n").as_bytes());
+    let asked = agent.requests.lock().unwrap();
+    assert!(asked[1].2.contains(&sent), "the list the guest counts from has the runtime: {}", asked[1].2);
+}
+
+#[test]
+fn an_intel_device_key_that_does_not_take_is_said_and_the_start_goes_on() {
+    let scratch = Scratch::new();
+    let mut context = plain_task_context(&scratch);
+    let agent = Arc::new(ScriptedAgent::answering(&["Access is denied\r\n"]));
+    context.agent = agent.clone();
+    let mut intel = machine(&context);
+    intel.use_windows_card(GpuMaker::Intel, "0000:00:02.0");
+    crate::agent::make_token(&context, &intel).unwrap();
+    let host = RecordingHost::default();
+    let mut task = Task::new(&context, &host, "start", intel);
+    place_files_for_maker(&mut task).unwrap();
+    assert!(task.error.contains("registry key"), "{}", task.error);
+}
+
+fn intel_start<'a>(context: &'a Context, host: &'a RecordingHost) -> Task<'a> {
+    let mut intel = machine(context);
+    intel.use_windows_card(GpuMaker::Intel, "0000:00:02.0");
+    crate::agent::make_token(context, &intel).unwrap();
+    Task::new(context, host, "start", intel)
+}
+
+#[test]
+fn a_vm_shut_down_from_windows_before_the_start_is_done_is_asked_nothing_more() {
+    let scratch = Scratch::new();
+    let mut context = plain_task_context(&scratch);
+    let agent = Arc::new(ScriptedAgent::default());
+    context.agent = agent.clone();
+    let run = context.run_folder(None);
+    fs::create_dir_all(&run).unwrap();
+    fs::write(run.join("ended-as"), crate::ending::GUEST_SHUTDOWN).unwrap();
+    let host = RecordingHost::default();
+    let mut task = intel_start(&context, &host);
+    finish_on_desktop(&mut task).unwrap();
+    assert!(agent.requests.lock().unwrap().is_empty(), "no guest to ask");
+    assert_eq!(task.error, "", "a guest that powered itself off is nothing gone wrong");
+    assert!(crate::log::read_log(&context).contains("was shut down from inside the guest."));
+}
+
+#[test]
+fn a_vm_that_went_by_itself_before_the_start_is_done_says_so_and_not_what_the_guest_missed() {
+    let scratch = Scratch::new();
+    let mut context = plain_task_context(&scratch);
+    context.agent = Arc::new(ScriptedAgent::default());
+    let host = RecordingHost::default();
+    let mut task = intel_start(&context, &host);
+    finish_on_desktop(&mut task).unwrap();
+    assert!(task.error.contains("this app didn't stop it"), "{}", task.error);
+    assert!(!task.error.contains("registry key"), "{}", task.error);
+}
+
+#[test]
+fn a_vm_still_running_at_the_end_of_its_start_is_given_its_device_key() {
+    let scratch = Scratch::new();
+    let mut context = plain_task_context(&scratch);
+    let agent = Arc::new(ScriptedAgent::answering(&["", "", "device key set\r\n"]));
+    context.agent = agent.clone();
+    with_vm_running(&context);
+    let host = RecordingHost::default();
+    let mut task = intel_start(&context, &host);
+    finish_on_desktop(&mut task).unwrap();
+    let asked = agent.requests.lock().unwrap();
+    assert!(asked.iter().any(|(_, _, script)| script.contains("OpenCLDriverName")), "{asked:?}");
+}
+
+/// A start of a machine with a real disk, in a PC that offers the card, as far as the guest.
+fn start_ready_machine(scratch: &Scratch) -> (Context, Machine) {
+    let mut context = plain_task_context(scratch);
+    context.pci_names = scratch.write("pci.ids", crate::setup::cards::stand_in::NAMES);
+    crate::setup::cards::stand_in::fake_pci(scratch, "0000:01:00.0", 0x2704, "0x10de", "0x030000");
+    fs::create_dir_all(crate::settings::driver_folder(&context)).unwrap();
+    let card = serde_json::json!({"card": {"device": 1}});
+    crate::settings::write_setup(&context, card.as_object().cloned().unwrap()).unwrap();
+    context.agent = Arc::new(ScriptedAgent::answering(&[]));
+    let mut vm = machine(&context);
+    assert!(
+        Command::new("qemu-img")
+            .args(["create", "-q", "-f", "qcow2", &vm.disk, "1G"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    vm.vars = scratch.write("vars.fd", "firmware").display().to_string();
+    vm.save(&context).unwrap();
+    crate::agent::make_token(&context, &vm).unwrap();
+    (context, vm)
+}
+
+#[test]
+fn a_start_that_fails_after_its_snapshot_offers_going_back_to_it() {
+    let scratch = Scratch::new();
+    let (context, vm) = start_ready_machine(&scratch);
+    let vm = Machine { auto_snapshot: Some(true), ..vm };
+    let host = RecordingHost::default();
+    let mut task = Task::new(&context, &host, "start", vm.clone());
+    let failed = start(&mut task).unwrap_err();
+    assert!(!failed.0.is_empty());
+    assert_eq!(host.said()[0], "start gpu", "the snapshot is before the VM");
+    let offered = status(&context, &vm).restore_point.expect("offered");
+    assert!(offered.name.starts_with("Automatic: before "), "{}", offered.name);
+    assert_eq!(crate::snapshots::list_snapshots(&context, &vm).len(), 1);
+    let mut second = Task::new(&context, &host, "start", vm.clone());
+    let _ = start(&mut second);
+    assert_eq!(crate::snapshots::list_snapshots(&context, &vm).len(), 1, "a retry takes no other");
+    assert_eq!(status(&context, &vm).restore_point, Some(offered));
+}
+
+#[test]
+fn a_start_with_the_switch_off_takes_no_snapshot() {
+    let scratch = Scratch::new();
+    let (context, vm) = start_ready_machine(&scratch);
+    let vm = Machine { auto_snapshot: Some(false), ..vm };
+    let host = RecordingHost::default();
+    let mut task = Task::new(&context, &host, "start", vm.clone());
+    let _ = start(&mut task);
+    assert!(crate::snapshots::list_snapshots(&context, &vm).is_empty());
+    assert_eq!(status(&context, &vm).restore_point, None);
 }

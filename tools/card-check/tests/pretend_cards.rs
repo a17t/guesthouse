@@ -1,6 +1,8 @@
 //! The program on the pretend Ada, Ampere and Turing cards: what it finds, what it says, and what never
 //! reaches the file. Nothing here goes near a card.
 
+#![cfg(target_os = "linux")]
+
 use guesthouse_backend::PciAddress;
 use guesthouse_backend_nvidia::profile::{ADA, AMPERE, BLACKWELL, Generation, HOST_615, TURING};
 use guesthouse_backend_nvidia::record::card::UUID;
@@ -28,7 +30,12 @@ struct Expected {
     nodes: usize,
     classes: usize,
     copy_caps: u32,
+    /// The channels the test tries, by label: one on each video engine where video runs, and on the
+    /// optical flow engine where its node takes a context.
+    channels: &'static [&'static str],
 }
+
+const NO_VIDEO_CHANNELS: &[&str] = &["graphics", "copy"];
 
 const CARDS: [Expected; 3] = [
     Expected {
@@ -39,6 +46,7 @@ const CARDS: [Expected; 3] = [
         nodes: 15,
         classes: 127,
         copy_caps: 0x1A0,
+        channels: NO_VIDEO_CHANNELS,
     },
     Expected {
         card: &FAKE_AMPERE,
@@ -48,6 +56,13 @@ const CARDS: [Expected; 3] = [
         nodes: 13,
         classes: 110,
         copy_caps: 0x1A0,
+        channels: &[
+            "graphics",
+            "copy",
+            "video engine 0x13 (class 0xC7B0)",
+            "video engine 0x1b (class 0xC7B7)",
+            "video engine 0x33 (class 0xC7FA)",
+        ],
     },
     Expected {
         card: &FAKE_TURING,
@@ -57,6 +72,7 @@ const CARDS: [Expected; 3] = [
         nodes: 14,
         classes: 110,
         copy_caps: 0x120,
+        channels: NO_VIDEO_CHANNELS,
     },
 ];
 
@@ -127,11 +143,15 @@ fn the_pretend_cards_are_read_as_the_tables_say() {
 }
 
 #[test]
-fn ada_and_turing_are_experimental_and_have_never_run() {
+fn the_pretend_cards_are_experimental_and_of_their_generations_only_ampere_has_run() {
     for expected in &CARDS {
         let findings = findings_on(expected.card);
-        let wanted = Verdict::Experimental { generation: expected.generation.name, ever_run: false };
+        let ever_run = expected.generation == &AMPERE;
+        let wanted = Verdict::Experimental { generation: expected.generation.name, ever_run };
         assert_eq!(findings.verdict, wanted);
+        let text = card_lines(0, &findings);
+        let said = text.contains(&format!("{} has run a guest, but this card has not.", AMPERE.name));
+        assert_eq!(said, ever_run, "{text}");
     }
 }
 
@@ -153,11 +173,11 @@ fn a_card_with_no_profile_or_an_unknown_sm_is_refused_by_name() {
     assert!(reason.contains("0x140"), "{reason}");
     assert!(!findings.classes.is_empty(), "the classes are still listed");
 
-    let odd_sm = FakeCard { sm_version: 0x705, ..FAKE_TURING };
+    let odd_sm = FakeCard { sm_version: 0x701, ..FAKE_TURING };
     let findings = findings_on(&odd_sm);
     assert_eq!(findings.shader_set, None);
     let Verdict::Refused(reason) = &findings.verdict else { panic!("{:?}", findings.verdict) };
-    assert!(reason.contains("SM 0x705"), "{reason}");
+    assert!(reason.contains("SM 0x701"), "{reason}");
 }
 
 #[test]
@@ -174,6 +194,15 @@ fn the_report_says_what_was_found_and_what_the_app_would_do() {
         assert!(text.contains("Verdict: experimental"), "{text}");
         assert!(text.contains("decoder 0"), "{text}");
         assert!(text.contains("encoder 0"), "{text}");
+    }
+}
+
+#[test]
+fn only_a_generation_whose_video_does_not_run_is_told_its_node_types_are_unset() {
+    for expected in &CARDS {
+        let text = card_lines(0, &findings_on(expected.card));
+        let told = text.contains("node types still unset");
+        assert_eq!(told, !expected.generation.nodes.video_runs, "{text}");
     }
 }
 
@@ -215,11 +244,18 @@ fn the_channel_test_makes_this_generations_channels_and_no_other() {
         )
         .unwrap();
         let labels: Vec<&str> = results.iter().map(|result| result.label.as_str()).collect();
-        assert_eq!(labels, ["graphics", "copy"], "no video channel where video does not run");
+        assert_eq!(labels, expected.channels, "a video channel only where video runs");
         assert!(results.iter().all(|result| result.outcome == Outcome::NotReleased));
         let made: Vec<u32> = device.rm.allocated().map(|(class, _)| class).collect();
         assert!(made.contains(&expected.generation.channel_class));
         assert!(made.contains(&expected.generation.copy_class));
+        let video = [expected.generation.video_decode_class, expected.generation.video_encode_class];
+        for class in video {
+            assert_eq!(made.contains(&class), expected.generation.nodes.video_runs, "{class:#x}");
+        }
+        if let Some(class) = expected.generation.nodes.optical_flow_class {
+            assert!(made.contains(&class), "{class:#x}");
+        }
         assert!(!made.contains(&BLACKWELL.channel_class));
         let text = channel_lines(&results);
         assert!(text.contains("graphics: NOT released"), "{text}");

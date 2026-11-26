@@ -1,25 +1,37 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "tools/card-check"]
+members = ["crates/*", "tools/card-check", "tools/hcs-boot"]
+# Microsoft's windows-reactor and the windows-rs crates it needs, vendored for the Windows app and
+# used by path from it. Not members: Windows only, and not this workspace's code.
+exclude = ["vendor/windows-reactor", "vendor/windows-rs"]
 # The app needs GTK's development files, which nothing else here does. Build it with `-p guesthouse-app`.
 default-members = [
     "crates/app-core",
     "crates/backend",
+    "crates/backend-intel",
     "crates/backend-nvidia",
     "crates/backend-standin",
+    "crates/control",
     "crates/core",
     "crates/daemon",
     "crates/frame-socket",
+    "crates/hcs",
+    "crates/host-windows",
+    "crates/installer-windows",
     "crates/jail",
     "crates/messages",
+    "crates/p9",
     "crates/replay",
     "crates/sensors",
+    "crates/share-windows",
+    "crates/service-windows",
     "crates/transport",
     "tools/card-check",
+    "tools/hcs-boot",
 ]
 
 [workspace.package]
-version = "0.5.1"
+version = "0.10.0"
 edition = "2024"
 rust-version = "1.88"
 publish = false
@@ -31,6 +43,7 @@ guesthouse-messages = { path = "crates/messages" }
 guesthouse-backend = { path = "crates/backend" }
 guesthouse-backend-standin = { path = "crates/backend-standin" }
 guesthouse-backend-amd = { path = "crates/backend-amd" }
+guesthouse-backend-intel = { path = "crates/backend-intel" }
 guesthouse-backend-nvidia = { path = "crates/backend-nvidia" }
 guesthouse-core = { path = "crates/core" }
 guesthouse-daemon = { path = "crates/daemon" }
@@ -38,6 +51,10 @@ guesthouse-app-core = { path = "crates/app-core" }
 guesthouse-frame-socket = { path = "crates/frame-socket" }
 guesthouse-sensors = { path = "crates/sensors" }
 guesthouse-jail = { path = "crates/jail" }
+guesthouse-card-check = { path = "tools/card-check" }
+guesthouse-control = { path = "crates/control" }
+guesthouse-hcs = { path = "crates/hcs" }
+guesthouse-host-windows = { path = "crates/host-windows" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

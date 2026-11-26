@@ -6,9 +6,11 @@
 //! frame socket from that same thread. The guest's memory comes from the app as descriptors: see
 //! [`handover`]. For a QEMU of someone else's it comes as two files instead: see [`memory_files`].
 
-#[cfg(feature = "amd")]
-pub mod amd_setup;
+// Linux only: the daemon is QEMU's peer on a Linux host. Other systems get an empty crate.
+#![cfg(target_os = "linux")]
+
 pub mod card_choice;
+pub mod desktop_note;
 pub mod display_note;
 pub mod environment;
 pub mod gpu_note;
@@ -23,6 +25,9 @@ pub mod server;
 pub mod setup;
 pub mod slot;
 pub mod startup;
-#[cfg(any(feature = "nvidia", feature = "amd"))]
+#[cfg(any(feature = "nvidia", feature = "amd", feature = "intel"))]
 mod store;
+pub mod use_note;
+#[cfg(any(feature = "amd", feature = "intel"))]
+pub mod vendor_setup;
 pub mod viewer;

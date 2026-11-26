@@ -7,15 +7,18 @@ use super::desktop::{
 };
 use crate::agent::guest_script;
 use crate::display::{
-    DisplayState, Driver, DriverPackage, PACKAGE_FILES, RunningScreen, SUPPORT_FILES, ScreenHdr, read_state,
-    ring_in, screen_hdr, write_state,
+    DisplayState, Driver, DriverPackage, PACKAGE_FILES, RunningScreen, SUPPORT_FILES, read_state, ring_in,
+    screen_hdr, write_state,
 };
 use crate::driver_modes::{DriverModes, SETTINGS_FILE, with_rate};
 use crate::failure::Result;
+use crate::gpu_maker::GpuMaker;
+use crate::intel_desktop;
 use crate::log::write_log;
 use crate::machine::REFRESH_RATES;
 use crate::screen_gpu::memory_frames;
 use crate::text::base64_encode;
+use crate::updates::VERSION;
 use guesthouse_daemon::display_note::ScreenNote;
 use guesthouse_daemon::gpu_note::read_note as read_gpu_note;
 use std::fs;
@@ -77,6 +80,8 @@ const NOT_UP: &str =
 const NOT_CONFIRMED: &str = "Windows hasn't confirmed this change with a picture yet.";
 const BLANK_BOOT: &str = "The display driver sent no picture on this boot. If that happens again on the next one, \
                           it's taken out.";
+const KEPT_OFF: &str = "An Intel card's desktop is drawn in software at this stage, and the display driver would \
+                        stop it, so Windows stays on its basic display.";
 const RESTART_OWED: &str = "Windows needs a restart to finish updating the display driver.";
 
 /// Why the screen is being set. A boot can give up on the driver, and a change to a running machine
@@ -111,7 +116,7 @@ impl Wanted {
             height: height.parse().unwrap_or_default(),
             hz: machine.refresh_hz,
             hdr: machine.hdr
-                && screen_hdr(task.context) == ScreenHdr::Shows
+                && screen_hdr(task.context).shows(machine.direct_frames())
                 && !memory_frames(task.context, machine),
         }
     }
@@ -140,7 +145,7 @@ impl Wanted {
         if memory_frames(task.context, &task.machine) {
             return MEMORY_FRAMES_SDR.to_owned();
         }
-        screen_hdr(task.context).sdr_reason().unwrap_or_default().to_owned()
+        screen_hdr(task.context).sdr_reason(task.machine.direct_frames()).unwrap_or_default().to_owned()
     }
 }
 
@@ -209,7 +214,7 @@ fn install(task: &Task, package: &DriverPackage, state: &mut DisplayState, found
     write_log(task.context, &format!("display driver: {}", said.trim()))?;
     if !went_in(&said) {
         take_out(task)?;
-        state.failed_package.clone_from(&package.id);
+        mark_failed(state, package.id.clone());
         return fail(task, state, DID_NOT_INSTALL, "the install did not finish");
     }
     let wanted = Wanted::of(task);
@@ -222,12 +227,40 @@ fn install(task: &Task, package: &DriverPackage, state: &mut DisplayState, found
     state.driver = Driver::Installed;
     state.package.clone_from(&package.id);
     state.failed_package.clear();
+    state.failed_on.clear();
     state.reason.clear();
     state.shown_frames = false;
     state.blank_boots = 0;
     state.restart_owed = said.contains(RESTART_MARK);
     // The install put the shipped settings back in Windows.
     state.offered_hz = 0;
+    Ok(())
+}
+
+/// `package` failed on this version of the app, so a start doesn't try it again.
+fn mark_failed(state: &mut DisplayState, package: String) {
+    state.failed_package = package;
+    state.failed_on = VERSION.to_owned();
+}
+
+/// An Intel machine's display driver that failed under an older app failed on a desktop the card
+/// couldn't draw, as no older app ran the guest's work on the card, so its failure says nothing of
+/// the driver. A start on the hardware desktop gives it its try again. One that fails on this
+/// version stays out until the next, as for any card.
+fn forgive_older_apps_failure(task: &Task, state: &mut DisplayState) -> Result<()> {
+    let intel = task.machine.windows_maker() == Some(GpuMaker::Intel);
+    if !intel || state.failed_package.is_empty() || state.failed_on == VERSION {
+        return Ok(());
+    }
+    let on = if state.failed_on.is_empty() { "an older version" } else { state.failed_on.as_str() };
+    write_log(
+        task.context,
+        &format!(
+            "display driver: it failed under {on} of the app, on a desktop the card couldn't draw; tried again on the hardware desktop"
+        ),
+    )?;
+    state.failed_package.clear();
+    state.failed_on.clear();
     Ok(())
 }
 
@@ -247,8 +280,35 @@ fn take_out(task: &Task) -> Result<()> {
     Ok(())
 }
 
-/// Sees that the driver is in, if it can be. `again` is someone asking for another try.
+/// Whether this machine's driver stays out of Windows: an Intel card's, unless the stage gives it the
+/// hardware desktop. Windows would have its compositor draw the driver's display on the card.
+fn kept_off(task: &Task) -> bool {
+    task.machine.windows_maker() == Some(GpuMaker::Intel)
+        && !intel_desktop::for_start(task.context, &task.machine).has_display_driver()
+}
+
+/// Takes the driver out if Windows has it, and says why it stays out.
+fn keep_off(task: &Task, state: &mut DisplayState) -> Result<()> {
+    task.step("Checking the display driver");
+    match device(task) {
+        Some(Device::Working | Device::Broken) => take_out(task)?,
+        Some(Device::Missing) => {}
+        None => write_log(task.context, "display driver: the agent did not say how the device is")?,
+    }
+    state.driver = Driver::Absent;
+    state.package.clear();
+    state.reason = KEPT_OFF.to_owned();
+    state.running = None;
+    Ok(())
+}
+
+/// Sees that the driver is in, if it can be. `again` is someone asking for another try. A driver kept
+/// off is taken out instead.
 fn make_sure_of_driver(task: &Task, state: &mut DisplayState, again: bool) -> Result<()> {
+    if kept_off(task) {
+        return keep_off(task, state);
+    }
+    forgive_older_apps_failure(task, state)?;
     task.step("Checking the display driver");
     let Some(found) = device(task) else {
         write_log(task.context, "display driver: the agent did not say how the device is")?;
@@ -357,7 +417,8 @@ fn settle_on_basic(task: &mut Task, state: &mut DisplayState, wanted: &Wanted) -
 
 fn give_up(task: &mut Task, state: &mut DisplayState, wanted: &Wanted, reason: &str) -> Result<()> {
     take_out(task)?;
-    state.failed_package = std::mem::take(&mut state.package);
+    let package = std::mem::take(&mut state.package);
+    mark_failed(state, package);
     fail(task, state, reason, "taken out again, as it never came up")?;
     settle_on_basic(task, state, wanted)
 }
@@ -431,6 +492,9 @@ fn apply(task: &mut Task, state: &mut DisplayState, occasion: Occasion) -> Resul
     let wanted = Wanted::of(task);
     let Wanted { width, height, hz, .. } = wanted;
     task.step(&format!("Setting the display to {width}x{height} at {hz} Hz"));
+    if kept_off(task) {
+        return settle_on_basic(task, state, &wanted);
+    }
     let expected = state.driver == Driver::Installed;
     let Some(mut screen) = tell_windows(task, &wanted, expected, 0)? else {
         return no_word_from_windows(task, state, &wanted, occasion);

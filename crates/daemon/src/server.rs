@@ -6,6 +6,7 @@
 use crate::display_note::{self, ScreenNote};
 use crate::gpu_note::write_note;
 use crate::router::{Channel, FrameSink, Router};
+use crate::use_note::UseNote;
 use crate::viewer::ViewerPort;
 use guesthouse_backend::{Backend, GuestMemory};
 use guesthouse_core::Waiting;
@@ -29,6 +30,10 @@ const FENCE_POLL: Duration = Duration::from_micros(20);
 const BACKGROUND_POLL: Duration = Duration::from_millis(1);
 /// How often to log where submissions spend their time, when asked to measure that.
 const TIMING_REPORT: Duration = Duration::from_secs(10);
+/// How long to go on looking without sleeping when a read got only part of a frame. QEMU writes a
+/// packet in up to three parts, and the rest follows within microseconds; a sleep and a wake cost
+/// more than that.
+const PARTIAL_FRAME_LIMIT: Duration = Duration::from_micros(100);
 /// How long every channel can stay closed before QEMU counts as gone. A QEMU that's alive connects
 /// again within half a second.
 const QEMU_GONE_AFTER: Duration = Duration::from_secs(5);
@@ -39,7 +44,11 @@ const NO_DESCRIPTOR: i32 = -1;
 const CHANNEL_PLACES: usize = 2 * Channel::ALL.len();
 const VIEWER_LISTENER: usize = CHANNEL_PLACES;
 const VIEWER_SOCKET: usize = CHANNEL_PLACES + 1;
-const ALL_PLACES: usize = CHANNEL_PLACES + 2;
+/// The descriptor the GPU's own interrupts post to, when the backend has one. Its readiness needs
+/// no dealing-with: whatever it woke the loop for is re-read by the poll below, as every tick
+/// re-reads it.
+const GPU_WAKE: usize = CHANNEL_PLACES + 2;
+const ALL_PLACES: usize = CHANNEL_PLACES + 3;
 /// QEMU runs as the same user, and nobody else has business with these.
 pub(crate) const OWNER_ONLY: u32 = 0o600;
 
@@ -81,9 +90,13 @@ pub struct Server<B, M> {
     viewers: ViewerPort,
     waiting: Waiting,
     urgent_since: Option<Instant>,
+    /// The descriptor the GPU's interrupts post to, when the backend has one.
+    wake: Option<i32>,
     scratch: Vec<u8>,
     /// QEMU has connected at some point, so a closed channel means something.
     qemu_seen: bool,
+    /// Since when a channel has held part of a frame, if one does.
+    partial_since: Option<Instant>,
     /// When the last channel closed, if they're all closed.
     all_closed_since: Option<Instant>,
     qemu_gone_after: Duration,
@@ -92,12 +105,17 @@ pub struct Server<B, M> {
     said_stopped: bool,
     /// What the app has been told about the display driver's screen.
     said_screen: Option<ScreenNote>,
+    /// What the app is told about the guest's video memory.
+    use_note: UseNote,
 }
 
 impl<B: Backend, M: GuestMemory> Server<B, M> {
     /// Listens in `run_folder`, replacing sockets a previous daemon left behind.
     pub fn bind(run_folder: &Path, router: Router<B, M>) -> io::Result<Self> {
         fs::create_dir_all(run_folder)?;
+        // Told before the sockets are there, so the app finds a figure as soon as QEMU can connect.
+        let mut use_note = UseNote::open(run_folder);
+        use_note.tell(Instant::now(), || router.session().video_use());
         let mut ports = Vec::new();
         for channel in Channel::ALL {
             let path = run_folder.join(channel.socket_name());
@@ -118,13 +136,16 @@ impl<B: Backend, M: GuestMemory> Server<B, M> {
             viewers,
             waiting: Waiting::Nothing,
             urgent_since: None,
+            wake: None,
             scratch: Vec::new(),
             qemu_seen: false,
+            partial_since: None,
             all_closed_since: None,
             qemu_gone_after: QEMU_GONE_AFTER,
             run_folder: run_folder.to_owned(),
             said_stopped: false,
             said_screen: None,
+            use_note,
         })
     }
 
@@ -182,7 +203,11 @@ impl<B: Backend, M: GuestMemory> Server<B, M> {
 
     /// How long to wait for the next message: what's waiting on fences, or the end of the wait for QEMU.
     fn next_timeout(&mut self, now: Instant) -> Option<Duration> {
-        let for_fences = self.fence_timeout(now);
+        let mut for_fences = shortest(self.fence_timeout(now), self.use_note.due_in(now));
+        if self.partial_since.is_some_and(|since| now.saturating_duration_since(since) < PARTIAL_FRAME_LIMIT)
+        {
+            for_fences = Some(Duration::ZERO);
+        }
         let Some(since) = self.all_closed_since else { return for_fences };
         let left = self.qemu_gone_after.saturating_sub(now - since);
         Some(for_fences.map_or(left, |timeout| timeout.min(left)))
@@ -200,7 +225,13 @@ impl<B: Backend, M: GuestMemory> Server<B, M> {
             }
             Waiting::Urgent => {
                 let since = *self.urgent_since.get_or_insert(now);
-                Some(if now - since < SPIN_LIMIT { Duration::ZERO } else { FENCE_POLL })
+                if now - since < SPIN_LIMIT {
+                    return Some(Duration::ZERO);
+                }
+                // Only the copy channel raises the surface's interrupt, and these fences are the
+                // guest's own channels', which nothing binds: they keep the tight pace whatever the
+                // surface's descriptor is doing for the copies.
+                Some(FENCE_POLL)
             }
         }
     }
@@ -216,6 +247,12 @@ impl<B: Backend, M: GuestMemory> Server<B, M> {
         let (listener, viewer, blocked) = self.viewers.wait_on();
         descriptors[VIEWER_LISTENER].fd = listener;
         descriptors[VIEWER_SOCKET].fd = viewer;
+        // The copy channel's surface is made lazily, so the descriptor is asked for every step.
+        self.wake = self.router.session_mut().wake_descriptor();
+        if let Some(fd) = self.wake {
+            descriptors[GPU_WAKE].fd = fd;
+            descriptors[GPU_WAKE].events = libc::POLLIN | libc::POLLPRI;
+        }
         if blocked {
             descriptors[VIEWER_SOCKET].events |= libc::POLLOUT;
         }
@@ -223,6 +260,7 @@ impl<B: Backend, M: GuestMemory> Server<B, M> {
         for (index, pair) in descriptors[..CHANNEL_PLACES].as_chunks::<2>().0.iter().enumerate() {
             if pair[1].revents != 0 {
                 self.read_channel(index);
+                self.use_note.guest_spoke();
             }
             if pair[0].revents != 0 {
                 let (stream, _) = self.ports[index].listener.accept()?;
@@ -231,6 +269,15 @@ impl<B: Backend, M: GuestMemory> Server<B, M> {
                 self.ports[index].connection = Some(Connection { stream, frames: FrameStream::new() });
             }
         }
+        let partial = self
+            .ports
+            .iter()
+            .filter_map(|port| port.connection.as_ref())
+            .any(|open| open.frames.has_partial());
+        self.partial_since = match (partial, self.partial_since) {
+            (false, _) => None,
+            (true, since) => since.or_else(|| Some(Instant::now())),
+        };
         // The guest's channels went first, and the viewer's trouble is only ever the viewer's.
         let session = self.router.session_mut();
         if descriptors[VIEWER_SOCKET].revents != 0 {
@@ -239,10 +286,15 @@ impl<B: Backend, M: GuestMemory> Server<B, M> {
         if descriptors[VIEWER_LISTENER].revents != 0 {
             self.viewers.accept(session);
         }
+        if self.wake.is_some() && descriptors[GPU_WAKE].revents != 0 {
+            self.router.session_mut().gpu_woke(Instant::now());
+        }
         let mut sink = Connections { ports: &mut self.ports, scratch: &mut self.scratch };
         self.waiting = self.router.poll(Instant::now(), &mut sink)?;
         self.router.session_mut().offer_frames(&mut self.viewers);
         self.keep_the_app_told();
+        let session = self.router.session();
+        self.use_note.tell(Instant::now(), || session.video_use());
         Ok(())
     }
 
@@ -298,6 +350,13 @@ impl<B: Backend, M: GuestMemory> Server<B, M> {
                 *connection = None;
             }
         }
+    }
+}
+
+fn shortest(one: Option<Duration>, other: Option<Duration>) -> Option<Duration> {
+    match (one, other) {
+        (Some(one), Some(other)) => Some(one.min(other)),
+        (one, other) => one.or(other),
     }
 }
 

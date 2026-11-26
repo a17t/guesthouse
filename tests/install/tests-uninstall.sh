@@ -189,6 +189,7 @@ t_deleting_machines_goes_with_the_right_name() {
 t_a_store_moved_by_the_pointer_is_the_one_shown() {
     install_plain
     mkdir -p "$H/.config/guesthouse"
+    # shellcheck disable=SC2088 # the file holds a literal tilde, which is what the test is about
     echo "~/big disk" >"$H/.config/guesthouse/store"
     make_machine "$H/big disk"
     answering "yes\n$H/big disk/machines\n" "$SHELL_UNDER_TEST" "$(uninstaller)" --delete-machines

@@ -8,14 +8,17 @@
 use super::{Handled, Session, answer_status};
 use crate::deferred::DeferredAction;
 use crate::gpu_addresses::{ALLOCATION_ALIGN, AddressUse, GPU_RANGES, Window};
-use crate::tables::ReservedRange;
-use guesthouse_backend::{Backend, GuestMemory, SpaceId};
+use crate::tables::{Mapping, ReservedRange};
+use guesthouse_backend::{Backend, GuestMemory, MemoryKind, RangeView, SpaceId};
 use guesthouse_messages::address::{ReserveRequest, freed_address};
 use guesthouse_messages::wire::{align_up, put_u64};
 use guesthouse_messages::{MessageHeader, Status};
 
 /// The answer has no status, so an address of zero is how a reservation fails.
 const NO_ADDRESS: u64 = 0;
+
+/// The smallest range whose size is taken to tell which kind of surface a later range is for.
+const SIZE_TELLS_FROM: u64 = 1 << 20;
 
 fn window_of(request: &ReserveRequest) -> Window {
     let to = if request.limit == 0 { u64::MAX } else { request.limit };
@@ -32,18 +35,31 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
     /// they stay mapped in the backend until then.
     pub(super) fn taken_in(&self, space: SpaceId) -> Vec<(u64, u64)> {
         let reserved = self.reserved_addresses.iter().filter(|range| range.space == space);
-        let live = self.allocations.values().flat_map(|allocation| &allocation.mappings);
-        let freed = self.deferred.iter().filter_map(|item| match &item.action {
-            DeferredAction::FreeAllocation(freed) => Some(freed),
-            _ => None,
-        });
-        let waiting = freed.flat_map(|freed| &freed.mappings);
-        let mapped = live.chain(waiting).filter(|mapping| mapping.space == space);
+        let mapped = self.mappings_held().filter(|mapping| mapping.space == space);
         reserved
             .map(|range| (range.address, range.address + range.size))
             .chain(mapped.map(|mapping| (mapping.address, mapping.address + mapping.length)))
             .chain(self.gpu_addresses.host_ranges().iter().copied())
             .collect()
+    }
+
+    /// Every mapping still in the backend, in every space: the live ones, and those of allocations
+    /// whose free waits for the GPU.
+    fn mappings_held(&self) -> impl Iterator<Item = &Mapping> {
+        let live = self.allocations.values().flat_map(|allocation| &allocation.mappings);
+        let freed = self.deferred.iter().filter_map(|item| match &item.action {
+            DeferredAction::FreeAllocation(freed) => Some(freed),
+            _ => None,
+        });
+        live.chain(freed.flat_map(|freed| &freed.mappings))
+    }
+
+    /// What is mapped in any space, as (start, end), which new hand-outs step over. Addresses handed
+    /// out have to work in whichever space they end up in, and a guest maps pages of its own where it
+    /// likes, even inside a range that was handed out for something else.
+    pub(super) fn mapped_anywhere(&self) -> Vec<(u64, u64)> {
+        let mapped = self.mappings_held().filter(|mapping| mapping.length != 0);
+        mapped.map(|mapping| (mapping.address, mapping.address + mapping.length)).collect()
     }
 
     /// The exact range asked for, if it is in the ranges and free in this space.
@@ -63,6 +79,8 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
     /// Somewhere in the window. Returns the address, and whether it was placed and not handed out.
     fn find_room(&mut self, window: Window, size: u64, space: SpaceId) -> Option<(u64, bool)> {
         let usage = AddressUse::Reserved;
+        // A freed reservation can still hold the guest's pages, and goes out again anyway: nothing is
+        // mapped over them until the guest maps there, which clears what it left.
         if let Some(base) = self.gpu_addresses.take_within(size, ALLOCATION_ALIGN, usage, window) {
             return Some((base, false));
         }
@@ -76,19 +94,82 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
         Some((self.place(base, size), true))
     }
 
+    /// The kind of the surface described just before a range was asked for, or plain.
+    ///
+    /// NVIDIA's Vulkan driver makes a depth image in three steps: a small allocation that says what
+    /// the image is and is never mapped, a range set aside for it, and maps of a plain heap into
+    /// that range. Nothing in the maps says the pages are depth, so the range has to remember it.
+    /// An allocation that was mapped, or made before another one, is not such a description. The
+    /// driver may destroy it before it asks for the range, and may ask for several ranges after
+    /// one, so it counts for every range until the next allocation.
+    ///
+    /// Testers' logs show a description with a range right after it and no link made in the same
+    /// process, so the newest description in the session counts too, whichever process made it.
+    ///
+    /// The driver describes an image once and may make more like it with no new description. Until
+    /// it is known what marks those, a range of the same size as a described one, in the same
+    /// process, is taken to be for the same kind of surface. Small ranges are left out, as buffers
+    /// of a few pages come in the same sizes as small images.
+    fn described_surface(&mut self, process: u32, size: u64) -> MemoryKind {
+        let own = self.described_surfaces.get(&process).map(|&(_, kind)| kind);
+        let described = own.or_else(|| {
+            let (owner, handle, kind) = self.newest_description?;
+            log::debug!(
+                "a range in process {process:#x} takes the kind of {handle:#x}, described in process {owner:#x}"
+            );
+            Some(kind)
+        });
+        match described {
+            Some(kind) if size >= SIZE_TELLS_FROM => {
+                self.surface_range_sizes.insert((process, size), kind);
+                kind
+            }
+            Some(kind) => kind,
+            None => self.surface_range_sizes.get(&(process, size)).copied().unwrap_or(MemoryKind::PLAIN),
+        }
+    }
+
+    /// The driver's protection value for a map at `address`, with the backend's word for the
+    /// surface the range there was set aside for, if it was for one.
+    pub(super) fn protection_in_range(&self, address: u64, space: SpaceId, driver_protection: u64) -> u64 {
+        let holds = |range: &&ReservedRange| {
+            range.space == space
+                && range.view != RangeView::NONE
+                && (range.address..range.address + range.size).contains(&address)
+        };
+        let Some(range) = self.reserved_addresses.iter().find(holds) else { return driver_protection };
+        let viewed = self.backend.protection_for_view(range.view, driver_protection);
+        if viewed != driver_protection {
+            log::debug!(
+                "a map at {address:#x} is in the range at {:#x}, so its driver protection is {viewed:#x}",
+                range.address
+            );
+        }
+        viewed
+    }
+
     pub(super) fn reserve_gpu_addresses(&mut self, message: &[u8], out: &mut Vec<u8>) -> Handled {
         let request = ReserveRequest::parse(message)?;
-        let space = self.space_for(MessageHeader::process_of(message)?)?;
+        let process = MessageHeader::process_of(message)?;
+        let space = self.space_for(process)?;
+        let (protection, driver_protection) = ReserveRequest::protections(message).unwrap_or_default();
+        let view = RangeView { surface: self.described_surface(process, request.size), driver_protection };
         let found = request.size.checked_add(ALLOCATION_ALIGN).and_then(|_| {
             let size = align_up(request.size, ALLOCATION_ALIGN);
             let found = match request.base {
                 0 => self.find_room(window_of(&request), size, space),
                 base => self.place_at(base, size, space).map(|base| (base, true)),
             };
-            found.map(|(address, placed)| ReservedRange { address, size, space, placed })
+            found.map(|(address, placed)| ReservedRange { address, size, space, placed, view })
         });
         let address = found.map_or(NO_ADDRESS, |range| range.address);
-        log::debug!("reservation {request:x?} got {address:#x}");
+        log::debug!(
+            "reservation in process {process:#x} {request:x?} got {address:#x}, protection {protection:#x}, \
+             driver protection {driver_protection:#x}"
+        );
+        if view.surface != MemoryKind::PLAIN {
+            log::debug!("the range at {address:#x} is for a surface of kind {:#x}", view.surface.0);
+        }
         match found {
             Some(range) => self.reserved_addresses.push(range),
             None => log::warn!("refused a reservation: {request:x?}"),

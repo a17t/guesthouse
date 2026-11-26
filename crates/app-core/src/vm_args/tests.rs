@@ -140,11 +140,22 @@ fn the_slot_sets_every_name() {
     assert!(arguments.iter().any(|word| word.contains("/run-2/qmp.sock,")));
 }
 
+/// The helper for dragged files is Windows', and only a Windows guest has the agent that starts it.
+#[test]
+fn only_a_windows_guest_gets_the_forward_for_dragged_files() {
+    let (_scratch, plan) = plan(&plain_machine(), plain_boot());
+    assert_eq!(plan.files_port, None);
+    assert!(!value_after(&plan.qemu_arguments(), "-nic").contains("8767"));
+}
+
 #[test]
 fn nothing_set_is_the_line_every_machine_had() {
     let (_scratch, plan) = plan(&windows(), Boot::Gpu);
     let arguments = plan.qemu_arguments();
-    assert_eq!(value_after(&arguments, "-nic"), "user,model=e1000e,hostfwd=tcp:127.0.0.1:18765-:8765");
+    assert_eq!(
+        value_after(&arguments, "-nic"),
+        "user,model=e1000e,hostfwd=tcp:127.0.0.1:18765-:8765,hostfwd=tcp:127.0.0.1:18865-:8767"
+    );
     assert!(!has(&arguments, "-netdev"), "NAT has one adapter");
 }
 
@@ -153,7 +164,9 @@ fn no_internet_keeps_the_agent() {
     let machine = Machine { network_mode: Mode::None, ..windows() };
     let (_scratch, plan) = plan(&machine, Boot::Gpu);
     let nic = value_after(&plan.qemu_arguments(), "-nic");
-    assert!(nic.starts_with("user,model=e1000e,restrict=on,hostfwd=tcp:127.0.0.1:18765-:8765"));
+    assert!(nic.starts_with(
+        "user,model=e1000e,restrict=on,hostfwd=tcp:127.0.0.1:18765-:8765,hostfwd=tcp:127.0.0.1:18865-:8767"
+    ));
 }
 
 #[test]
@@ -173,7 +186,7 @@ fn bridged_goes_through_the_helper_and_adds_the_private_link_last() {
             crate::network::bridge_helper()
         )
     );
-    assert!(value_after(&arguments, "-netdev").ends_with("-:8765,hostfwd=udp:127.0.0.1:5000-:50"));
+    assert!(value_after(&arguments, "-netdev").ends_with("-:8767,hostfwd=udp:127.0.0.1:5000-:50"));
     assert_eq!(arguments.last().unwrap(), "e1000e,netdev=link,mac=52:54:00:67:68:01,bus=pcie.0,addr=0x1e");
 }
 
@@ -190,6 +203,116 @@ fn passt_has_its_own_addresses_and_the_private_link() {
     let words = plan.passt_words();
     assert!(words.windows(2).any(|two| two == ["--dns-host", "192.168.1.1"]), "{words:?}");
     assert!(words.windows(2).any(|two| two == ["--map-host-loopback", "none"]), "{words:?}");
+}
+
+fn held_to(interface: &str, ipv6: bool) -> NetworkPlan {
+    let through = OnlyThrough { interface: interface.into(), ipv6 };
+    NetworkPlan { passt: true, only_through: Some(through), ..plan(&windows(), Boot::Gpu).1.network }
+}
+
+#[test]
+fn an_interface_with_ipv6_binds_both_families_to_it() {
+    let (_scratch, plan) = plan(&windows(), Boot::Gpu);
+    let plan = VmPlan { network: held_to("wg0", true), ..plan };
+    let words = plan.passt_words();
+    assert!(words.windows(2).any(|two| two == ["--outbound-if4", "wg0"]), "{words:?}");
+    assert!(words.windows(2).any(|two| two == ["--outbound-if6", "wg0"]), "{words:?}");
+    assert!(!words.contains(&"--ipv4-only".to_owned()));
+}
+
+#[test]
+fn an_interface_without_ipv6_makes_the_guest_ipv4_only() {
+    let (_scratch, plan) = plan(&windows(), Boot::Gpu);
+    let plan = VmPlan { network: held_to("tun0", false), ..plan };
+    let words = plan.passt_words();
+    assert!(words.windows(2).any(|two| two == ["--outbound-if4", "tun0"]), "{words:?}");
+    assert!(words.contains(&"--ipv4-only".to_owned()));
+    assert!(!words.contains(&"--outbound-if6".to_owned()));
+}
+
+#[test]
+fn a_machine_that_is_not_held_to_an_interface_has_none_of_these_words() {
+    let (_scratch, mut plan) = plan(&windows(), Boot::Gpu);
+    plan.network.passt = true;
+    let words = plan.passt_words();
+    assert!(!words.iter().any(|word| word.starts_with("--outbound") || word == "--ipv4-only"), "{words:?}");
+}
+
+#[test]
+fn the_setting_takes_passt_whatever_the_switch_says_and_only_in_nat() {
+    let held = Machine { only_through: "wg0".into(), dns: "10.64.0.1".into(), ..windows() };
+    let (_scratch, nat) = plan(&held, Boot::Gpu);
+    assert!(nat.network.passt, "the switch is off");
+    assert_eq!(nat.network.only_through.as_ref().map(|found| found.interface.as_str()), Some("wg0"));
+    assert_eq!(nat.network.resolver.as_deref(), Some("10.64.0.1"), "the typed server is the guest's");
+    let bridged = Machine { network_mode: Mode::Bridged, ..held };
+    let (_scratch, bridged) = plan(&bridged, Boot::Gpu);
+    assert_eq!(bridged.network.only_through, None);
+    assert!(!bridged.network.passt);
+}
+
+#[test]
+fn the_launchers_passt_is_never_swapped_for_qemus_own_network() {
+    let (_scratch, plan) = plan(&windows(), Boot::Gpu);
+    let plan = VmPlan { jail: None, network: held_to("wg0", true), ..plan };
+    let arguments = plan.qemu_arguments();
+    let nic = value_after(&arguments, "-nic");
+    assert_eq!(nic, format!("socket,model=e1000e,fd={PASST_FD}"));
+}
+
+#[test]
+fn passt_without_loopback_none_is_given_no_map_gw_by_qemu_and_the_launcher() {
+    let (_scratch, mut plan) = plan(&windows(), Boot::Gpu);
+    plan.network.passt = true;
+    plan.network.resolver = Some("127.0.0.53".into());
+    plan.network.passt_age = PasstAge::NoLoopbackNone;
+    let nic = value_after(&plan.qemu_arguments(), "-nic");
+    assert!(nic.contains(",gateway=10.0.3.2,param=--no-map-gw,dns=10.0.3.3,"), "{nic}");
+    assert!(nic.ends_with("dns-forward=10.0.3.3,dns-host=127.0.0.53") && !nic.contains("map-host-loopback"));
+    let words = plan.passt_words();
+    assert!(words.contains(&"--no-map-gw".to_owned()) && !words.contains(&"--map-host-loopback".to_owned()));
+    assert!(words.windows(2).any(|two| two == ["--dns-host", "127.0.0.53"]), "{words:?}");
+}
+
+#[test]
+fn passt_without_dns_host_tells_the_guest_the_hosts_resolver() {
+    let (_scratch, mut plan) = plan(&windows(), Boot::Gpu);
+    plan.network.passt = true;
+    plan.network.resolver = Some("192.168.1.1".into());
+    plan.network.passt_age = PasstAge::NoDnsHost;
+    let nic = value_after(&plan.qemu_arguments(), "-nic");
+    assert!(nic.ends_with(",gateway=10.0.3.2,param=--no-map-gw,dns=192.168.1.1"), "{nic}");
+    let words = plan.passt_words();
+    assert_eq!(&words[words.len() - 3..], ["--no-map-gw", "--dns", "192.168.1.1"]);
+    assert!(!words.iter().any(|word| word.starts_with("--dns-")), "{words:?}");
+}
+
+#[test]
+fn each_age_is_asked_with_its_own_words() {
+    let current = passt_probe_words(PasstAge::Current);
+    assert!(current.windows(2).any(|two| two == ["--map-host-loopback", "none"]), "{current:?}");
+    assert!(current.contains(&"--dns-host".to_owned()));
+    let middle = passt_probe_words(PasstAge::NoLoopbackNone);
+    assert!(middle.contains(&"--no-map-gw".to_owned()) && middle.contains(&"--dns-host".to_owned()));
+    let oldest = passt_probe_words(PasstAge::NoDnsHost);
+    assert!(oldest.contains(&"--no-map-gw".to_owned()));
+    assert!(!oldest.iter().any(|word| word == "--dns-host" || word == "--map-host-loopback"), "{oldest:?}");
+}
+
+#[test]
+fn the_disk_is_on_nvme_only_for_a_machine_on_it_and_the_cds_stay_on_sata() {
+    let (_scratch, on_nvme) = plan(&Machine { nvme: true, ..windows() }, Boot::Gpu);
+    assert!(on_nvme.nvme, "the plan has it from the machine");
+    let (_scratch, sata) = plan(&windows(), Boot::Gpu);
+    // The same plan but for the disk, as two plans have their own folders.
+    let nvme = VmPlan { nvme: true, ..sata.clone() };
+    let (sata, nvme) = (sata.qemu_arguments(), nvme.qemu_arguments());
+    assert!(has(&sata, "ide-hd,bus=ahci.0,drive=hd0,bootindex=1"));
+    assert!(has(&nvme, "nvme,serial=guesthouse,drive=hd0,bootindex=1"));
+    assert!(!nvme.iter().any(|word| word.starts_with("ide-hd")));
+    assert!(has(&nvme, "ahci,id=ahci") && has(&nvme, "ide-cd,bus=ahci.2,drive=cd1"));
+    let changed: Vec<_> = sata.iter().zip(&nvme).filter(|(old, new)| old != new).collect();
+    assert_eq!(changed.len(), 1, "nothing else moves: {changed:?}");
 }
 
 #[test]
@@ -366,4 +489,81 @@ fn standalone_keeps_the_drives_and_opens_them_by_name() {
         "driver=host_device,node-name=drive2,filename=/ids/b,cache.direct=on,discard=unmap"
     ));
     assert!(!arguments.iter().any(|word| word == "-add-fd" || word.contains("fdset")));
+}
+
+#[test]
+fn a_program_for_a_cleared_environment_is_given_by_where_path_finds_it() {
+    let shell = program_word("sh");
+    assert!(shell.starts_with('/') && shell.ends_with("/sh"), "{shell}");
+    assert_eq!(program_word("no-such-program-here"), "no-such-program-here");
+}
+
+#[test]
+fn the_first_card_has_the_machines_own_address_in_every_network_mode() {
+    let mac = "52:54:00:a2:1c:6d";
+    for machine in [windows(), plain_machine()] {
+        for (mode, passt, bridge) in [
+            (Mode::Nat, false, ""),
+            (Mode::Nat, true, ""),
+            (Mode::None, false, ""),
+            (Mode::Bridged, false, "br0"),
+        ] {
+            let machine = Machine {
+                network_mode: mode,
+                passt,
+                bridge: bridge.into(),
+                mac: mac.into(),
+                ..machine.clone()
+            };
+            let boot = if machine.kind == Kind::Plain { plain_boot() } else { Boot::Gpu };
+            let (_scratch, plan) = plan(&machine, boot);
+            let card = value_after(&plan.qemu_arguments(), "-nic");
+            assert!(card.contains(&format!(",mac={mac},")), "{mode:?} passt {passt}: {card}");
+        }
+    }
+}
+
+fn with_app_windows(context: &Context, machine: &Machine, on: bool) {
+    fs::create_dir_all(machine.folder(context)).unwrap();
+    crate::app_windows::set_on(context, machine, on).unwrap();
+}
+
+#[test]
+fn app_windows_on_adds_one_forward_for_its_helper_after_the_files_helpers() {
+    let scratch = Scratch::new();
+    let context = scratch_context(&scratch);
+    with_app_windows(&context, &windows(), true);
+    let plan = VmPlan::new(&context, &windows(), Boot::Gpu, slots::first(), 0);
+    assert_eq!(plan.app_windows_port, Some(18965));
+    assert_eq!(
+        value_after(&plan.qemu_arguments(), "-nic"),
+        "user,model=e1000e,hostfwd=tcp:127.0.0.1:18765-:8765,hostfwd=tcp:127.0.0.1:18865-:8767,\
+         hostfwd=tcp:127.0.0.1:18965-:8769"
+    );
+    let second = VmPlan::new(&context, &windows(), Boot::Gpu, slots::number(2), 0);
+    assert!(value_after(&second.qemu_arguments(), "-nic").ends_with("hostfwd=tcp:127.0.0.1:18967-:8769"));
+}
+
+#[test]
+fn with_app_windows_off_or_never_set_qemu_gets_the_words_it_always_did() {
+    let scratch = Scratch::new();
+    let context = scratch_context(&scratch);
+    let machine = windows();
+    let never = VmPlan::new(&context, &machine, Boot::Gpu, slots::first(), 0);
+    with_app_windows(&context, &machine, true);
+    with_app_windows(&context, &machine, false);
+    let off = VmPlan::new(&context, &machine, Boot::Gpu, slots::first(), 0);
+    assert_eq!(never.qemu_arguments(), off.qemu_arguments());
+    assert_eq!((never.app_windows_port, off.app_windows_port), (None, None));
+    assert!(!never.qemu_arguments().join(" ").contains("8769"));
+}
+
+#[test]
+fn only_a_windows_machine_can_have_the_forward_whatever_a_file_says() {
+    let scratch = Scratch::new();
+    let context = scratch_context(&scratch);
+    let machine = plain_machine();
+    fs::create_dir_all(machine.folder(&context)).unwrap();
+    fs::write(machine.folder(&context).join(crate::app_windows::SWITCH_FILE), "{\"on\":true}").unwrap();
+    assert_eq!(VmPlan::new(&context, &machine, plain_boot(), slots::first(), 0).app_windows_port, None);
 }

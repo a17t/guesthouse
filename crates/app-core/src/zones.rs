@@ -3,14 +3,15 @@
 //! The table comes from Unicode's public CLDR data, under the Unicode License v3: `data/windows-zones.txt`
 //! says where. Anything it can't place stays on UTC, which is also what the answer file's template says.
 
-use chrono::{Datelike, Local};
+use jiff::ZonedDateTime;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 
 pub const HOST_ZONE_LINK: &str = "/etc/localtime";
 const ZONE_TABLE: &str = include_str!("../data/windows-zones.txt");
-const ZONE_DATABASE: &str = "/usr/share/zoneinfo";
+/// NixOS keeps its zone files in `/etc`, behind the links its `/etc/localtime` goes through.
+const ZONE_DATABASES: [&str; 2] = ["/usr/share/zoneinfo", "/etc/zoneinfo"];
 const FALLBACK: &str = "UTC";
 
 /// The host's IANA zone, from where the link points. Empty if that says nothing.
@@ -32,7 +33,7 @@ fn plain_name(name: &str) -> bool {
 
 fn is_zone(zone: &str) -> bool {
     let safe = !zone.is_empty() && !zone.split('/').any(|part| part == ".." || part.is_empty());
-    safe && Path::new(ZONE_DATABASE).join(zone).is_file()
+    safe && ZONE_DATABASES.iter().any(|folder| Path::new(folder).join(zone).is_file())
 }
 
 /// A zone's UTC offsets on 1 January and 1 July of a year, or `None` if there's no such zone.
@@ -57,7 +58,7 @@ pub fn windows_zone(zone: &str) -> String {
     if let Some((_, name)) = table.iter().find(|(known, _)| *known == zone) {
         return (*name).to_owned();
     }
-    let year = Local::now().year() + 1;
+    let year = i32::from(ZonedDateTime::now().year()) + 1;
     let Some(wanted) = offsets(zone, year) else { return FALLBACK.to_owned() };
     let same = table.iter().find(|(known, _)| offsets(known, year).as_ref() == Some(&wanted));
     same.map_or_else(|| FALLBACK.to_owned(), |(_, name)| (*name).to_owned())

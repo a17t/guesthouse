@@ -1,0 +1,28 @@
+# Builds the release payload the way packaging/build-in-images.sh does, to see it still builds.
+# It publishes nothing, and uploads nothing. QEMU takes a long time, so this isn't on every PR.
+name: Payload build
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 2 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: payload-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  payload:
+    name: payload build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The source stage is a release, and wants the Windows display driver, so it's left out.
+      - name: Build QEMU, the bundled source, the app and the payload
+        run: sh packaging/build-in-images.sh qemu bundled app payload

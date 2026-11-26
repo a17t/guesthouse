@@ -46,7 +46,8 @@ const SYSTEM_IN_VIRTUAL_MACHINE: u32 = 1 << 1;
 /// How many GPUs the adapter links. One, with linking off.
 const GPU_COUNT: usize = 0x608;
 
-// Firmware versions, from FW_VERSION. Video firmware stays zero, as no video engine is offered.
+// Firmware versions, from FW_VERSION. Video firmware stays zero: the guest's driver offers video
+// without it.
 const FIRMWARE_SDMA0: usize = 0x88C;
 const FIRMWARE_SDMA1: usize = 0x890;
 const FIRMWARE_SMU: usize = 0x8E8;
@@ -118,13 +119,18 @@ const ALWAYS_ON_UNITS: usize = 0xC30;
 const GRAPHICS_FLAGS: usize = 0xC44;
 /// The counts from [`MAX_VGPRS`] on are filled in.
 const GRAPHICS_COUNTS_VALID: u32 = 1 << 0;
-/// [`ACTIVE_UNITS`] and [`ALWAYS_ON_UNITS`] are filled in. Without this bit, or the one for the
-/// per-engine state arrays (bit 16, whose arrays this block leaves empty), the guest reads no unit
-/// masks at all. Whether a GFX10.3 card sets bit 16 on a real host isn't known; this bit's path is
-/// the one that reads the masks held here.
+/// [`ACTIVE_UNITS`] and [`ALWAYS_ON_UNITS`] are filled in. The GFX10 and GFX11 paths read these when
+/// [`ENGINE_UNIT_MASKS_VALID`] is clear; the GFX12 path never does. Whether a GFX10.3 card sets bit
+/// 16 on a real host isn't known, so GFX10 parts are given only this bit.
 const UNIT_MASKS_VALID: u32 = 1 << 2;
 /// [`TILE_STEERING_OVERRIDE`] is filled in.
 const TILE_STEERING_VALID: u32 = 1 << 4;
+/// [`ENGINE_ACTIVE_UNITS`] and [`ENGINE_ALWAYS_ON_UNITS`] are filled in. The RDNA3 and later
+/// driver (32.0.32015 read) takes its masks from there when this bit is set, and on GFX12 from
+/// nowhere else: its GFX12 path never reads [`ACTIVE_UNITS`], so with this bit clear it counts no
+/// compute units at all. PAL then sizes the scratch ring for no waves and writes WAVES = 0 into
+/// SPI_TMPRING_SIZE, and the first shader that spills never launches and hangs the card.
+const ENGINE_UNIT_MASKS_VALID: u32 = 1 << 16;
 const MAX_VGPRS: usize = 0xC58;
 const WAVEFRONT_SIZE: usize = 0xC5C;
 const SHADER_ENGINES: usize = 0xC60;
@@ -139,6 +145,36 @@ const GS_VGT_TABLE_DEPTH: usize = 0xC80;
 const GS_PRIM_BUFFER_DEPTH: usize = 0xC84;
 const COMPUTE_RINGS: usize = 0xC88;
 const TILE_STEERING_OVERRIDE: usize = 0xCE0;
+/// The per-engine unit masks: one 16-bit mask of active workgroup processors for each of an
+/// engine's two arrays, engine after engine, with room for [`ENGINES_IN_ARRAYS`] engines. The guest
+/// copies `SHADER_ENGINES` times four bytes from here, then turns each workgroup bit into two compute
+/// unit bits. Read in amfrtdrv64.dll 32.0.32015.12012 at 0x1806bc0c2 (GFX12) and 0x1806bb829
+/// (GFX10 and GFX11), where the block sits at device offset 0x9F48.
+const ENGINE_ACTIVE_UNITS: usize = 0xD04;
+/// The units kept on all the time, laid out the same way. The GFX10 path reads them four engines in,
+/// at 0xD14, and is not given these: GFX10 parts keep to [`ACTIVE_UNITS`].
+const ENGINE_ALWAYS_ON_UNITS: usize = 0xD1C;
+/// Cache sizes in KiB, which the guest's PAL multiplies by 1024 into its chip properties
+/// (instCacheSizePerCu, scalarCacheSizePerCu, gl1cSizePerSa) on the GFX10/11 and GFX12 paths alike,
+/// with no flag: left zero, they overwrite PAL's own per-chip values with zero.
+const INST_CACHE_KB: usize = 0xD60;
+const SCALAR_CACHE_KB: usize = 0xD64;
+const GL1_CACHE_KB_PER_ARRAY: usize = 0xD68;
+/// Four dwords of active pixel packers, [`PACKERS_PER_ENGINE_SLOT`] bits to an engine, copied
+/// as they are into PAL's activePixelPackerMask, which it only reports up to its clients.
+const PIXEL_PACKER_MASK: usize = 0xD74;
+const PACKERS_PER_ENGINE_SLOT: u32 = 4;
+/// The last-level cache in MiB, which PAL shifts by 20 into mallSizeInBytes when its setting asks
+/// for the kernel's figure.
+const MALL_SIZE_MIB: usize = 0xD84;
+/// GB_ADDR_CONFIG's log of the chip's pixel packers.
+const NUM_PKRS_SHIFT: u32 = 8;
+const NUM_PKRS_MASK: u32 = 0b111;
+/// How many engines the per-engine arrays hold.
+const ENGINES_IN_ARRAYS: usize = 6;
+/// The first generation given the per-engine arrays. GFX10 parts run the RDNA1 and RDNA2 driver,
+/// which reads [`ACTIVE_UNITS`], and the per-engine path there isn't known.
+const FIRST_GFX_WITH_ENGINE_MASKS: u32 = 11;
 
 /// One byte for each of the guest's nodes: AMD's number for the engine behind it, or
 /// [`NO_ENGINE`]. The guest's user-mode driver picks each node's queue type from this.
@@ -208,6 +244,15 @@ const CHECKSUM: usize = 0x2E20;
 const CHECKSUM_VERSION: usize = 0x35E0;
 pub const SUBMISSION_CHECKSUM_VERSION: u32 = 1;
 
+/// Two dwords the guest's driver wants set before it offers any video: with either left zero it
+/// lists no hardware decoder and finds no encoder, whatever nodes it is given. What they mean isn't
+/// known. The values are the ones a Radeon 890M's own driver has in its block, and the only ones
+/// that were tried. They are filled in only when the video ring is offered: see [`crate::video`].
+const VIDEO_FIRST: usize = 0x366C;
+const VIDEO_FIRST_AS_SEEN: u32 = 4;
+const VIDEO_SECOND: usize = 0x36EC;
+const VIDEO_SECOND_AS_SEEN: u32 = 1;
+
 /// The family union's arrays have room for four shader engines with two arrays each.
 const ENGINES_IN_BLOCK: usize = 4;
 const ARRAYS_IN_BLOCK: usize = 2;
@@ -263,6 +308,10 @@ pub fn build(info: &DeviceInfo) -> Vec<u8> {
     fill_virtual_memory(&mut block);
     put_dword(&mut block, SOFTWARE_FEATURES, FEATURES);
     put_dword(&mut block, CHECKSUM_VERSION, SUBMISSION_CHECKSUM_VERSION);
+    if info.engines.video {
+        put_dword(&mut block, VIDEO_FIRST, VIDEO_FIRST_AS_SEEN);
+        put_dword(&mut block, VIDEO_SECOND, VIDEO_SECOND_AS_SEEN);
+    }
     let sum = index_xor_sum(&block, BLOCK_SIZE / 4, CHECKSUM);
     put_dword(&mut block, CHECKSUM, sum);
     block
@@ -355,6 +404,56 @@ pub fn unit_masks(bitmap: &[[u32; 4]; 4], gfx_major: u32) -> [u16; ENGINES_IN_BL
     masks
 }
 
+/// One engine's array as amdgpu's INFO bitmap holds it: four engines by four arrays, with engines
+/// past the fourth folded into the third and fourth columns of the first rows, as amdgpu packs
+/// GFX11's six engines.
+fn bitmap_units(bitmap: &[[u32; 4]; 4], engine: usize, array: usize) -> u32 {
+    let column = array + (engine / ENGINES_IN_BLOCK) * ARRAYS_IN_BLOCK;
+    bitmap.get(engine % ENGINES_IN_BLOCK).and_then(|row| row.get(column)).copied().unwrap_or(0)
+}
+
+/// The per-engine workgroup masks, two to an engine, for [`ENGINES_IN_ARRAYS`] engines.
+pub fn engine_unit_masks(bitmap: &[[u32; 4]; 4]) -> [u16; ENGINES_IN_ARRAYS * ARRAYS_IN_BLOCK] {
+    let mut masks = [0; ENGINES_IN_ARRAYS * ARRAYS_IN_BLOCK];
+    for engine in 0..ENGINES_IN_ARRAYS {
+        for array in 0..ARRAYS_IN_BLOCK {
+            masks[engine * ARRAYS_IN_BLOCK + array] =
+                workgroup_mask(bitmap_units(bitmap, engine, array)) as u16;
+        }
+    }
+    masks
+}
+
+/// The active pixel packers, by engine: the chip's packers from GB_ADDR_CONFIG shared out evenly to
+/// the engines that have any compute unit on, at most [`PACKERS_PER_ENGINE_SLOT`] each. Empty when
+/// the address config couldn't be read.
+pub fn pixel_packer_mask(details: &CardDetails) -> u128 {
+    let engines = details.shader_engines.min(ENGINES_IN_ARRAYS as u32);
+    let Some(config) = details.gb_addr_config.filter(|_| engines > 0) else { return 0 };
+    let packers = 1u32 << (config >> NUM_PKRS_SHIFT & NUM_PKRS_MASK);
+    let per_engine = (packers / engines).clamp(1, PACKERS_PER_ENGINE_SLOT);
+    let mut mask = 0u128;
+    for engine in 0..engines as usize {
+        let on = (0..ARRAYS_IN_BLOCK).any(|array| bitmap_units(&details.cu_bitmap, engine, array) != 0);
+        if on {
+            mask |= ((1u128 << per_engine) - 1) << (engine as u32 * PACKERS_PER_ENGINE_SLOT);
+        }
+    }
+    mask
+}
+
+/// What the kernel driver gives about the caches and the pixel packers, from amdgpu's INFO.
+fn fill_caches_and_packers(block: &mut [u8], details: &CardDetails) {
+    put_dword(block, INST_CACHE_KB, details.sqc_inst_cache_kb);
+    put_dword(block, SCALAR_CACHE_KB, details.sqc_data_cache_kb);
+    put_dword(block, GL1_CACHE_KB_PER_ARRAY, details.gl1c_cache_kb);
+    put_dword(block, MALL_SIZE_MIB, u32::try_from(details.mall_size.div_ceil(1 << 20)).unwrap_or(u32::MAX));
+    let mask = pixel_packer_mask(details);
+    for index in 0..4 {
+        put_dword(block, PIXEL_PACKER_MASK + index * 4, (mask >> (index * 32)) as u32);
+    }
+}
+
 fn put_masks(block: &mut [u8], at: usize, masks: &[u16]) {
     for (index, &mask) in masks.iter().enumerate() {
         put_word(block, at + index * 2, mask);
@@ -373,6 +472,12 @@ fn fill_graphics(block: &mut [u8], details: &CardDetails) {
     put_masks(block, ALWAYS_ON_UNITS, &unit_masks(&details.always_on_cu_bitmap, gfx_major));
 
     let mut flags = GRAPHICS_COUNTS_VALID | UNIT_MASKS_VALID;
+    if gfx_major >= FIRST_GFX_WITH_ENGINE_MASKS {
+        flags |= ENGINE_UNIT_MASKS_VALID;
+        put_masks(block, ENGINE_ACTIVE_UNITS, &engine_unit_masks(&details.cu_bitmap));
+        put_masks(block, ENGINE_ALWAYS_ON_UNITS, &engine_unit_masks(&details.always_on_cu_bitmap));
+        fill_caches_and_packers(block, details);
+    }
     if gfx_major >= FIRST_GFX_WITH_WGPS && details.tile_steering_override != 0 {
         flags |= TILE_STEERING_VALID;
         put_dword(block, TILE_STEERING_OVERRIDE, details.tile_steering_override);
@@ -462,11 +567,12 @@ pub(crate) mod tests {
             visible_vram_total: 2 << 30,
             gtt_total: 8 << 30,
             counter_freq_khz: 100_000,
-            engines: EngineSet { graphics: true, compute: true, dma: true },
+            engines: EngineSet { graphics: true, compute: true, dma: true, video: false },
             ib_alignment: IbAlignments {
                 graphics: IbAlignment { start: 32, size: 32 },
                 compute: IbAlignment { start: 32, size: 32 },
                 dma: IbAlignment { start: 256, size: 4 },
+                video: IbAlignment { start: 256, size: 4 },
             },
             details: CardDetails {
                 external_revision: 0x9,
@@ -552,6 +658,45 @@ pub(crate) mod tests {
         assert!(block[NODE_ENGINES + 3..NODE_ENGINES + NODE_SLOTS].iter().all(|&byte| byte == NO_ENGINE));
         let words: Vec<u32> = (0..8).map(|index| dword_at(&block, NODE_IB_ALIGNMENT + index * 4)).collect();
         assert_eq!(words, [32, 32, 32, 32, 256, 4, 0, 0]);
+    }
+
+    /// [`small_card`] with its video ring offered to the guest.
+    fn card_offering_video() -> DeviceInfo {
+        let mut card = small_card();
+        card.video_ring = true;
+        card.engines.video = true;
+        card
+    }
+
+    #[test]
+    fn a_card_that_offers_video_names_the_codec_node_and_sets_the_two_video_dwords() {
+        let block = build(&card_offering_video());
+        assert_eq!(&block[NODE_ENGINES..NODE_ENGINES + 5], &[0, 5, 4, 41, NO_ENGINE]);
+        let at = NODE_IB_ALIGNMENT + 3 * NODE_IB_ALIGNMENT_STRIDE;
+        assert_eq!((dword_at(&block, at), dword_at(&block, at + 4)), (256, 4));
+        assert_eq!((dword_at(&block, VIDEO_FIRST), dword_at(&block, VIDEO_SECOND)), (4, 1));
+        assert!(KeyFields::read(&block).unwrap().checksum_holds);
+    }
+
+    /// The sum the block of [`small_card`] held before there was any video to offer. The sum is
+    /// over every dword of the block, so it stands for the whole of it.
+    const SUM_BEFORE_VIDEO: u32 = 0x4655_C071;
+
+    #[test]
+    fn a_card_that_offers_no_video_is_told_as_it_was_before() {
+        let block = build(&small_card());
+        assert_eq!(dword_at(&block, CHECKSUM), SUM_BEFORE_VIDEO);
+        assert!(KeyFields::read(&block).unwrap().checksum_holds);
+        assert_eq!((dword_at(&block, VIDEO_FIRST), dword_at(&block, VIDEO_SECOND)), (0, 0));
+        // The ring being there changes nothing by itself: the guest hears of it only when it is offered.
+        let with_a_ring = DeviceInfo { video_ring: true, ..small_card() };
+        assert_eq!(build(&with_a_ring), block);
+        // Offered, the block differs in the node's two places, the two dwords and the sum, and nowhere else.
+        let offered = build(&card_offering_video());
+        let changed: Vec<usize> =
+            (0..BLOCK_SIZE).step_by(4).filter(|&at| block[at..at + 4] != offered[at..at + 4]).collect();
+        let node = NODE_IB_ALIGNMENT + 3 * NODE_IB_ALIGNMENT_STRIDE;
+        assert_eq!(changed, [NODE_ENGINES, CHECKSUM, node, node + 4, VIDEO_FIRST, VIDEO_SECOND]);
     }
 
     #[test]
@@ -669,30 +814,180 @@ pub(crate) mod tests {
         assert_eq!(gcn[3], 0b0111);
     }
 
+    /// A Navi48 like Short3D's RX 9070 XT: four engines of two arrays, each array four workgroup
+    /// processors, which INFO gives as eight compute units.
+    fn navi48() -> DeviceInfo {
+        let mut info = small_card();
+        info.family = 152;
+        info.details.gfx_version = (12, 0);
+        info.details.shader_engines = 4;
+        info.details.arrays_per_engine = 2;
+        info.details.cus_per_array = 8;
+        let mut bitmap = [[0; 4]; 4];
+        for row in &mut bitmap {
+            row[0] = 0xFF;
+            row[1] = 0xFF;
+        }
+        info.details.cu_bitmap = bitmap;
+        info.details.always_on_cu_bitmap = bitmap;
+        info
+    }
+
+    fn words(block: &[u8], at: usize, count: usize) -> Vec<u16> {
+        (0..count)
+            .map(|index| u16::from_le_bytes([block[at + index * 2], block[at + index * 2 + 1]]))
+            .collect()
+    }
+
+    #[test]
+    fn a_gfx12_card_gets_its_units_in_the_per_engine_masks_the_guest_reads() {
+        let block = build(&navi48());
+        assert_ne!(dword_at(&block, GRAPHICS_FLAGS) & ENGINE_UNIT_MASKS_VALID, 0);
+        // Four workgroups an array, two arrays an engine, four engines, then two empty engines.
+        let expected = [0xF, 0xF, 0xF, 0xF, 0xF, 0xF, 0xF, 0xF, 0, 0, 0, 0];
+        assert_eq!(words(&block, ENGINE_ACTIVE_UNITS, 12), expected);
+        assert_eq!(words(&block, ENGINE_ALWAYS_ON_UNITS, 12), expected);
+        // The guest counts each workgroup bit as two units: 64 compute units, none of them lost.
+        let units: u32 =
+            words(&block, ENGINE_ACTIVE_UNITS, 12).iter().map(|mask| 2 * mask.count_ones()).sum();
+        assert_eq!(units, 64);
+        // The older masks are still there for the older driver, and the sum covers the new ones.
+        assert_eq!(words(&block, ACTIVE_UNITS, 8), [0xF; 8]);
+        assert!(KeyFields::read(&block).unwrap().checksum_holds);
+    }
+
+    /// PAL's scratch ring, as gfx12ShaderRing.cpp sizes it: waves for every slot of every unit, at
+    /// most 32 a unit, where units are engines times arrays times the most units an array has.
+    fn scratch_waves(block: &[u8]) -> u32 {
+        let engines = dword_at(block, SHADER_ENGINES);
+        let arrays = dword_at(block, ARRAYS_PER_ENGINE);
+        let per_array = (0..engines as usize * 2)
+            .map(|index| 2 * words(block, ENGINE_ACTIVE_UNITS + index * 2, 1)[0].count_ones())
+            .max()
+            .unwrap_or(0);
+        let units = engines * arrays * per_array;
+        (16 * 2 * units).min(32 * units)
+    }
+
+    #[test]
+    fn the_guest_can_size_a_scratch_ring_on_gfx12() {
+        // Short3D's hung runs wrote SPI_TMPRING_SIZE 0x9000, WAVES 0, from a 64 KiB ring: no units.
+        assert_eq!(scratch_waves(&build(&navi48())), 2048);
+    }
+
+    #[test]
+    fn the_per_engine_masks_are_given_from_gfx11_and_not_to_gfx10() {
+        let mut gfx11 = navi48();
+        gfx11.details.gfx_version = (11, 0);
+        assert_ne!(dword_at(&build(&gfx11), GRAPHICS_FLAGS) & ENGINE_UNIT_MASKS_VALID, 0);
+        let gfx10 = build(&small_card());
+        assert_eq!(dword_at(&gfx10, GRAPHICS_FLAGS) & ENGINE_UNIT_MASKS_VALID, 0);
+        assert!(gfx10[ENGINE_ACTIVE_UNITS..ENGINE_ALWAYS_ON_UNITS + 24].iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn a_gfx12_card_gets_its_cache_sizes_and_pixel_packers() {
+        let mut info = navi48();
+        info.details.sqc_inst_cache_kb = 32;
+        info.details.sqc_data_cache_kb = 16;
+        info.details.gl1c_cache_kb = 0;
+        info.details.mall_size = 64 << 20;
+        // Sixteen packers: NUM_PKRS 4.
+        info.details.gb_addr_config = Some(4 << NUM_PKRS_SHIFT | 0x2);
+        let block = build(&info);
+        assert_eq!(dword_at(&block, INST_CACHE_KB), 32);
+        assert_eq!(dword_at(&block, SCALAR_CACHE_KB), 16);
+        assert_eq!(dword_at(&block, GL1_CACHE_KB_PER_ARRAY), 0);
+        assert_eq!(dword_at(&block, MALL_SIZE_MIB), 64);
+        // Four packers in each of the four engines' slots, and nothing past them.
+        assert_eq!(dword_at(&block, PIXEL_PACKER_MASK), 0xFFFF);
+        for index in 1..4 {
+            assert_eq!(dword_at(&block, PIXEL_PACKER_MASK + index * 4), 0);
+        }
+        assert!(KeyFields::read(&block).unwrap().checksum_holds);
+    }
+
+    #[test]
+    fn an_engine_with_no_units_has_no_packers_and_an_unread_config_gives_none() {
+        let mut info = navi48();
+        info.details.gb_addr_config = Some(4 << NUM_PKRS_SHIFT);
+        info.details.cu_bitmap[2] = [0; 4];
+        assert_eq!(pixel_packer_mask(&info.details), 0xF0FF);
+        info.details.gb_addr_config = None;
+        assert_eq!(pixel_packer_mask(&info.details), 0);
+    }
+
+    #[test]
+    fn a_gfx10_card_is_given_no_cache_fields() {
+        let mut info = small_card();
+        info.details.sqc_inst_cache_kb = 32;
+        info.details.mall_size = 32 << 20;
+        let block = build(&info);
+        assert!(block[INST_CACHE_KB..MALL_SIZE_MIB + 4].iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn engines_past_the_fourth_come_from_where_amdgpu_folds_them() {
+        // amdgpu keeps a sixth engine's two arrays in the third and fourth columns of row one.
+        let mut bitmap = [[0; 4]; 4];
+        bitmap[0][0] = 0b11;
+        bitmap[1][2] = 0b1111;
+        bitmap[1][3] = 0b11_0000;
+        let masks = engine_unit_masks(&bitmap);
+        assert_eq!(masks[0], 0b1);
+        assert_eq!(&masks[10..12], &[0b11, 0b100]);
+        assert!(masks[1..10].iter().all(|&mask| mask == 0));
+    }
+
     #[test]
     fn only_the_block_query_is_answered() {
         let info = small_card();
         let mut out = Vec::new();
-        let other = VendorQuery { kind: 7, size: BLOCK_SIZE, data: &[], process_is_32_bit: false };
+        let other =
+            VendorQuery { kind: 7, size: BLOCK_SIZE, data: &[], process_is_32_bit: false, program: "" };
         assert_eq!(answer(&other, &info, &mut out), None);
-        let short = VendorQuery { kind: QUERY_TYPE, size: 0x100, data: &[], process_is_32_bit: false };
+        let short =
+            VendorQuery { kind: QUERY_TYPE, size: 0x100, data: &[], process_is_32_bit: false, program: "" };
         assert_eq!(answer(&short, &info, &mut out), Some(Status::INVALID_PARAMETER));
         assert!(out.is_empty());
-        let too_big =
-            VendorQuery { kind: QUERY_TYPE, size: BLOCK_SIZE + 4, data: &[], process_is_32_bit: false };
+        let too_big = VendorQuery {
+            kind: QUERY_TYPE,
+            size: BLOCK_SIZE + 4,
+            data: &[],
+            process_is_32_bit: false,
+            program: "",
+        };
         assert_eq!(answer(&too_big, &info, &mut out), Some(Status::INVALID_PARAMETER));
         assert!(out.is_empty());
-        let right = VendorQuery { kind: QUERY_TYPE, size: BLOCK_SIZE, data: &[], process_is_32_bit: false };
+        let right = VendorQuery {
+            kind: QUERY_TYPE,
+            size: BLOCK_SIZE,
+            data: &[],
+            process_is_32_bit: false,
+            program: "",
+        };
         assert_eq!(answer(&right, &info, &mut out), Some(Status::SUCCESS));
         assert_eq!(out.len(), BLOCK_SIZE);
         out.clear();
         let header_size = adapter_header::HEADER_SIZE;
-        let header = VendorQuery { kind: QUERY_TYPE, size: header_size, data: &[], process_is_32_bit: false };
+        let header = VendorQuery {
+            kind: QUERY_TYPE,
+            size: header_size,
+            data: &[],
+            process_is_32_bit: false,
+            program: "",
+        };
         assert_eq!(answer(&header, &info, &mut out), Some(Status::SUCCESS));
         assert_eq!(out, adapter_header::build(&info, header_size));
         out.clear();
         let both_size = header_size + BLOCK_SIZE;
-        let both = VendorQuery { kind: QUERY_TYPE, size: both_size, data: &[], process_is_32_bit: false };
+        let both = VendorQuery {
+            kind: QUERY_TYPE,
+            size: both_size,
+            data: &[],
+            process_is_32_bit: false,
+            program: "",
+        };
         assert_eq!(answer(&both, &info, &mut out), Some(Status::SUCCESS));
         assert_eq!(out[..header_size], adapter_header::build(&info, both_size)[..]);
         assert_eq!(out[header_size..], build(&info)[..]);
@@ -707,7 +1002,8 @@ pub(crate) mod tests {
         {
             let mut out = Vec::new();
             let size = header_size + tail;
-            let query = VendorQuery { kind: QUERY_TYPE, size, data: &[], process_is_32_bit: false };
+            let query =
+                VendorQuery { kind: QUERY_TYPE, size, data: &[], process_is_32_bit: false, program: "" };
             assert_eq!(answer(&query, &info, &mut out), Some(Status::SUCCESS));
             assert_eq!(out[header_size..], body[..]);
         }

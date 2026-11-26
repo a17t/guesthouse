@@ -1,11 +1,12 @@
-//! `guesthouse-jail PLAN [--passt PROGRAM FD PID_FILE [--passt-word WORD]...]
-//! [--tap HELPER BRIDGE FD] -- PROGRAM ARGUMENTS`: puts itself in the jail the plan describes, with
+//! `guesthouse-jail PLAN [--passt PROGRAM FD PID_FILE [--passt-word WORD]...
+//! [--passt-only-through INTERFACE CUT_FILE]] [--tap HELPER BRIDGE FD] -- PROGRAM ARGUMENTS`: puts itself in the jail the plan describes, with
 //! QEMU's filter, and becomes the program. The jail carries across the exec, so the program can't
 //! leave it.
 //!
 //! `--passt` starts passt first, outside the jail, as it builds a sandbox of its own that can't be
 //! made inside one, and leaves the other end of its connection open at `FD`. Its pid and start time
-//! go in `PID_FILE`. `--tap` gets a bridged
+//! go in `PID_FILE`. `--passt-only-through` puts a guard on it, which refuses its connections once
+//! the interface it's to keep to has gone, and says so in `CUT_FILE`. `--tap` gets a bridged
 //! network's device from QEMU's setuid helper first, as a helper can't gain its privileges once the
 //! jail is on. The device is left open at `FD` for the program.
 //!
@@ -13,10 +14,12 @@
 //! step before bubblewrap, whose namespaces a setuid helper can't work in, and which then runs this
 //! launcher again with the plan.
 
+mod guard;
 mod handover;
 mod passt;
 mod tap;
 
+pub use guard::{CUT_FILE, Guard, OnlyThrough, cut_file_beside, interface_number};
 pub use passt::{start as start_passt, start_time};
 pub use tap::open as open_tap;
 
@@ -25,17 +28,19 @@ use crate::{Plan, filters, landlock};
 use std::ffi::OsString;
 use std::io;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const END_OF_PLAN: &str = "--";
 const TAP: &str = "--tap";
 const PASST: &str = "--passt";
 const PASST_WORD: &str = "--passt-word";
+const PASST_ONLY_THROUGH: &str = "--passt-only-through";
 const OPEN_ONLY: &str = "--open-only";
 const UNIX_LISTEN: &str = "--unix-listen";
 const UNIX_CONNECT: &str = "--unix-connect";
 const NO_NEW_UNIX_SOCKETS: &str = "--no-new-unix-sockets";
+const READS_OWN_MEMORY: &str = "--reads-own-memory";
 
 /// A unix socket the launcher opens for the program, so the program needs to make none itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +66,8 @@ pub struct Passt {
     pub fd: i32,
     pub pid_file: PathBuf,
     pub words: Vec<String>,
+    /// The one interface it's told to keep to, which the launcher then holds it to.
+    pub only_through: Option<OnlyThrough>,
 }
 
 /// Everything the launcher was told.
@@ -73,6 +80,8 @@ pub struct Launch {
     pub unix_sockets: Vec<UnixSocket>,
     /// Refuse the program any unix socket it would make, which leaves it the ones opened for it.
     pub no_new_unix_sockets: bool,
+    /// Let the program read its own memory with `process_vm_readv`, which a macOS guest's device needs.
+    pub reads_own_memory: bool,
     pub program: Vec<OsString>,
 }
 
@@ -93,6 +102,13 @@ impl Launch {
             for word in &passt.words {
                 words.extend([PASST_WORD.to_owned(), word.clone()]);
             }
+            if let Some(only) = &passt.only_through {
+                words.extend([
+                    PASST_ONLY_THROUGH.to_owned(),
+                    only.interface.clone(),
+                    only.cut_file.display().to_string(),
+                ]);
+            }
         }
         if let Some(tap) = &self.tap {
             words.extend([
@@ -109,6 +125,9 @@ impl Launch {
         if self.no_new_unix_sockets {
             words.push(NO_NEW_UNIX_SOCKETS.to_owned());
         }
+        if self.reads_own_memory {
+            words.push(READS_OWN_MEMORY.to_owned());
+        }
         words.push(END_OF_PLAN.to_owned());
         words
     }
@@ -120,6 +139,7 @@ impl Launch {
             tap: None,
             unix_sockets: Vec::new(),
             no_new_unix_sockets: false,
+            reads_own_memory: false,
             program: Vec::new(),
         };
         let mut words = arguments.into_iter();
@@ -137,7 +157,13 @@ impl Launch {
                     let fd =
                         fd.parse().map_err(|_| format!("{PASST} needs a descriptor number, not {fd:?}"))?;
                     let pid_file = pid_file.into();
-                    launch.passt = Some(Passt { program: program.into(), fd, pid_file, words: Vec::new() });
+                    launch.passt = Some(Passt {
+                        program: program.into(),
+                        fd,
+                        pid_file,
+                        words: Vec::new(),
+                        only_through: None,
+                    });
                 }
                 PASST_WORD => {
                     let word = next(PASST_WORD)?;
@@ -145,7 +171,16 @@ impl Launch {
                         launch.passt.as_mut().ok_or_else(|| format!("{PASST_WORD} comes after {PASST}"))?;
                     passt.words.push(word);
                 }
+                PASST_ONLY_THROUGH => {
+                    let (interface, cut_file) = (next(PASST_ONLY_THROUGH)?, next(PASST_ONLY_THROUGH)?);
+                    let passt = launch
+                        .passt
+                        .as_mut()
+                        .ok_or_else(|| format!("{PASST_ONLY_THROUGH} comes after {PASST}"))?;
+                    passt.only_through = Some(OnlyThrough { interface, cut_file: cut_file.into() });
+                }
                 NO_NEW_UNIX_SOCKETS => launch.no_new_unix_sockets = true,
+                READS_OWN_MEMORY => launch.reads_own_memory = true,
                 UNIX_LISTEN | UNIX_CONNECT => {
                     let (path, fd) = (next(&name)?, next(&name)?);
                     let fd =
@@ -202,12 +237,14 @@ impl Launch {
             return error;
         }
         let (program, arguments) = self.program.split_first().expect("parse makes sure there's a program");
-        Command::new(program).args(arguments).exec()
+        let error = Command::new(program).args(arguments).exec();
+        // A missing loader or library gives the same error as a missing program, so say which one.
+        io::Error::new(error.kind(), format!("{} couldn't start: {error}", Path::new(program).display()))
     }
 
     fn jail(&self, plan: &Plan) -> io::Result<()> {
         let applied = landlock::apply(plan)?;
-        let filter = filters::qemu(self.no_new_unix_sockets);
+        let filter = filters::qemu(self.no_new_unix_sockets, self.reads_own_memory);
         seccomp::install(&filter, Threads::This)?;
         let missing = applied.missing();
         let leaves_out = if missing.is_empty() {
@@ -237,10 +274,15 @@ mod tests {
                 fd: 11,
                 pid_file: "/r/passt.pid".into(),
                 words: ["--quiet", "--mtu", "1500"].map(str::to_owned).to_vec(),
+                only_through: Some(OnlyThrough {
+                    interface: "wg0".to_owned(),
+                    cut_file: "/r/network-cut".into(),
+                }),
             }),
             tap: Some(Tap { helper: "/usr/libexec/qemu-bridge-helper".into(), bridge: "br0".into(), fd: 3 }),
             unix_sockets: vec![UnixSocket { path: "/r/qmp.sock".into(), fd: 20, listen: true }],
             no_new_unix_sockets: true,
+            reads_own_memory: true,
             program: ["/usr/bin/qemu-system-x86_64", "-name", "gpupv", "--"].map(OsString::from).to_vec(),
         }
     }

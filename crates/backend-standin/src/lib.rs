@@ -10,14 +10,17 @@
 //! | 12..16 | surface height |
 //! | 16    | nonzero asks for the GPU's cache |
 
+// Linux only, as the backend it stands in for is. Other systems get an empty crate.
+#![cfg(target_os = "linux")]
+
 mod memory;
 mod random_messages;
 
 use guesthouse_backend::{
-    AdapterFacts, AllocationShape, Backend, BackendError, CardLabel, Doorbell, DriverFound, DriverSurvey,
-    GpuRange, GuestBooks, HostServices, MapRequest, MemoryId, MemoryKind, PciCard, Refusal, RegistryName,
-    RegistryValue, Setup, SlotCopy, SpaceId, StagingCopy, StagingStart, StandardSurface, Status,
-    SurfaceShape, UnmapRequest, VendorQuery, Work, WorkStart,
+    AdapterFacts, AllocationShape, Backend, BackendError, CardLabel, CommandBuffer, Doorbell, DriverFound,
+    DriverSurvey, GpuRange, GuestBooks, HostServices, MapRequest, MemoryId, MemoryKind, PciCard, RangeView,
+    Refusal, RegistryName, RegistryValue, RingTiling, Setup, SlotCopy, SpaceId, StagingCopy, StagingStart,
+    StandardSurface, Status, SurfaceShape, UnmapRequest, VendorQuery, Work, WorkStart,
 };
 pub use memory::SparseMemory;
 pub use random_messages::RandomMessages;
@@ -53,6 +56,11 @@ pub struct StandIn {
     spaces: HashMap<SpaceId, Space>,
     /// Set to make the next video memory allocation fail.
     pub fail_next_allocation: bool,
+    /// Memory made in system memory for allocations the card had no room for, when it may be.
+    pub spill_allowed: bool,
+    pub spilled: Vec<MemoryId>,
+    /// What the card says it has free, if it says.
+    pub card_free: Option<u64>,
     /// Set to make the next mapping fail.
     pub fail_next_map: bool,
     /// Whether submissions go to the pretend GPU. If not, they finish at once.
@@ -67,6 +75,8 @@ pub struct StandIn {
     /// Set to say that any two different driver protection values need different mappings.
     pub protections_differ: bool,
     pub preserved: Vec<(MemoryId, MemoryId, u64)>,
+    /// Set to say that video memory nothing has written reads as zero.
+    pub new_memory_is_zero: bool,
     pub copies: Vec<StagingCopy>,
     pub slot_copies: Vec<SlotCopy>,
     /// Copies that would have gone past what's mapped at their addresses, as an engine would run them.
@@ -77,6 +87,8 @@ pub struct StandIn {
     pub memory_starts: HashMap<MemoryId, Vec<u8>>,
     /// Set to make every export fail.
     pub refuse_exports: bool,
+    /// The tiles a viewer's frames can be laid out in, for a test to set. `None` is a card with none.
+    pub ring_tiling: Option<RingTiling>,
     /// Set to refuse every allocation's, context's and queue's private data, as a vendor's driver
     /// would refuse data it can't read.
     pub refuse_private_data: bool,
@@ -94,14 +106,37 @@ pub struct StandIn {
     /// Copies into a viewer's slots finish at once, even with `slow_copies`.
     pub quick_slot_copies: bool,
     pub copy_done: bool,
+    /// Takes copies before their frame is done, as a card that holds the copy until then does.
+    pub copies_after_work: bool,
+    /// The fences each copy taken that way was held behind.
+    pub copied_after: Vec<Vec<(u64, u64)>>,
     pub work_per_submission: u32,
     pub unfinished_limit: Option<u64>,
     /// How long work may take before its queue is given up, when the core's own time isn't wanted.
     pub work_patience: Option<Duration>,
+    /// Says work is on the GPU that only polling notices: see [`Backend::needs_polling`].
+    pub needs_polling: bool,
+    /// How often the core polled the work, and how often it said the GPU woke the daemon.
+    pub work_polls: u32,
+    pub wakes: u32,
     /// How many submissions to come are answered with no room, as a driver refusing one for now.
     pub busy_starts: u32,
     /// How many doorbells to come are refused for now, as a driver refusing a submission call.
     pub refused_rings: u32,
+    /// A time the next doorbell is refused until, once, as a backend that knows when work may run.
+    pub ring_not_before: Option<Instant>,
+    /// Work rung in runs until the guest ends it.
+    pub work_stays: bool,
+    /// The commands the last submission named, as the core passed them on.
+    pub last_commands: Option<CommandBuffer>,
+    /// Stands in for a backend whose display driver slots may lie in the guest's own pages.
+    pub slots_in_guest_pages: bool,
+    /// Set to be given the commands a context's submission names.
+    pub context_commands: bool,
+    /// A monitored fence's GPU address each submission asks the host about, and what the last
+    /// answer was.
+    pub ask_monitored: Option<u64>,
+    pub monitored_found: Option<Option<u64>>,
 }
 
 #[derive(Debug, Default)]
@@ -150,6 +185,9 @@ impl StandIn {
             live_memory: HashSet::new(),
             spaces: HashMap::new(),
             fail_next_allocation: false,
+            spill_allowed: false,
+            spilled: Vec::new(),
+            card_free: None,
             fail_next_map: false,
             run_work: false,
             run_work_at_once: false,
@@ -158,12 +196,14 @@ impl StandIn {
             mapped_protections: Vec::new(),
             protections_differ: false,
             preserved: Vec::new(),
+            new_memory_is_zero: false,
             copies: Vec::new(),
             slot_copies: Vec::new(),
             copies_past_their_memory: Vec::new(),
             slot_copy_status: Status::SUCCESS,
             memory_starts: HashMap::new(),
             refuse_exports: false,
+            ring_tiling: None,
             refuse_private_data: false,
             standard_data: None,
             standard_shape: None,
@@ -172,11 +212,23 @@ impl StandIn {
             slow_copies: false,
             quick_slot_copies: false,
             copy_done: false,
+            copies_after_work: false,
+            copied_after: Vec::new(),
             work_per_submission: 1,
             unfinished_limit: None,
             work_patience: None,
+            needs_polling: false,
+            work_polls: 0,
+            wakes: 0,
             busy_starts: 0,
             refused_rings: 0,
+            ring_not_before: None,
+            work_stays: false,
+            last_commands: None,
+            slots_in_guest_pages: false,
+            context_commands: false,
+            ask_monitored: None,
+            monitored_found: None,
         }
     }
 
@@ -264,6 +316,10 @@ const PITCH_FIELD: usize = 20;
 const TILING_FIELD: usize = 24;
 /// Where private data can state a colour word. Zero means the usual one.
 const COLOUR_FIELD: usize = 28;
+/// Where private data can ask for memory of a kind of its own. Zero means plain.
+const KIND_FIELD: usize = 32;
+/// Where a view's kind goes in the driver protection value this pretend vendor maps with.
+pub const VIEW_KIND_SHIFT: u32 = 8;
 /// The narrowest and shortest block of a pretend tiled surface, and the tallest log2 there is.
 const TILE_WIDTH: u64 = 64;
 const TILE_ROWS: u64 = 8;
@@ -313,12 +369,37 @@ impl Backend for StandIn {
         Ok((self.new_memory(), size))
     }
 
+    fn allocate_spill_memory(
+        &mut self,
+        size: u64,
+        _kind: MemoryKind,
+    ) -> Result<(MemoryId, u64), BackendError> {
+        if !self.spill_allowed {
+            return Err(BackendError::new("the stand-in has no spill"));
+        }
+        let memory = self.new_memory();
+        self.spilled.push(memory);
+        Ok((memory, size))
+    }
+
+    fn card_memory_free(&self) -> Option<u64> {
+        self.card_free
+    }
+
     fn adopt_host_pages(&mut self, _host_address: u64, _size: u64) -> Result<MemoryId, BackendError> {
         Ok(self.new_memory())
     }
 
     fn release_memory(&mut self, memory: MemoryId) {
         assert!(self.live_memory.remove(&memory), "{memory:?} was freed twice or never made");
+    }
+
+    fn new_video_memory_is_zero(&self) -> bool {
+        self.new_memory_is_zero
+    }
+
+    fn runs_context_commands(&self) -> bool {
+        self.context_commands
     }
 
     fn preserve_contents(
@@ -331,6 +412,10 @@ impl Backend for StandIn {
     ) -> Result<(), BackendError> {
         self.preserved.push((from, to, size));
         Ok(())
+    }
+
+    fn slots_may_be_guest_pages(&self) -> bool {
+        self.slots_in_guest_pages
     }
 
     fn create_address_space(&mut self, ranges: &[GpuRange]) -> Result<SpaceId, BackendError> {
@@ -365,6 +450,10 @@ impl Backend for StandIn {
         space.mappings.insert(request.address, request.length);
         self.mapped_protections.push((request.address, request.driver_protection));
         Ok(())
+    }
+
+    fn protection_for_view(&self, view: RangeView, driver_protection: u64) -> u64 {
+        driver_protection | u64::from(view.surface.0) << VIEW_KIND_SHIFT | view.driver_protection
     }
 
     fn unmap(&mut self, unmap: &UnmapRequest) -> Result<(), BackendError> {
@@ -405,7 +494,7 @@ impl Backend for StandIn {
             exact_size: size,
             surface,
             gpu_cached: private.get(16).is_some_and(|&byte| byte != 0),
-            kind: MemoryKind::PLAIN,
+            kind: MemoryKind(field(private, KIND_FIELD)),
         }
     }
 
@@ -441,7 +530,7 @@ impl Backend for StandIn {
         })
     }
 
-    fn registry_value(&mut self, name: &RegistryName) -> Option<RegistryValue> {
+    fn registry_value(&mut self, name: &RegistryName, _asked_type: u32) -> Option<RegistryValue> {
         let utf16 = |text: &str| text.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>();
         match name {
             RegistryName::DriverStorePath | RegistryName::DriverImagePath => {
@@ -459,6 +548,10 @@ impl Backend for StandIn {
     }
 
     fn start_work(&mut self, host: &mut dyn HostServices, work: &Work<'_>) -> WorkStart {
+        self.last_commands = work.commands;
+        if let Some(address) = self.ask_monitored {
+            self.monitored_found = Some(host.monitored_fence(work.space, address));
+        }
         if !self.run_work || !work.may_run || work.queue_failed {
             return WorkStart::Finished;
         }
@@ -475,6 +568,18 @@ impl Backend for StandIn {
         WorkStart::Started { doorbell: work.fence_value, work: self.work_per_submission }
     }
 
+    fn poll_work(&mut self, _host: &mut dyn HostServices, _now: Instant) {
+        self.work_polls += 1;
+    }
+
+    fn gpu_woke(&mut self, _host: &mut dyn HostServices, _now: Instant) {
+        self.wakes += 1;
+    }
+
+    fn needs_polling(&self) -> bool {
+        self.needs_polling
+    }
+
     fn ring_doorbell(&mut self, queue: u32, doorbell: u64) -> Result<Doorbell, BackendError> {
         if self.fail_rings {
             return Err(BackendError::new("the stand-in was told to fail its doorbells"));
@@ -483,8 +588,11 @@ impl Backend for StandIn {
             self.refused_rings -= 1;
             return Ok(Doorbell::NotYet);
         }
+        if let Some(not_before) = self.ring_not_before.take() {
+            return Ok(Doorbell::NotBefore(not_before));
+        }
         self.doorbells.push((queue, doorbell));
-        Ok(Doorbell::Rung)
+        Ok(if self.work_stays { Doorbell::RungToStay } else { Doorbell::Rung })
     }
 
     fn close_queue(&mut self, queue: u32) {
@@ -495,6 +603,22 @@ impl Backend for StandIn {
         self.note_staging_copy(copy);
         self.copies.push(*copy);
         if self.slow_copies { StagingStart::Running } else { StagingStart::Finished(Status::SUCCESS) }
+    }
+
+    fn copy_staging_after(
+        &mut self,
+        _host: &mut dyn HostServices,
+        copy: &StagingCopy,
+        after: &[(u64, u64)],
+        _wait: Duration,
+    ) -> Option<Status> {
+        if !self.copies_after_work {
+            return None;
+        }
+        self.note_staging_copy(copy);
+        self.copies.push(*copy);
+        self.copied_after.push(after.to_vec());
+        Some(Status::SUCCESS)
     }
 
     fn poll_staging_copy(&mut self, _host: &mut dyn HostServices, _now: Instant) -> Option<Status> {
@@ -543,6 +667,10 @@ impl Backend for StandIn {
     }
 
     /// Anything that is a file will do, as nothing here has pixels.
+    fn ring_tiling(&self) -> Option<RingTiling> {
+        self.ring_tiling
+    }
+
     fn export_memory(&mut self, _memory: MemoryId, _size: u64) -> Result<OwnedFd, BackendError> {
         if self.refuse_exports {
             return Err(BackendError::new("the stand-in was told to refuse"));

@@ -2,9 +2,11 @@
 
 mod adapter;
 mod allocation;
+mod batch_note;
 mod context;
 mod copies;
 mod copy_bounds;
+mod first_lock;
 mod frame_ring;
 mod indirect;
 mod mapping;
@@ -29,8 +31,8 @@ use crate::tables::{Allocation, Mapping, Queue, ReservedRange};
 use crate::timing::Timings;
 use copies::{CopyJob, Parked};
 use guesthouse_backend::{
-    AllocationShape, Backend, BackendError, GuestMemory, GuestSpan, HostServices, MemoryError, PagesView,
-    SharedSpan, SpaceId,
+    AllocationShape, Backend, BackendError, GuestMemory, GuestSpan, HostServices, MemoryError, MemoryKind,
+    PagesView, SharedSpan, SpaceId,
 };
 use guesthouse_messages::notice::Notice;
 use guesthouse_messages::wire::{Malformed, put_u32};
@@ -109,6 +111,17 @@ pub struct TableSizes {
     pub deferred: usize,
 }
 
+/// See [`Session::video_use`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VideoUse {
+    /// The video memory the guest's allocations hold.
+    pub on_card: u64,
+    /// The system memory allocations hold that the card had no room for.
+    pub spilled: u64,
+    /// The cap they are held to, if any.
+    pub cap: Option<u64>,
+}
+
 /// Everything the host knows about one guest. See the crate documentation.
 pub struct Session<B, M> {
     pub(crate) backend: B,
@@ -126,6 +139,8 @@ pub struct Session<B, M> {
     pub(crate) processes_32_bit: HashSet<u32>,
     /// Each process's PID in the guest, by the handle this side gave it.
     pub(crate) guest_pids: HashMap<u32, u32>,
+    /// Each process's program, by its file name, where the guest named it.
+    pub(crate) programs: HashMap<u32, String>,
     pub(crate) spaces: HashMap<u32, SpaceId>,
     /// The daemon's own address space, apart from `spaces` so that no message can name it.
     own_space: Option<SpaceId>,
@@ -157,6 +172,9 @@ pub struct Session<B, M> {
     /// What each process has asked to keep of each memory group, by (process, group).
     pub(crate) reservations: HashMap<(u32, u32), u64>,
     pub(crate) gates: HashMap<u32, Gate>,
+    /// Queues whose doorbell the backend won't take before a time, by queue. Their gate waits for
+    /// it without hurry.
+    pub(crate) rings_not_before: HashMap<u32, Instant>,
     /// The number of the next wait to join a line.
     pub(crate) next_wait: u64,
     /// Waits that hold more than one queue, by number.
@@ -169,12 +187,20 @@ pub struct Session<B, M> {
     pub(crate) queues_made: u32,
     /// Statistics have been refused once, which is worth saying once.
     pub(crate) statistics_refused: bool,
+    /// Whether the log has said an allocation went to system memory, which it says once.
+    pub(crate) spill_noted: bool,
     /// Command numbers that were answered as not supported, so that each is worth one warning.
     unknown_commands: HashSet<u32>,
     /// Copies refused so far, as only the first few are worth a warning.
     pub(crate) copies_refused: u64,
     /// Submissions that reached the GPU, which may have written any memory mapped for it since.
     pub(crate) work_started: u64,
+    /// For each address space, how many times something was started that may have written the
+    /// memory mapped in it. Work that never ends in a space puts it in `ring_spaces` instead.
+    pub(crate) space_writes: HashMap<SpaceId, u64>,
+    /// Address spaces where work has run that the guest feeds without a word here, so what it
+    /// writes and when is not known.
+    pub(crate) ring_spaces: HashSet<SpaceId>,
     /// How many queues of each address space have stopped answering since it last came off the GPU.
     pub(crate) failed_queues: HashMap<SpaceId, u32>,
     pub(crate) faults: FaultRate,
@@ -187,6 +213,14 @@ pub struct Session<B, M> {
     pub(crate) mapped_so_far: u64,
     /// In the order the guest asked, which decides who gets a freed range next.
     pub(crate) reserved_addresses: Vec<ReservedRange>,
+    /// The last allocation each process made, if its memory has a kind of its own and nothing has
+    /// mapped it yet: the process, then the handle and the kind. See `described_surface`.
+    pub(crate) described_surfaces: HashMap<u32, (u32, MemoryKind)>,
+    /// The same for the newest allocation in the whole session: the process, the handle and the kind.
+    pub(crate) newest_description: Option<(u32, u32, MemoryKind)>,
+    /// The sizes of the ranges a process set aside for a described surface, and the surface's kind.
+    /// A probe, see `described_surface`.
+    pub(crate) surface_range_sizes: HashMap<(u32, u64), MemoryKind>,
 
     pub(crate) copies: VecDeque<CopyJob>,
     pub(crate) next_copy: u64,
@@ -202,11 +236,23 @@ pub struct Session<B, M> {
     pub(crate) pending: Vec<Pending>,
     pub(crate) pending_spare: Vec<Pending>,
     pub(crate) notices: Vec<Notice>,
+    /// While a message is handled for [`Session::handle_message_reply_first`]: doorbells wait in
+    /// `rings_after_reply` until the reply has gone.
+    pub(crate) reply_first: bool,
+    /// Doorbells to ring once the reply is out, as (queue, doorbell, fence, value), in order.
+    pub(crate) rings_after_reply: Vec<(u32, u64, u64, u64)>,
 }
 
 impl<B: Backend, M: GuestMemory> Session<B, M> {
+    /// The descriptor the GPU's interrupts post to, so the daemon's loop can sleep on them.
+    pub fn wake_descriptor(&self) -> Option<std::os::fd::RawFd> {
+        self.backend.wake_descriptor()
+    }
+
     pub fn new(backend: B, memory: M, config: Config) -> Self {
-        let gpu_addresses = GpuAddresses::keeping_clear(backend.kept_gpu_ranges());
+        let gpu_addresses = GpuAddresses::keeping_clear(backend.kept_gpu_ranges())
+            .with_guest_only(backend.guest_placed_gpu_ranges())
+            .holding_freed(backend.hold_freed_gpu_addresses());
         Self {
             backend,
             memory,
@@ -219,6 +265,7 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
             io_space: None,
             processes_32_bit: HashSet::new(),
             guest_pids: HashMap::new(),
+            programs: HashMap::new(),
             spaces: HashMap::new(),
             own_space: None,
             closed_spaces: HashSet::new(),
@@ -242,17 +289,24 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
             first_locks_waited: HashSet::new(),
             display_driver_seen: false,
             gates: HashMap::new(),
+            rings_not_before: HashMap::new(),
             queues_made: 0,
             statistics_refused: false,
+            spill_noted: false,
             unknown_commands: HashSet::new(),
             copies_refused: 0,
             work_started: 0,
+            space_writes: HashMap::new(),
+            ring_spaces: HashSet::new(),
             failed_queues: HashMap::new(),
             faults: FaultRate::new(),
             mapped_addresses: HashMap::new(),
             placed_mappings: HashMap::new(),
             mapped_so_far: 0,
             reserved_addresses: Vec::new(),
+            described_surfaces: HashMap::new(),
+            newest_description: None,
+            surface_range_sizes: HashMap::new(),
             copies: VecDeque::new(),
             next_copy: 0,
             parked: VecDeque::new(),
@@ -265,6 +319,8 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
             pending: Vec::new(),
             pending_spare: Vec::new(),
             notices: Vec::new(),
+            reply_first: false,
+            rings_after_reply: Vec::new(),
         }
     }
 
@@ -305,12 +361,53 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
         }
     }
 
+    /// What the guest's allocations hold, by the same count the cap is checked against. It goes
+    /// through every allocation, so it's for now and then, not for each message.
+    pub fn video_use(&self) -> VideoUse {
+        VideoUse {
+            on_card: self.video_in_use(),
+            spilled: self.spilled_in_use(),
+            cap: self.config.limits.video_cap,
+        }
+    }
+
     pub fn timings(&self) -> &Timings {
         &self.timings
     }
 
     pub fn timings_mut(&mut self) -> &mut Timings {
         &mut self.timings
+    }
+
+    /// Answers one message as [`Session::handle_message`] does, but leaves the doorbells it would ring
+    /// for [`Session::ring_after_reply`], which the caller calls once the reply has been written.
+    ///
+    /// A submission's reply says only whether its work was taken, which is known before the
+    /// doorbell. Ringing is the CS call on AMD, tens of microseconds, and the guest's thread waits
+    /// for the reply, so it goes first. The daemon reads nothing more before the doorbells are rung,
+    /// so the order of everything the guest sends is kept.
+    pub fn handle_message_reply_first(
+        &mut self,
+        message: &[u8],
+        ticket: Option<ReplyTicket>,
+        out: &mut Vec<u8>,
+    ) -> Answer {
+        self.reply_first = true;
+        let answer = self.handle_message(message, ticket, out);
+        self.reply_first = false;
+        answer
+    }
+
+    /// Rings what [`Session::handle_message_reply_first`] left, in order.
+    pub fn ring_after_reply(&mut self) {
+        let mut rings = std::mem::take(&mut self.rings_after_reply);
+        for (queue, doorbell, fence, value) in rings.drain(..) {
+            self.ring_or_hold(queue, doorbell, fence, value);
+        }
+        // Kept, so ringing does not allocate.
+        if self.rings_after_reply.is_empty() {
+            self.rings_after_reply = rings;
+        }
     }
 
     /// Answers one message. `ticket` is `None` if the guest wants no reply.
@@ -333,6 +430,16 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
             put_u32(out, Status::UNSUCCESSFUL.0);
             return Answer::Now;
         }
+        // With GUESTHOUSE_VERBOSE, every message gets a line, as some only the core sees, and a
+        // status that isn't success shows in the reply's first bytes for most of them.
+        log::debug!(
+            "message {command:?} process={:#x} length={} reply_length={} held={} reply_start={}",
+            MessageHeader::process_of(message).unwrap_or(0),
+            message.len(),
+            out.len(),
+            self.held,
+            ReplyStart(out)
+        );
         if self.held { Answer::Held } else { Answer::Now }
     }
 
@@ -438,6 +545,8 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
                 if self.unknown_commands.insert(number) {
                     log::warn!("the guest sent command {number}, which isn't supported");
                 }
+                // What it carried is the only clue to what the guest wanted, or was reporting.
+                log::debug!("refused command {number} length={} bytes={}", message.len(), Refused(message));
                 answer_status(Status::NOT_SUPPORTED, out);
             }
             None => answer_status(Status::NOT_SUPPORTED, out),
@@ -457,7 +566,10 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
 
     /// An address space with the fences in it, as every space has.
     fn new_space(&mut self) -> Result<SpaceId, BackendError> {
-        let space = self.backend.create_address_space(&crate::GPU_RANGES)?;
+        // A backend's guest-only ranges are part of each space too, so the guest's own mappings there
+        // have somewhere to go. With none, as for NVIDIA and AMD, a space is the core's ranges alone.
+        let ranges = [&crate::GPU_RANGES[..], self.backend.guest_placed_gpu_ranges()].concat();
+        let space = self.backend.create_address_space(&ranges)?;
         let block = self.fence_block()?;
         self.backend.map(&guesthouse_backend::MapRequest {
             space,
@@ -514,6 +626,9 @@ pub(crate) struct Services<'a, M> {
     gpu_addresses: &'a mut GpuAddresses,
     allocations: &'a HashMap<u32, Allocation>,
     memory: &'a mut M,
+    sync_objects: &'a SyncTable,
+    /// Each process's space.
+    spaces: &'a HashMap<u32, SpaceId>,
 }
 
 impl<M: GuestMemory> Services<'_, M> {
@@ -614,6 +729,11 @@ impl<M: GuestMemory> HostServices for Services<'_, M> {
     fn fence_value(&self, fence: u64) -> Result<u64, MemoryError> {
         self.memory.read_u64(fence)
     }
+
+    fn monitored_fence(&self, space: SpaceId, gpu_address: u64) -> Option<u64> {
+        let (&process, _) = self.spaces.iter().find(|&(_, &held)| held == space)?;
+        self.sync_objects.monitored_fence(process, gpu_address)
+    }
 }
 
 macro_rules! services {
@@ -622,6 +742,8 @@ macro_rules! services {
             &mut $session.gpu_addresses,
             &$session.allocations,
             &mut $session.memory,
+            &$session.sync_objects,
+            &$session.spaces,
         )
     };
 }
@@ -632,8 +754,10 @@ impl<'a, M> Services<'a, M> {
         gpu_addresses: &'a mut GpuAddresses,
         allocations: &'a HashMap<u32, Allocation>,
         memory: &'a mut M,
+        sync_objects: &'a SyncTable,
+        spaces: &'a HashMap<u32, SpaceId>,
     ) -> Self {
-        Self { gpu_addresses, allocations, memory }
+        Self { gpu_addresses, allocations, memory, sync_objects, spaces }
     }
 }
 
@@ -645,4 +769,25 @@ pub(crate) fn answer_status(status: Status, out: &mut Vec<u8>) {
 fn answer_no_registry_keys(out: &mut Vec<u8>) {
     put_u32(out, 0);
     put_u32(out, Status::SUCCESS.0);
+}
+
+/// A message the core had no answer for, in hex for the log, up to a size that keeps a line readable.
+struct Refused<'a>(&'a [u8]);
+
+impl std::fmt::Display for Refused<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const SHOWN: usize = 1024;
+        self.0.iter().take(SHOWN).try_for_each(|byte| write!(f, "{byte:02x}"))?;
+        if self.0.len() > SHOWN { write!(f, "...") } else { Ok(()) }
+    }
+}
+
+/// The first bytes of a reply in hex, for the log, written without making a string.
+struct ReplyStart<'a>(&'a [u8]);
+
+impl std::fmt::Display for ReplyStart<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const SHOWN: usize = 16;
+        self.0.iter().take(SHOWN).try_for_each(|byte| write!(f, "{byte:02x}"))
+    }
 }

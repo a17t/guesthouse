@@ -11,7 +11,7 @@ pub const DRIVER_LIBRARIES: [&str; 3] = ["libcuda.so.1", "libnvidia-ml.so.1", "l
 /// Versions a person has run the whole check on. Another point release of a branch runs with a
 /// warning, and a branch nobody knows doesn't run, as a new branch can change what the driver asks of
 /// the host, on a card the host's own desktop is using.
-pub const TESTED_VERSIONS: [&str; 1] = ["615.78.08"];
+pub const TESTED_VERSIONS: [&str; 2] = ["615.78.08", "620.70.06"];
 
 /// What the host's kernel and files say.
 pub trait DriverHost {
@@ -100,12 +100,14 @@ mod tests {
     fn the_tested_version_and_its_branch_are_known() {
         assert_eq!(branch_refusal("615.78.08"), None);
         assert_eq!(branch_refusal("615.90.01"), None);
+        assert_eq!(branch_refusal("620.70.06"), None);
+        assert_eq!(untested_warning("620.70.06"), None);
     }
 
     #[test]
     fn an_unknown_branch_is_refused_by_name() {
-        let said = branch_refusal("620.11").unwrap();
-        assert!(said.contains("620") && said.contains("615"));
+        let said = branch_refusal("625.11").unwrap();
+        assert!(said.contains("625") && said.contains("615") && said.contains("620"));
     }
 
     #[test]

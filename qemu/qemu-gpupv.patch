@@ -8726,3 +8726,1198 @@ index d319160..ff1077c 100644
 -- 
 2.56.0
 
+From fb2d6463d8c1a09f51a67146019eab4e19bd1260 Mon Sep 17 00:00:00 2001
+From: xnixy <x@ruxn.com>
+Date: Fri, 13 Nov 2026 09:32:29 -0800
+Subject: [PATCH 31/31] hw/misc/nvfwd: read calls as the host's driver branch
+ does
+
+Driver branch 620 grows the parameters of two classes, and the RM takes
+those sizes from its own table when a call gives none. The device keeps
+a table of class sizes for each branch it knows, 615 and 620, and picks
+one from the loaded module's version before the guest runs. A branch it
+has no table for stops the device from starting.
+
+The sensor daemon knows 620.70.06 too: the shared data page it reads is
+laid out the same there.
+
+class_tables_620.h comes from NVIDIA's open modules at 620.70.06, under
+NVIDIA's MIT notice.
+---
+ hw/misc/nvfwd/class_tables_620.h | 192 +++++++++++++++++++++++++++++++
+ hw/misc/nvfwd/host_card.c        |  30 +++++
+ hw/misc/nvfwd/rmargs.c           |  39 ++++++-
+ hw/misc/nvfwd/rmargs.h           |   6 +
+ hw/misc/nvfwd/rusd.c             |  17 ++-
+ 5 files changed, 276 insertions(+), 8 deletions(-)
+ create mode 100644 hw/misc/nvfwd/class_tables_620.h
+
+diff --git a/hw/misc/nvfwd/class_tables_620.h b/hw/misc/nvfwd/class_tables_620.h
+new file mode 100644
+index 0000000..7ca7bd4
+--- /dev/null
++++ b/hw/misc/nvfwd/class_tables_620.h
+@@ -0,0 +1,192 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * Made from NVIDIA's open GPU kernel modules, whose notice follows.
++ *
++ * Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
++ * associated documentation files (the "Software"), to deal in the Software without restriction,
++ * including without limitation the rights to use, copy, modify, merge, publish, distribute,
++ * sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in all copies or
++ * substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT
++ * NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES
++ * OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++ */
++{ 0x0, 4 }, /* NV01_ROOT NvHandle */
++{ 0x1, 4 }, /* NV01_ROOT_NON_PRIV NvHandle */
++{ 0x41, 4 }, /* NV01_ROOT_CLIENT NvHandle */
++{ 0xf, 16 }, /* FABRIC_MANAGER_SESSION NV000F_ALLOCATION_PARAMETERS */
++{ 0xf1, 32 }, /* NV_IMEX_SESSION NV00F1_ALLOCATION_PARAMETERS */
++{ 0x77cc, 8 }, /* NV_MNCC_SESSION NV77CC_ALLOC_PARAMETERS */
++{ 0x20, 4 }, /* NV0020_GPU_MANAGEMENT NvHandle */
++{ 0x90cd, 72 }, /* NV_EVENT_BUFFER NV_EVENT_BUFFER_ALLOC_PARAMETERS */
++{ 0x90d0, 104 }, /* NV_OPERATIONAL_EVENT_BUFFER_BIND NV_OPERATIONAL_EVENT_BUFFER_BIND_ALLOC_PARAMETERS */
++{ 0xda, 16 }, /* NV_SEMAPHORE_SURFACE NV_SEMAPHORE_SURFACE_ALLOC_PARAMETERS */
++{ 0x503b, 88 }, /* NV50_P2P NV503B_ALLOC_PARAMETERS */
++{ 0x60, 4 }, /* NV0060_SYNC_GPU_BOOST NV0060_ALLOC_PARAMETERS */
++{ 0x80, 56 }, /* NV01_DEVICE_0 NV0080_ALLOC_PARAMETERS */
++{ 0x83de, 12 }, /* GT200_DEBUGGER NV83DE_ALLOC_PARAMETERS */
++{ 0x30f1, 4 }, /* NV30_GSYNC NV30F1_ALLOC_PARAMETERS */
++{ 0xb1cc, 4 }, /* MAXWELL_PROFILER_CONTEXT NVB1CC_ALLOC_PARAMETERS */
++{ 0xb2cc, 8 }, /* MAXWELL_PROFILER_DEVICE NVB2CC_ALLOC_PARAMETERS */
++{ 0xb0cd, 8 }, /* PROFILER_DEVICE_EVENT NVB0CD_ALLOC_PARAMETERS */
++{ 0xb0ce, 16 }, /* PROFILER_CONTEXT_EVENT NVB0CE_ALLOC_PARAMETERS */
++{ 0xcdcd, 8 }, /* TRACE_DEVICE_EVENT NVCDCD_ALLOC_PARAMETERS */
++{ 0xd0cd, 8 }, /* WPPS_CONFIG_SESSION NVD0CD_ALLOC_PARAMETERS */
++{ 0x906f, 376 }, /* GF100_CHANNEL_GPFIFO NV_CHANNEL_ALLOC_PARAMS */
++{ 0xa06f, 376 }, /* KEPLER_CHANNEL_GPFIFO_A NV_CHANNEL_ALLOC_PARAMS */
++{ 0xa16f, 376 }, /* KEPLER_CHANNEL_GPFIFO_B NV_CHANNEL_ALLOC_PARAMS */
++{ 0xb06f, 376 }, /* MAXWELL_CHANNEL_GPFIFO_A NV_CHANNEL_ALLOC_PARAMS */
++{ 0xc06f, 376 }, /* PASCAL_CHANNEL_GPFIFO_A NV_CHANNEL_ALLOC_PARAMS */
++{ 0xc36f, 376 }, /* VOLTA_CHANNEL_GPFIFO_A NV_CHANNEL_ALLOC_PARAMS */
++{ 0xc46f, 376 }, /* TURING_CHANNEL_GPFIFO_A NV_CHANNEL_ALLOC_PARAMS */
++{ 0xc56f, 376 }, /* AMPERE_CHANNEL_GPFIFO_A NV_CHANNEL_ALLOC_PARAMS */
++{ 0xc86f, 376 }, /* HOPPER_CHANNEL_GPFIFO_A NV_CHANNEL_ALLOC_PARAMS */
++{ 0xc96f, 376 }, /* BLACKWELL_CHANNEL_GPFIFO_A NV_CHANNEL_ALLOC_PARAMS */
++{ 0xca6f, 376 }, /* BLACKWELL_CHANNEL_GPFIFO_B NV_CHANNEL_ALLOC_PARAMS */
++{ 0xc574, 8 }, /* UVM_CHANNEL_RETAINER NV_UVM_CHANNEL_RETAINER_ALLOC_PARAMS */
++{ 0x9067, 16 }, /* FERMI_CONTEXT_SHARE_A NV_CTXSHARE_ALLOCATION_PARAMETERS */
++{ 0x2080, 4 }, /* NV20_SUBDEVICE_0 NV2080_ALLOC_PARAMETERS */
++{ 0x2081, 4 }, /* NV2081_BINAPI NV2081_ALLOC_PARAMETERS */
++{ 0x2082, 4 }, /* NV2082_BINAPI_PRIVILEGED NV2082_ALLOC_PARAMETERS */
++{ 0xa06c, 32 }, /* KEPLER_CHANNEL_GROUP_A NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS */
++{ 0x40, 128 }, /* NV01_MEMORY_LOCAL_USER NV_MEMORY_ALLOCATION_PARAMS */
++{ 0xc2, 24 }, /* NV01_MEMORY_LOCAL_PHYSICAL NV_PHYSICAL_MEMORY_ALLOCATION_PARAMS */
++{ 0x50a0, 128 }, /* NV50_MEMORY_VIRTUAL NV_MEMORY_ALLOCATION_PARAMS */
++{ 0x3e, 128 }, /* NV01_MEMORY_SYSTEM NV_MEMORY_ALLOCATION_PARAMS */
++{ 0x70, 24 }, /* NV01_MEMORY_VIRTUAL NV_MEMORY_VIRTUAL_ALLOCATION_PARAMS */
++{ 0xfe, 24 }, /* NV_MEMORY_MAPPER NV_MEMORY_MAPPER_ALLOCATION_PARAMS */
++{ 0x71, 40 }, /* NV01_MEMORY_SYSTEM_OS_DESCRIPTOR NV_OS_DESC_MEMORY_ALLOCATION_PARAMS */
++{ 0xc3, 4 }, /* NV01_MEMORY_SYNCPOINT NV_MEMORY_SYNCPOINT_ALLOCATION_PARAMS */
++{ 0x90ce, 128 }, /* NV01_MEMORY_DEVICELESS NV_MEMORY_ALLOCATION_PARAMS */
++{ 0xb1, 120 }, /* NV01_MEMORY_HW_RESOURCES NV_MEMORY_HW_RESOURCES_ALLOCATION_PARAMS */
++{ 0x81, 152 }, /* NV01_MEMORY_LIST_SYSTEM NV_MEMORY_LIST_ALLOCATION_PARAMS */
++{ 0x82, 152 }, /* NV01_MEMORY_LIST_FBMEM NV_MEMORY_LIST_ALLOCATION_PARAMS */
++{ 0x83, 152 }, /* NV01_MEMORY_LIST_OBJECT NV_MEMORY_LIST_ALLOCATION_PARAMS */
++{ 0xe0, 244 }, /* NV_MEMORY_EXPORT NV00E0_ALLOCATION_PARAMETERS */
++{ 0xf9, 64 }, /* NV_MEMORY_FABRIC_IMPORT_V2 NV00F9_ALLOCATION_PARAMETERS */
++{ 0xf8, 48 }, /* NV_MEMORY_FABRIC NV00F8_ALLOCATION_PARAMETERS */
++{ 0xfb, 32 }, /* NV_MEMORY_FABRIC_IMPORTED_REF NV00FB_ALLOCATION_PARAMETERS */
++{ 0x90f1, 56 }, /* FERMI_VASPACE_A NV_VASPACE_ALLOCATION_PARAMETERS */
++{ 0xfd, 80 }, /* NV_MEMORY_MULTICAST_FABRIC NV00FD_ALLOCATION_PARAMETERS */
++{ 0xa0bc, 20 }, /* NVENC_SW_SESSION NVA0BC_ALLOC_PARAMETERS */
++{ 0xa0bd, 20 }, /* NVFBC_SW_SESSION NVA0BD_ALLOC_PARAMETERS */
++{ 0xa084, 88 }, /* NVA084_KERNEL_HOST_VGPU_DEVICE NVA084_ALLOC_PARAMETERS */
++{ 0x503c, 4 }, /* NV50_THIRD_PARTY_P2P NV503C_ALLOC_PARAMETERS */
++{ 0xdb, 8 }, /* NV40_DEBUG_BUFFER NV00DB_ALLOCATION_PARAMETERS */
++{ 0xde, 8 }, /* RM_USER_SHARED_DATA NV00DE_ALLOC_PARAMETERS */
++{ 0xc661, 2 }, /* HOPPER_USERMODE_A NV_HOPPER_USERMODE_A_PARAMS */
++{ 0xc761, 2 }, /* BLACKWELL_USERMODE_A NV_HOPPER_USERMODE_A_PARAMS */
++{ 0xc365, 4 }, /* ACCESS_COUNTER_NOTIFY_BUFFER NV_ACCESS_COUNTER_NOTIFY_BUFFER_ALLOC_PARAMS */
++{ 0xc763, 528 }, /* MMU_VIDMEM_ACCESS_BIT_BUFFER NV_VIDMEM_ACCESS_BIT_ALLOCATION_PARAMS */
++{ 0xc863, 528 }, /* HOPPER_MMU_VIDMEM_ACCESS_BIT_BUFFER NV_VIDMEM_ACCESS_BIT_ALLOCATION_PARAMS */
++{ 0xc637, 16 }, /* AMPERE_SMC_PARTITION_REF NVC637_ALLOCATION_PARAMETERS */
++{ 0xc638, 16 }, /* AMPERE_SMC_EXEC_PARTITION_REF NVC638_ALLOCATION_PARAMETERS */
++{ 0xc639, 8 }, /* AMPERE_SMC_CONFIG_SESSION NVC639_ALLOCATION_PARAMETERS */
++{ 0xc640, 8 }, /* AMPERE_SMC_MONITOR_SESSION NVC640_ALLOCATION_PARAMETERS */
++{ 0x9010, 32 }, /* NV9010_VBLANK_CALLBACK NV_VBLANK_CALLBACK_ALLOCATION_PARAMETERS */
++{ 0x92, 32 }, /* NV0092_RG_LINE_CALLBACK NV0092_RG_LINE_CALLBACK_ALLOCATION_PARAMETERS */
++{ 0xc57a, 16 }, /* NVC57A_CURSOR_IMM_CHANNEL_PIO NV50VAIO_CHANNELPIO_ALLOCATION_PARAMETERS */
++{ 0xc67a, 16 }, /* NVC67A_CURSOR_IMM_CHANNEL_PIO NV50VAIO_CHANNELPIO_ALLOCATION_PARAMETERS */
++{ 0xc87a, 16 }, /* NVC87A_CURSOR_IMM_CHANNEL_PIO NV50VAIO_CHANNELPIO_ALLOCATION_PARAMETERS */
++{ 0xc97a, 16 }, /* NVC97A_CURSOR_IMM_CHANNEL_PIO NV50VAIO_CHANNELPIO_ALLOCATION_PARAMETERS */
++{ 0xca7a, 16 }, /* NVCA7A_CURSOR_IMM_CHANNEL_PIO NV50VAIO_CHANNELPIO_ALLOCATION_PARAMETERS */
++{ 0xcb7a, 16 }, /* NVCB7A_CURSOR_IMM_CHANNEL_PIO NV50VAIO_CHANNELPIO_ALLOCATION_PARAMETERS */
++{ 0xcc7a, 16 }, /* NVCC7A_CURSOR_IMM_CHANNEL_PIO NV50VAIO_CHANNELPIO_ALLOCATION_PARAMETERS */
++{ 0xc57b, 40 }, /* NVC57B_WINDOW_IMM_CHANNEL_DMA NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS */
++{ 0xc57d, 40 }, /* NVC57D_CORE_CHANNEL_DMA NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS */
++{ 0xc57e, 40 }, /* NVC57E_WINDOW_CHANNEL_DMA NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS */
++{ 0xc67b, 40 }, /* NVC67B_WINDOW_IMM_CHANNEL_DMA NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS */
++{ 0xc67d, 40 }, /* NVC67D_CORE_CHANNEL_DMA NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS */
++{ 0xc77d, 40 }, /* NVC77D_CORE_CHANNEL_DMA NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS */
++{ 0xc77f, 40 }, /* NVC77F_ANY_CHANNEL_DMA NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS */
++{ 0xc67e, 40 }, /* NVC67E_WINDOW_CHANNEL_DMA NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS */
++{ 0xc87b, 40 }, /* NVC87B_WINDOW_IMM_CHANNEL_DMA NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS */
++{ 0xc87d, 40 }, /* NVC87D_CORE_CHANNEL_DMA NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS */
++{ 0xc87e, 40 }, /* NVC87E_WINDOW_CHANNEL_DMA NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS */
++{ 0xc97b, 40 }, /* NVC97B_WINDOW_IMM_CHANNEL_DMA NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS */
++{ 0xc97d, 40 }, /* NVC97D_CORE_CHANNEL_DMA NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS */
++{ 0xc97e, 40 }, /* NVC97E_WINDOW_CHANNEL_DMA NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS */
++{ 0xca7b, 40 }, /* NVCA7B_WINDOW_IMM_CHANNEL_DMA NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS */
++{ 0xca7d, 40 }, /* NVCA7D_CORE_CHANNEL_DMA NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS */
++{ 0xca7e, 40 }, /* NVCA7E_WINDOW_CHANNEL_DMA NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS */
++{ 0xcb7b, 40 }, /* NVCB7B_WINDOW_IMM_CHANNEL_DMA NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS */
++{ 0xcb7d, 40 }, /* NVCB7D_CORE_CHANNEL_DMA NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS */
++{ 0xcb7e, 40 }, /* NVCB7E_WINDOW_CHANNEL_DMA NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS */
++{ 0xcc7b, 40 }, /* NVCC7B_WINDOW_IMM_CHANNEL_DMA NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS */
++{ 0xcc7d, 40 }, /* NVCC7D_CORE_CHANNEL_DMA NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS */
++{ 0xcc7e, 40 }, /* NVCC7E_WINDOW_CHANNEL_DMA NV50VAIO_CHANNELDMA_ALLOCATION_PARAMETERS */
++{ 0x9072, 12 }, /* GF100_DISP_SW NV9072_ALLOCATION_PARAMETERS */
++{ 0x5080, 1 }, /* NV50_DEFERRED_API_CLASS NV5080_ALLOC_PARAMS */
++{ 0xb0b5, 8 }, /* MAXWELL_DMA_COPY_A NVB0B5_ALLOCATION_PARAMETERS */
++{ 0xc0b5, 8 }, /* PASCAL_DMA_COPY_A NVB0B5_ALLOCATION_PARAMETERS */
++{ 0xc5b5, 8 }, /* TURING_DMA_COPY_A NVB0B5_ALLOCATION_PARAMETERS */
++{ 0xc6b5, 8 }, /* AMPERE_DMA_COPY_A NVB0B5_ALLOCATION_PARAMETERS */
++{ 0xc7b5, 8 }, /* AMPERE_DMA_COPY_B NVB0B5_ALLOCATION_PARAMETERS */
++{ 0xc8b5, 8 }, /* HOPPER_DMA_COPY_A NVB0B5_ALLOCATION_PARAMETERS */
++{ 0xc9b5, 8 }, /* BLACKWELL_DMA_COPY_A NVB0B5_ALLOCATION_PARAMETERS */
++{ 0xcab5, 8 }, /* BLACKWELL_DMA_COPY_B NVB0B5_ALLOCATION_PARAMETERS */
++{ 0xb8b0, 12 }, /* NVB8B0_VIDEO_DECODER NV_BSP_ALLOCATION_PARAMETERS */
++{ 0xc4b0, 12 }, /* NVC4B0_VIDEO_DECODER NV_BSP_ALLOCATION_PARAMETERS */
++{ 0xc6b0, 12 }, /* NVC6B0_VIDEO_DECODER NV_BSP_ALLOCATION_PARAMETERS */
++{ 0xc7b0, 12 }, /* NVC7B0_VIDEO_DECODER NV_BSP_ALLOCATION_PARAMETERS */
++{ 0xc9b0, 12 }, /* NVC9B0_VIDEO_DECODER NV_BSP_ALLOCATION_PARAMETERS */
++{ 0xcdb0, 12 }, /* NVCDB0_VIDEO_DECODER NV_BSP_ALLOCATION_PARAMETERS */
++{ 0xceb0, 12 }, /* NVCEB0_VIDEO_DECODER NV_BSP_ALLOCATION_PARAMETERS */
++{ 0xcfb0, 12 }, /* NVCFB0_VIDEO_DECODER NV_BSP_ALLOCATION_PARAMETERS */
++{ 0xd1b0, 12 }, /* NVD1B0_VIDEO_DECODER NV_BSP_ALLOCATION_PARAMETERS */
++{ 0xd2b0, 12 }, /* NVD2B0_VIDEO_DECODER NV_BSP_ALLOCATION_PARAMETERS */
++{ 0xb8d1, 12 }, /* NVB8D1_VIDEO_NVJPG NV_NVJPG_ALLOCATION_PARAMETERS */
++{ 0xc4d1, 12 }, /* NVC4D1_VIDEO_NVJPG NV_NVJPG_ALLOCATION_PARAMETERS */
++{ 0xc9d1, 12 }, /* NVC9D1_VIDEO_NVJPG NV_NVJPG_ALLOCATION_PARAMETERS */
++{ 0xcdd1, 12 }, /* NVCDD1_VIDEO_NVJPG NV_NVJPG_ALLOCATION_PARAMETERS */
++{ 0xced0, 12 }, /* NVCED0_VIDEO_NVJPG NV_NVJPG_ALLOCATION_PARAMETERS */
++{ 0xcfd1, 12 }, /* NVCFD1_VIDEO_NVJPG NV_NVJPG_ALLOCATION_PARAMETERS */
++{ 0xd2d1, 12 }, /* NVD2D1_VIDEO_NVJPG NV_NVJPG_ALLOCATION_PARAMETERS */
++{ 0xb8fa, 12 }, /* NVB8FA_VIDEO_OFA NV_OFA_ALLOCATION_PARAMETERS */
++{ 0xc6fa, 12 }, /* NVC6FA_VIDEO_OFA NV_OFA_ALLOCATION_PARAMETERS */
++{ 0xc7fa, 12 }, /* NVC7FA_VIDEO_OFA NV_OFA_ALLOCATION_PARAMETERS */
++{ 0xc9fa, 12 }, /* NVC9FA_VIDEO_OFA NV_OFA_ALLOCATION_PARAMETERS */
++{ 0xcdfa, 12 }, /* NVCDFA_VIDEO_OFA NV_OFA_ALLOCATION_PARAMETERS */
++{ 0xcefa, 12 }, /* NVCEFA_VIDEO_OFA NV_OFA_ALLOCATION_PARAMETERS */
++{ 0xcffa, 12 }, /* NVCFFA_VIDEO_OFA NV_OFA_ALLOCATION_PARAMETERS */
++{ 0xd1fa, 12 }, /* NVD1FA_VIDEO_OFA NV_OFA_ALLOCATION_PARAMETERS */
++{ 0xd2fa, 12 }, /* NVD2FA_VIDEO_OFA NV_OFA_ALLOCATION_PARAMETERS */
++{ 0xd1b7, 12 }, /* NVD1B7_VIDEO_ENCODER NV_MSENC_ALLOCATION_PARAMETERS */
++{ 0xc4b7, 12 }, /* NVC4B7_VIDEO_ENCODER NV_MSENC_ALLOCATION_PARAMETERS */
++{ 0xb4b7, 12 }, /* NVB4B7_VIDEO_ENCODER NV_MSENC_ALLOCATION_PARAMETERS */
++{ 0xc7b7, 12 }, /* NVC7B7_VIDEO_ENCODER NV_MSENC_ALLOCATION_PARAMETERS */
++{ 0xc9b7, 12 }, /* NVC9B7_VIDEO_ENCODER NV_MSENC_ALLOCATION_PARAMETERS */
++{ 0xceb7, 12 }, /* NVCEB7_VIDEO_ENCODER NV_MSENC_ALLOCATION_PARAMETERS */
++{ 0xcfb7, 12 }, /* NVCFB7_VIDEO_ENCODER NV_MSENC_ALLOCATION_PARAMETERS */
++{ 0xc697, 16 }, /* AMPERE_A NV_GR_ALLOCATION_PARAMETERS */
++{ 0xc6c0, 16 }, /* AMPERE_COMPUTE_A NV_GR_ALLOCATION_PARAMETERS */
++{ 0xc797, 16 }, /* AMPERE_B NV_GR_ALLOCATION_PARAMETERS */
++{ 0xc7c0, 16 }, /* AMPERE_COMPUTE_B NV_GR_ALLOCATION_PARAMETERS */
++{ 0xc997, 16 }, /* ADA_A NV_GR_ALLOCATION_PARAMETERS */
++{ 0xc9c0, 16 }, /* ADA_COMPUTE_A NV_GR_ALLOCATION_PARAMETERS */
++{ 0xcb97, 16 }, /* HOPPER_A NV_GR_ALLOCATION_PARAMETERS */
++{ 0xcbc0, 16 }, /* HOPPER_COMPUTE_A NV_GR_ALLOCATION_PARAMETERS */
++{ 0xcd97, 16 }, /* BLACKWELL_A NV_GR_ALLOCATION_PARAMETERS */
++{ 0xcdc0, 16 }, /* BLACKWELL_COMPUTE_A NV_GR_ALLOCATION_PARAMETERS */
++{ 0xcd40, 16 }, /* BLACKWELL_INLINE_TO_MEMORY_A NV_GR_ALLOCATION_PARAMETERS */
++{ 0xce97, 16 }, /* BLACKWELL_B NV_GR_ALLOCATION_PARAMETERS */
++{ 0xcec0, 16 }, /* BLACKWELL_COMPUTE_B NV_GR_ALLOCATION_PARAMETERS */
++{ 0x902d, 16 }, /* FERMI_TWOD_A NV_GR_ALLOCATION_PARAMETERS */
++{ 0xa140, 16 }, /* KEPLER_INLINE_TO_MEMORY_B NV_GR_ALLOCATION_PARAMETERS */
++{ 0xc597, 16 }, /* TURING_A NV_GR_ALLOCATION_PARAMETERS */
++{ 0xc5c0, 16 }, /* TURING_COMPUTE_A NV_GR_ALLOCATION_PARAMETERS */
++{ 0x2, 32 }, /* NV01_CONTEXT_DMA NV_CONTEXT_DMA_ALLOCATION_PARAMS */
++{ 0x5, 24 }, /* NV01_EVENT NV0005_ALLOC_PARAMETERS */
++{ 0x79, 24 }, /* NV01_EVENT_OS_EVENT NV0005_ALLOC_PARAMETERS */
++{ 0x78, 24 }, /* NV01_EVENT_KERNEL_CALLBACK NV0005_ALLOC_PARAMETERS */
++{ 0x7e, 24 }, /* NV01_EVENT_KERNEL_CALLBACK_EX NV0005_ALLOC_PARAMETERS */
++{ 0xcb33, 4 }, /* NV_CONFIDENTIAL_COMPUTE NV_CONFIDENTIAL_COMPUTE_ALLOC_PARAMS */
++{ 0x50, 24 }, /* NV_CE_UTILS NV0050_ALLOCATION_PARAMETERS */
+diff --git a/hw/misc/nvfwd/host_card.c b/hw/misc/nvfwd/host_card.c
+index ad6797f..0a01901 100644
+--- a/hw/misc/nvfwd/host_card.c
++++ b/hw/misc/nvfwd/host_card.c
+@@ -8,6 +8,7 @@
+ #include <sys/ioctl.h>
+ #include "nvfwd.h"
+ #include "rm_layout.h"
++#include "rmargs.h"
+ 
+ #define IOCTL_MAGIC 'F'
+ #define CLASS_ROOT_CLIENT 0x41
+@@ -16,6 +17,8 @@
+ #define CLIENT_PARAMS_BYTES 120 /* NV0000_ALLOC_PARAMETERS */
+ #define DEVICE_PARAMS_BYTES 56  /* NV0080_ALLOC_PARAMETERS */
+ #define STATUS_INSUFFICIENT_PERMISSIONS 0x1b
++#define DRIVER_VERSION_FILE "/sys/module/nvidia/version"
++#define MOST_VERSION_BYTES 32
+ 
+ typedef struct LookupClient {
+     int control_fd;
+@@ -121,11 +124,38 @@ static const char *look_up(NvfwdState *s, const CardAddress *address)
+     return why;
+ }
+ 
++/* The loaded module's version, as the guest's driver files have to be, picks how calls are read. */
++static bool use_host_driver(NvfwdState *s, Error **errp)
++{
++    char version[MOST_VERSION_BYTES] = "";
++    FILE *f = fopen(DRIVER_VERSION_FILE, "r");
++
++    if (!f) {
++        error_setg_errno(errp, errno, "nvfwd: %s", DRIVER_VERSION_FILE);
++        return false;
++    }
++    if (!fgets(version, sizeof(version), f)) {
++        version[0] = 0;
++    }
++    fclose(f);
++    version[strcspn(version, "\n")] = 0;
++    if (!rmargs_use_driver(version)) {
++        error_setg(errp, "nvfwd: the host's driver %s is from a branch this QEMU has no tables for", version);
++        return false;
++    }
++    fprintf(s->log, "host driver %s\n", version);
++    return true;
++}
++
+ bool host_card_open(NvfwdState *s, Error **errp)
+ {
+     CardAddress address;
+     const char *why;
+ 
++    if (!use_host_driver(s, errp)) {
++        return false;
++    }
++
+     snprintf(s->card_path, sizeof(s->card_path), "/dev/nvidia%u", s->card_minor);
+     if (s->card_text && !card_parse_address(s->card_text, &address)) {
+         error_setg(errp, "nvfwd: card=%s is not a PCI address", s->card_text);
+diff --git a/hw/misc/nvfwd/rmargs.c b/hw/misc/nvfwd/rmargs.c
+index bc93134..f4b7979 100644
+--- a/hw/misc/nvfwd/rmargs.c
++++ b/hw/misc/nvfwd/rmargs.c
+@@ -47,9 +47,12 @@ static const struct control_size pinned_controls[] = {
+ struct class_size {
+     uint32_t hclass, size;
+ };
+-static const struct class_size class_sizes[] = {
++static const struct class_size class_sizes_615[] = {
+ #include "class_tables.h"
+ };
++static const struct class_size class_sizes_620[] = {
++#include "class_tables_620.h"
++};
+ 
+ struct uvm_call {
+     uint32_t cmd, size;
+@@ -62,6 +65,21 @@ static const struct uvm_call uvm_calls[] = {
+ 
+ #define ARRAY_LENGTH(a) (sizeof(a) / sizeof((a)[0]))
+ 
++/*
++ * A new driver branch can grow a class's parameters, and only the sizes of classes differ between
++ * the branches here. The first is what a call is read with until the device knows the host's.
++ */
++typedef struct Branch {
++    const char *name;
++    const struct class_size *sizes;
++    size_t count;
++} Branch;
++static const Branch branches[] = {
++    { "615", class_sizes_615, ARRAY_LENGTH(class_sizes_615) },
++    { "620", class_sizes_620, ARRAY_LENGTH(class_sizes_620) },
++};
++static const Branch *branch = &branches[0];
++
+ typedef struct Walk {
+     const RmCall *call;
+     RmField *fields;
+@@ -195,9 +213,9 @@ static void walk_control(Walk *w)
+ 
+ static uint32_t class_params_bytes(uint32_t hclass)
+ {
+-    for (size_t i = 0; i < ARRAY_LENGTH(class_sizes); i++) {
+-        if (class_sizes[i].hclass == hclass) {
+-            return class_sizes[i].size;
++    for (size_t i = 0; i < branch->count; i++) {
++        if (branch->sizes[i].hclass == hclass) {
++            return branch->sizes[i].size;
+         }
+     }
+     return 0;
+@@ -394,3 +412,16 @@ int rmargs_uvm_fields(uint32_t cmd, uint32_t len, const struct nvfwd_fix *fix, u
+     }
+     return -EPERM;
+ }
++
++bool rmargs_use_driver(const char *version)
++{
++    size_t length = strcspn(version, ".");
++
++    for (size_t i = 0; i < ARRAY_LENGTH(branches); i++) {
++        if (strlen(branches[i].name) == length && !strncmp(version, branches[i].name, length)) {
++            branch = &branches[i];
++            return true;
++        }
++    }
++    return false;
++}
+diff --git a/hw/misc/nvfwd/rmargs.h b/hw/misc/nvfwd/rmargs.h
+index 3687d71..68d413a 100644
+--- a/hw/misc/nvfwd/rmargs.h
++++ b/hw/misc/nvfwd/rmargs.h
+@@ -50,4 +50,10 @@ int rmargs_fields(const RmCall *call, RmField *fields, int *matched);
+ int rmargs_uvm_fields(uint32_t cmd, uint32_t len, const struct nvfwd_fix *fix, uint32_t nfix,
+                       RmField *fields, int *matched);
+ 
++/*
++ * Reads calls as the host's driver at `version` will, which is "615.78.08" or the like. False for
++ * a branch this device has no tables for, whose calls it can't read safely.
++ */
++bool rmargs_use_driver(const char *version);
++
+ #endif
+diff --git a/hw/misc/nvfwd/rusd.c b/hw/misc/nvfwd/rusd.c
+index d4bf6df..9f72ef1 100644
+--- a/hw/misc/nvfwd/rusd.c
++++ b/hw/misc/nvfwd/rusd.c
+@@ -16,8 +16,11 @@
+ #include <sys/mman.h>
+ #include <unistd.h>
+ 
+-/* Every offset below was read from this version's cl00de.h. Another driver may move them. */
+-#define DRIVER_VERSION "615.78.08"
++/*
++ * Every offset below was read from cl00de.h, which is the same at each of these versions. Another
++ * driver may move them.
++ */
++static const char *const known_versions[] = { "615.78.08", "620.70.06" };
+ #define DRIVER_VERSION_FILE "/sys/module/nvidia/version"
+ 
+ #define IOCTL_MAGIC 'F'
+@@ -163,7 +166,14 @@ static bool driver_matches(void)
+         fclose(f);
+     }
+     version[strcspn(version, "\n")] = 0;
+-    return !strcmp(version, DRIVER_VERSION);
++    for (size_t i = 0; i < sizeof(known_versions) / sizeof(known_versions[0]); i++) {
++        if (!strcmp(version, known_versions[i])) {
++            return true;
++        }
++    }
++    fprintf(stderr, "rusd: host driver %s is not one whose sensor page is known, so no sensor page\n",
++            version);
++    return false;
+ }
+ 
+ static int attach_card(Rusd *r, const RusdCard *card)
+@@ -240,7 +250,6 @@ Rusd *rusd_open(int page_fd, const RusdCard *card)
+     Rusd *r;
+ 
+     if (!driver_matches()) {
+-        fprintf(stderr, "rusd: host driver is not %s, so no sensor page\n", DRIVER_VERSION);
+         return NULL;
+     }
+     r = calloc(1, sizeof(*r));
+-- 
+2.56.0
+
+From 07243d2ef5855070ae0b9dda786d422d5aedcb1d Mon Sep 17 00:00:00 2001
+From: xnixy <x@ruxn.com>
+Date: Fri, 20 Nov 2026 09:43:18 -0800
+Subject: [PATCH 32/32] hw/misc/nvfwd: take the screen socket open
+
+Guesthouse's launcher opens every unix socket a jailed QEMU needs and
+then refuses it any new one, so a QEMU that has been taken over can't
+reach the session bus or any other socket of the desktop's on a kernel
+whose Landlock can't hold back sockets by path. The device made its
+screen socket itself, which kept a Linux guest's QEMU out of that.
+
+show-fd names a listening socket QEMU was started with, and the device
+takes it in place of making <show>.sock. Without it, the device makes
+the socket as before.
+---
+ hw/misc/nvfwd/nvfwd.c |  1 +
+ hw/misc/nvfwd/nvfwd.h |  1 +
+ hw/misc/nvfwd/show.c  | 41 +++++++++++++++++++++++++++++++++++------
+ 3 files changed, 37 insertions(+), 6 deletions(-)
+
+diff --git a/hw/misc/nvfwd/nvfwd.c b/hw/misc/nvfwd/nvfwd.c
+index e596b97..256d79f 100644
+--- a/hw/misc/nvfwd/nvfwd.c
++++ b/hw/misc/nvfwd/nvfwd.c
+@@ -213,6 +213,7 @@ static const Property nvfwd_props[] = {
+     DEFINE_PROP_STRING("sensord", NvfwdState, sensord_path),
+     DEFINE_PROP_STRING("log", NvfwdState, log_path),
+     DEFINE_PROP_STRING("show", NvfwdState, show_path),
++    DEFINE_PROP_INT32("show-fd", NvfwdState, show_listen_fd, -1),
+     DEFINE_PROP_STRING("card", NvfwdState, card_text),
+     DEFINE_PROP_UINT32("card-minor", NvfwdState, card_minor, 0),
+     DEFINE_PROP_BOOL("trace", NvfwdState, trace, false),
+diff --git a/hw/misc/nvfwd/nvfwd.h b/hw/misc/nvfwd/nvfwd.h
+index 678e234..8812830 100644
+--- a/hw/misc/nvfwd/nvfwd.h
++++ b/hw/misc/nvfwd/nvfwd.h
+@@ -61,6 +61,7 @@ struct NvfwdState {
+     AllowSet *allow;
+     time_t allow_mtime;
+     char *show_path; /* path prefix: <path>.sock and <path>.display */
++    int32_t show_listen_fd; /* <path>.sock, opened by whoever started QEMU, or -1 */
+     QemuMutex show_lock;
+     QemuThread show_thread;
+     int render, listener, viewer;
+diff --git a/hw/misc/nvfwd/show.c b/hw/misc/nvfwd/show.c
+index a92c67a..bfb7bc6 100644
+--- a/hw/misc/nvfwd/show.c
++++ b/hw/misc/nvfwd/show.c
+@@ -292,11 +292,43 @@ void do_show_rate(NvfwdState *s, struct nvfwd_req *r)
+     r->ret = 0;
+ }
+ 
++/*
++ * The socket viewers connect to. A QEMU that may make no sockets of its own is handed it open, at
++ * show-fd; otherwise it's made here, at <show>.sock.
++ */
++static int show_socket(NvfwdState *s, const char *path, Error **errp)
++{
++    struct sockaddr_un addr = { .sun_family = AF_UNIX };
++    int listening = 0;
++    socklen_t size = sizeof(listening);
++    int fd;
++
++    if (s->show_listen_fd >= 0) {
++        if (getsockopt(s->show_listen_fd, SOL_SOCKET, SO_ACCEPTCONN, &listening, &size) || !listening) {
++            error_setg(errp, "nvfwd screen socket: %d is not a listening socket", s->show_listen_fd);
++            return -1;
++        }
++        /* the sensor daemon is started later, and has no use for it */
++        qemu_set_cloexec(s->show_listen_fd);
++        return s->show_listen_fd;
++    }
++    unlink(path);
++    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path);
++    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
++    if (fd < 0 || bind(fd, (void *)&addr, sizeof(addr)) || listen(fd, 1)) {
++        error_setg_errno(errp, errno, "nvfwd screen socket");
++        if (fd >= 0) {
++            close(fd);
++        }
++        return -1;
++    }
++    return fd;
++}
++
+ void show_init(NvfwdState *s, Error **errp)
+ {
+     g_autofree char *display = g_strdup_printf("%s.display", s->show_path);
+     g_autofree char *sock = g_strdup_printf("%s.sock", s->show_path);
+-    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+     int f = open(display, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+     uint8_t *page;
+     if (f < 0 || ftruncate(f, 4096)) {
+@@ -311,11 +343,8 @@ void show_init(NvfwdState *s, Error **errp)
+     s->show_reading = (uint64_t *)(page + DISPLAY_READING);
+     s->show_rate = (uint64_t *)(page + DISPLAY_RATE);
+     s->show_claimed = (uint32_t *)(page + DISPLAY_CLAIMED);
+-    unlink(sock);
+-    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sock);
+-    s->listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+-    if (s->listener < 0 || bind(s->listener, (void *)&addr, sizeof(addr)) || listen(s->listener, 1)) {
+-        error_setg_errno(errp, errno, "nvfwd screen socket");
++    s->listener = show_socket(s, sock, errp);
++    if (s->listener < 0) {
+         return;
+     }
+     qemu_thread_create(&s->show_thread, "nvfwd-show", show_listen, s, QEMU_THREAD_DETACHED);
+-- 
+2.47.3
+
+From e3fc6d30693b673ca2c40e9982f49c795a9a67b2 Mon Sep 17 00:00:00 2001
+From: xnixy <x@ruxn.com>
+Date: Mon, 23 Nov 2026 11:45:55 -0800
+Subject: [PATCH 33/33] hw/misc/nvfwd: let the CUDA runtime ask what it needs
+ to start
+
+The CUDA runtime stops with "initialization error" unless three controls
+succeed. RC_GET_WATCHDOG_INFO is public, one NvU32 the driver writes, and
+goes at its 4 bytes only. The other two have no public layout, so the host
+never reads the guest's bytes for them: the guest has to ask the one
+question NVIDIA's own library was seen to ask, and the device sends its
+own copy of that question, with every other byte zero.
+---
+ hw/misc/nvfwd/forward.c |  7 +++++++
+ hw/misc/nvfwd/nvfwd.h   |  2 +-
+ hw/misc/nvfwd/rmargs.c  | 44 +++++++++++++++++++++++++++++++++++++++++
+ hw/misc/nvfwd/rmargs.h  |  7 +++++++
+ 4 files changed, 59 insertions(+), 1 deletion(-)
+
+diff --git a/hw/misc/nvfwd/forward.c b/hw/misc/nvfwd/forward.c
+index 17ae253..af201b6 100644
+--- a/hw/misc/nvfwd/forward.c
++++ b/hw/misc/nvfwd/forward.c
+@@ -425,6 +425,13 @@ static void forward_ioctl(NvfwdState *s, Bounce *b, uint32_t *held, uint32_t *nh
+         memcpy(&params, arg + RM_CONTROL_PARAMS, 8);
+         memcpy(&params_size, arg + RM_CONTROL_PARAMS_SIZE, 4);
+         /* By now this pointer is ours or null, and fits the size it claims. */
++        if (rmargs_own_request(cmd, (uint8_t *)(uintptr_t)params, params_size) < 0) {
++            uint32_t st = STATUS_NOT_SUPPORTED;
++            note_once(s, "REFUSED", "question in ctrl", KEY(K_QUESTION, cmd), cmd);
++            memcpy(arg + RM_CONTROL_STATUS, &st, 4);
++            r->ret = 0;
++            return;
++        }
+         if (cmd == 0x906f0101 && params && params_size >= sizeof(hobj)) { /* which engine owns this object? */
+             memcpy(&hobj, (const void *)params, sizeof(hobj));
+             if (objects_is_local(s->objects, hclient, hobj)) {
+diff --git a/hw/misc/nvfwd/nvfwd.h b/hw/misc/nvfwd/nvfwd.h
+index 8812830..e230825 100644
+--- a/hw/misc/nvfwd/nvfwd.h
++++ b/hw/misc/nvfwd/nvfwd.h
+@@ -94,7 +94,7 @@ struct NvfwdState {
+ };
+ 
+ enum { K_IOCTL = 1, K_CTRL = 2, K_CLASS = 3, K_UVM = 4, K_MEMCLASS = 5, K_EMUCTRL = 6, K_LIMIT = 7, K_CLIENT = 8,
+-       K_CARD = 9 };
++       K_CARD = 9, K_QUESTION = 10 };
+ 
+ #define KEY(kind, value) (((uint64_t)(kind) << 32) | (uint32_t)(value))
+ 
+diff --git a/hw/misc/nvfwd/rmargs.c b/hw/misc/nvfwd/rmargs.c
+index f4b7979..1ccfbaa 100644
+--- a/hw/misc/nvfwd/rmargs.c
++++ b/hw/misc/nvfwd/rmargs.c
+@@ -42,6 +42,25 @@ struct control_size {
+ };
+ static const struct control_size pinned_controls[] = {
+     { 0x20808163, 4 },
++    { 0x20802209, 4 },   /* NV2080_CTRL_CMD_RC_GET_WATCHDOG_INFO, which is public: one NvU32 out */
++    { 0x20809001, 8 },   /* the CUDA runtime's, see owned_requests */
++    { 0x2080a026, 532 }, /* likewise */
++};
++
++/*
++ * Controls with no public layout that the CUDA runtime won't start without. The host never reads the
++ * guest's bytes for them: the guest has to ask the one question NVIDIA's own library was seen to ask,
++ * and the device sends that question, written by the device, in its place. Bytes not named here are
++ * zero on the way to the host. Seen from libcuda 620.73.04 on an RTX 5090.
++ */
++#define OWNED_FIELDS_MAX 4
++struct owned_request {
++    uint32_t cmd, size, nfields;
++    struct { uint32_t at, value; } field[OWNED_FIELDS_MAX];
++};
++static const struct owned_request owned_requests[] = {
++    { 0x20809001, 8, 0, { { 0, 0 } } },
++    { 0x2080a026, 532, 4, { { 0, 0x400 }, { 16, 2 }, { 20, 1 }, { 36, 0x10 } } },
+ };
+ 
+ struct class_size {
+@@ -175,6 +194,31 @@ static bool size_allowed(uint32_t cmd, uint32_t size)
+     return true;
+ }
+ 
++int rmargs_own_request(uint32_t cmd, uint8_t *params, uint32_t size)
++{
++    for (size_t i = 0; i < ARRAY_LENGTH(owned_requests); i++) {
++        const struct owned_request *o = &owned_requests[i];
++
++        if (o->cmd != cmd) {
++            continue;
++        }
++        if (!params || size != o->size) {
++            return -1;
++        }
++        for (uint32_t f = 0; f < o->nfields; f++) {
++            if (read32(params + o->field[f].at) != o->field[f].value) {
++                return -1;
++            }
++        }
++        memset(params, 0, size);
++        for (uint32_t f = 0; f < o->nfields; f++) {
++            memcpy(params + o->field[f].at, &o->field[f].value, sizeof(uint32_t));
++        }
++        return 1;
++    }
++    return 0;
++}
++
+ static void walk_control(Walk *w)
+ {
+     const RmCall *c = w->call;
+diff --git a/hw/misc/nvfwd/rmargs.h b/hw/misc/nvfwd/rmargs.h
+index 68d413a..cc41fe4 100644
+--- a/hw/misc/nvfwd/rmargs.h
++++ b/hw/misc/nvfwd/rmargs.h
+@@ -50,6 +50,13 @@ int rmargs_fields(const RmCall *call, RmField *fields, int *matched);
+ int rmargs_uvm_fields(uint32_t cmd, uint32_t len, const struct nvfwd_fix *fix, uint32_t nfix,
+                       RmField *fields, int *matched);
+ 
++/*
++ * For a control whose parameters no public source describes, puts the device's own copy of the one
++ * question it may ask in place of the guest's. 0: not such a control. 1: `params` now holds only the
++ * device's bytes. -1: the guest asked something else, or at another size, so the call goes no further.
++ */
++int rmargs_own_request(uint32_t cmd, uint8_t *params, uint32_t size);
++
+ /*
+  * Reads calls as the host's driver at `version` will, which is "615.78.08" or the like. False for
+  * a branch this device has no tables for, whose calls it can't read safely.
+-- 
+2.56.1
+
+From 41e21268184a5030c8110f38887809508d4c65ce Mon Sep 17 00:00:00 2001
+From: xnixy <x@ruxn.com>
+Date: Mon, 23 Nov 2026 11:45:55 -0800
+Subject: [PATCH 34/34] hw/misc/nvfwd: let the guest read what the device
+ turned down
+
+A refused control comes back as a status inside a call that worked, so a
+program in the guest only says its own error, and calls.log is on the
+host. The device keeps the REFUSED and OVER lines it writes there, each
+kind once and at most 64 of them, and answers a new request, REFUSED,
+with them. It only ever writes that answer, so a guest can't make it grow
+or make the host log more.
+---
+ hw/misc/nvfwd/allow.c       | 14 ++++++++++++++
+ hw/misc/nvfwd/meson.build   |  1 +
+ hw/misc/nvfwd/nvfwd.c       |  3 +++
+ hw/misc/nvfwd/nvfwd.h       |  4 ++++
+ hw/misc/nvfwd/nvfwd_proto.h |  6 +++++-
+ hw/misc/nvfwd/refused.c     | 28 ++++++++++++++++++++++++++++
+ hw/misc/nvfwd/refused.h     | 23 +++++++++++++++++++++++
+ 7 files changed, 78 insertions(+), 1 deletion(-)
+ create mode 100644 hw/misc/nvfwd/refused.c
+ create mode 100644 hw/misc/nvfwd/refused.h
+
+diff --git a/hw/misc/nvfwd/allow.c b/hw/misc/nvfwd/allow.c
+index fe5ec5c..636c76f 100644
+--- a/hw/misc/nvfwd/allow.c
++++ b/hw/misc/nvfwd/allow.c
+@@ -84,6 +84,10 @@ void note_once(NvfwdState *s, const char *outcome, const char *what, uint64_t ke
+         s->seen_count++;
+         fprintf(s->log, "%s %s 0x%llx\n", outcome, what, (unsigned long long)value);
+         fflush(s->log);
++        /* Each kind once, as above, and a fixed number of them: a guest can't make this grow. */
++        if (!strcmp(outcome, "REFUSED") || !strcmp(outcome, "OVER")) {
++            refused_add(&s->refused, outcome, what, value);
++        }
+     }
+     qemu_mutex_unlock(&s->lock);
+ }
+@@ -105,3 +109,13 @@ bool allowed(NvfwdState *s, const char *what, int kind, uint64_t value)
+     note(s, what, kind, value, ok);
+     return ok;
+ }
++
++int refused_list(NvfwdState *s, char *to, uint32_t room)
++{
++    uint32_t used;
++
++    qemu_mutex_lock(&s->lock);
++    used = refused_text(&s->refused, to, room);
++    qemu_mutex_unlock(&s->lock);
++    return used;
++}
+diff --git a/hw/misc/nvfwd/meson.build b/hw/misc/nvfwd/meson.build
+index ce35da7..860ad36 100644
+--- a/hw/misc/nvfwd/meson.build
++++ b/hw/misc/nvfwd/meson.build
+@@ -11,6 +11,7 @@ nvfwd_ss = files(
+   'card.c',
+   'host_card.c',
+   'sensors.c',
++  'refused.c',
+   'allow.c',
+   'fds.c',
+   'forward.c',
+diff --git a/hw/misc/nvfwd/nvfwd.c b/hw/misc/nvfwd/nvfwd.c
+index 256d79f..1ac083b 100644
+--- a/hw/misc/nvfwd/nvfwd.c
++++ b/hw/misc/nvfwd/nvfwd.c
+@@ -84,6 +84,9 @@ static void handle(NvfwdState *s, uint32_t slot)
+     case NVFWD_OP_SHOW_FRAME:
+         do_show_frame(s, r);
+         break;
++    case NVFWD_OP_REFUSED: /* only written here, never read back, so the guest's copy is no matter */
++        r->ret = refused_list(s, (char *)base + NVFWD_HDR_SIZE, NVFWD_REFUSED_MAX * NVFWD_REFUSED_LINE);
++        break;
+     case NVFWD_OP_POLL: {
+         struct pollfd p = { .fd = host_fd(s, r->fdid), .events = r->a0 };
+         int rc = poll(&p, 1, 0);
+diff --git a/hw/misc/nvfwd/nvfwd.h b/hw/misc/nvfwd/nvfwd.h
+index e230825..302f4b1 100644
+--- a/hw/misc/nvfwd/nvfwd.h
++++ b/hw/misc/nvfwd/nvfwd.h
+@@ -19,6 +19,7 @@
+ #include "card.h"
+ #include "maps.h"
+ #include "nvfwd_proto.h"
++#include "refused.h"
+ #include "objects.h"
+ #include "sensors.h"
+ 
+@@ -83,6 +84,7 @@ struct NvfwdState {
+     uint64_t surf_modifier[NVFWD_SHOW_MAX_SURFACES];
+     AllowSet *seen; /* first-seen keys, for the list of forwarded calls */
+     uint32_t seen_count;
++    RefusedList refused; /* the REFUSED and OVER lines, for the guest to read */
+     Sensors *sensors;
+     Objects *objects;
+     Maps *maps;
+@@ -105,6 +107,8 @@ void allow_reload(NvfwdState *s);
+ void note_once(NvfwdState *s, const char *outcome, const char *what, uint64_t key, uint64_t value);
+ void note_local(NvfwdState *s, const char *what, int kind, uint64_t value);
+ bool allowed(NvfwdState *s, const char *what, int kind, uint64_t value);
++/* Writes the refused lines into `to`, which holds `room` bytes, and returns how many bytes that took. */
++int refused_list(NvfwdState *s, char *to, uint32_t room);
+ 
+ /* fds.c */
+ void throttle(NvfwdState *s);
+diff --git a/hw/misc/nvfwd/nvfwd_proto.h b/hw/misc/nvfwd/nvfwd_proto.h
+index 969db62..4b17f2c 100644
+--- a/hw/misc/nvfwd/nvfwd_proto.h
++++ b/hw/misc/nvfwd/nvfwd_proto.h
+@@ -15,7 +15,11 @@
+ #define NVFWD_MAGIC      0x6e766664u
+ 
+ enum { NVFWD_OP_OPEN = 1, NVFWD_OP_CLOSE, NVFWD_OP_IOCTL, NVFWD_OP_MMAP, NVFWD_OP_MUNMAP, NVFWD_OP_POLL,
+-       NVFWD_OP_SHOW_BUFFER, NVFWD_OP_SHOW_NEXT, NVFWD_OP_SHOW_FRAME, NVFWD_OP_SHOW_SURFACE, NVFWD_OP_SHOW_READING, NVFWD_OP_SHOW_RATE };
++       NVFWD_OP_SHOW_BUFFER, NVFWD_OP_SHOW_NEXT, NVFWD_OP_SHOW_FRAME, NVFWD_OP_SHOW_SURFACE, NVFWD_OP_SHOW_READING, NVFWD_OP_SHOW_RATE,
++       NVFWD_OP_REFUSED };
++/* What REFUSED answers: up to this many lines, one per kind of call the device turned down since it started. */
++#define NVFWD_REFUSED_MAX 64u
++#define NVFWD_REFUSED_LINE 48u
+ /* First argument of SHOW_SURFACE: which surface, and how its memory is laid out, as NVKMS describes it. */
+ #define NVFWD_SURFACE_ID(id, layout, generic, gobs_y, pitch_blocks) \
+     ((id) | (uint64_t)(layout) << 8 | (uint64_t)!!(generic) << 9 | (uint64_t)(gobs_y) << 12 | (uint64_t)(pitch_blocks) << 32)
+diff --git a/hw/misc/nvfwd/refused.c b/hw/misc/nvfwd/refused.c
+new file mode 100644
+index 0000000..66dd600
+--- /dev/null
++++ b/hw/misc/nvfwd/refused.c
+@@ -0,0 +1,28 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/* See refused.h. */
++#include "refused.h"
++
++#include <stdio.h>
++
++void refused_add(RefusedList *list, const char *outcome, const char *what, uint64_t value)
++{
++    if (list->count < NVFWD_REFUSED_MAX) {
++        snprintf(list->line[list->count++], NVFWD_REFUSED_LINE, "%s %s 0x%llx", outcome, what,
++                 (unsigned long long)value);
++    }
++}
++
++uint32_t refused_text(const RefusedList *list, char *to, uint32_t room)
++{
++    uint32_t used = 0;
++
++    for (uint32_t i = 0; i < list->count && i < NVFWD_REFUSED_MAX; i++) {
++        int n = snprintf(to + used, room - used, "%s\n", list->line[i]);
++
++        if (n < 0 || (uint32_t)n >= room - used) {
++            break;
++        }
++        used += n;
++    }
++    return used;
++}
+diff --git a/hw/misc/nvfwd/refused.h b/hw/misc/nvfwd/refused.h
+new file mode 100644
+index 0000000..ad4fa66
+--- /dev/null
++++ b/hw/misc/nvfwd/refused.h
+@@ -0,0 +1,23 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * The kinds of call the device turned down, for the guest to read. Each kind comes here once, as
++ * calls.log has it, and the list stops at a fixed size, so a guest can't make it grow.
++ */
++#ifndef NVFWD_REFUSED_H
++#define NVFWD_REFUSED_H
++
++#include <stdint.h>
++#include "nvfwd_proto.h"
++
++typedef struct RefusedList {
++    char line[NVFWD_REFUSED_MAX][NVFWD_REFUSED_LINE];
++    uint32_t count;
++} RefusedList;
++
++/* Keeps "outcome what 0xvalue", cut to a line's size, while there's room. */
++void refused_add(RefusedList *list, const char *outcome, const char *what, uint64_t value);
++
++/* Writes whole lines, each ending in a newline, into `room` bytes at most, and returns the bytes written. */
++uint32_t refused_text(const RefusedList *list, char *to, uint32_t room);
++
++#endif
+-- 
+2.56.1
+
+From 2595c1df5627bc909f5c8239dde0777f8586416b Mon Sep 17 00:00:00 2001
+From: xnixy <x@ruxn.com>
+Date: Mon, 23 Nov 2026 12:08:29 -0800
+Subject: [PATCH 35/35] hw/misc/nvfwd: answer a pinned control at another size
+ as the driver does
+
+A control the device takes at one size only failed the whole ioctl with
+EINVAL at any other size, and nothing said so. The filter now answers it
+with NV_ERR_INVALID_PARAM_STRUCT, which is what the driver says to a
+control at the wrong size, and notes "REFUSED size of ctrl" once. Calls
+at the right size are as before, and the parser keeps its own check.
+---
+ hw/misc/nvfwd/forward.c   | 11 ++++++++++-
+ hw/misc/nvfwd/nvfwd.h     |  2 +-
+ hw/misc/nvfwd/rm_layout.h |  1 +
+ hw/misc/nvfwd/rmargs.c    |  9 ++++++---
+ hw/misc/nvfwd/rmargs.h    |  3 +++
+ 5 files changed, 21 insertions(+), 5 deletions(-)
+
+diff --git a/hw/misc/nvfwd/forward.c b/hw/misc/nvfwd/forward.c
+index af201b6..0c42a2b 100644
+--- a/hw/misc/nvfwd/forward.c
++++ b/hw/misc/nvfwd/forward.c
+@@ -105,7 +105,16 @@ static int filter_rm(NvfwdState *s, uint32_t nr, uint8_t *arg, uint32_t size)
+             return 0;
+         }
+         if (allowed(s, "ctrl", K_CTRL, cmd)) {
+-            return 0;
++            uint32_t params_size, st = STATUS_INVALID_PARAM_STRUCT;
++
++            memcpy(&params_size, arg + RM_CONTROL_PARAMS_SIZE, 4);
++            if (rmargs_control_size_ok(cmd, params_size)) {
++                return 0;
++            }
++            /* As the host's driver answers a control at the wrong size, and said once, as a refusal is. */
++            note_once(s, "REFUSED", "size of ctrl", KEY(K_SIZE, cmd), cmd);
++            memcpy(arg + RM_CONTROL_STATUS, &st, 4);
++            return 1;
+         }
+         status_at = 28;
+         break;
+diff --git a/hw/misc/nvfwd/nvfwd.h b/hw/misc/nvfwd/nvfwd.h
+index 302f4b1..c73977d 100644
+--- a/hw/misc/nvfwd/nvfwd.h
++++ b/hw/misc/nvfwd/nvfwd.h
+@@ -96,7 +96,7 @@ struct NvfwdState {
+ };
+ 
+ enum { K_IOCTL = 1, K_CTRL = 2, K_CLASS = 3, K_UVM = 4, K_MEMCLASS = 5, K_EMUCTRL = 6, K_LIMIT = 7, K_CLIENT = 8,
+-       K_CARD = 9, K_QUESTION = 10 };
++       K_CARD = 9, K_QUESTION = 10, K_SIZE = 11 };
+ 
+ #define KEY(kind, value) (((uint64_t)(kind) << 32) | (uint32_t)(value))
+ 
+diff --git a/hw/misc/nvfwd/rm_layout.h b/hw/misc/nvfwd/rm_layout.h
+index 4c00adf..c6ef907 100644
+--- a/hw/misc/nvfwd/rm_layout.h
++++ b/hw/misc/nvfwd/rm_layout.h
+@@ -105,6 +105,7 @@
+ #define STATUS_OK 0
+ #define STATUS_INSUFFICIENT_RESOURCES 0x1a
+ #define STATUS_INVALID_ARGUMENT 0x1f
++#define STATUS_INVALID_PARAM_STRUCT 0x3a /* what the RM says to a control at the wrong size */
+ #define STATUS_INVALID_CLASS 0x22 /* what the RM says to a device instance it doesn't have */
+ #define STATUS_NO_MEMORY 0x51
+ #define STATUS_NOT_SUPPORTED 0x56
+diff --git a/hw/misc/nvfwd/rmargs.c b/hw/misc/nvfwd/rmargs.c
+index 1ccfbaa..60e261d 100644
+--- a/hw/misc/nvfwd/rmargs.c
++++ b/hw/misc/nvfwd/rmargs.c
+@@ -51,7 +51,10 @@ static const struct control_size pinned_controls[] = {
+  * Controls with no public layout that the CUDA runtime won't start without. The host never reads the
+  * guest's bytes for them: the guest has to ask the one question NVIDIA's own library was seen to ask,
+  * and the device sends that question, written by the device, in its place. Bytes not named here are
+- * zero on the way to the host. Seen from libcuda 620.73.04 on an RTX 5090.
++ * zero on the way to the host, whatever the guest put there: a call that differs only outside the named
++ * fields is answered, as the host is asked the same thing either way. That is by design, not a hole: no
++ * byte of the guest's parameters ever reaches the host's driver for these. Seen from libcuda 620.73.04
++ * on an RTX 5090.
+  */
+ #define OWNED_FIELDS_MAX 4
+ struct owned_request {
+@@ -184,7 +187,7 @@ static bool inside(Walk *w, uint64_t start, uint64_t bytes, uint32_t size)
+     return true;
+ }
+ 
+-static bool size_allowed(uint32_t cmd, uint32_t size)
++bool rmargs_control_size_ok(uint32_t cmd, uint32_t size)
+ {
+     for (size_t i = 0; i < ARRAY_LENGTH(pinned_controls); i++) {
+         if (pinned_controls[i].cmd == cmd) {
+@@ -231,7 +234,7 @@ static void walk_control(Walk *w)
+     }
+     cmd = read32(arg + RM_CONTROL_CMD);
+     size = read32(arg + RM_CONTROL_PARAMS_SIZE);
+-    if (!size_allowed(cmd, size)) {
++    if (!rmargs_control_size_ok(cmd, size)) { /* the filter has refused these already: a second guard */
+         w->error = -EINVAL;
+         return;
+     }
+diff --git a/hw/misc/nvfwd/rmargs.h b/hw/misc/nvfwd/rmargs.h
+index cc41fe4..ab1a507 100644
+--- a/hw/misc/nvfwd/rmargs.h
++++ b/hw/misc/nvfwd/rmargs.h
+@@ -50,6 +50,9 @@ int rmargs_fields(const RmCall *call, RmField *fields, int *matched);
+ int rmargs_uvm_fields(uint32_t cmd, uint32_t len, const struct nvfwd_fix *fix, uint32_t nfix,
+                       RmField *fields, int *matched);
+ 
++/* False for a control the device takes at one size only, asked at another. */
++bool rmargs_control_size_ok(uint32_t cmd, uint32_t size);
++
+ /*
+  * For a control whose parameters no public source describes, puts the device's own copy of the one
+  * question it may ask in place of the guest's. 0: not such a control. 1: `params` now holds only the
+-- 
+2.56.1
+
+From 5c80f6ad22e7edc6a08e695f053b6d173aeb365d Mon Sep 17 00:00:00 2001
+From: xnixy <x@ruxn.com>
+Date: Mon, 23 Nov 2026 12:08:29 -0800
+Subject: [PATCH 36/36] hw/misc/nvfwd: a full refused list says it is full
+
+The list a guest reads stopped at 64 lines with no sign that more were
+turned down. Its last line is now kept for a fixed one that says so.
+---
+ hw/misc/nvfwd/nvfwd_proto.h | 2 ++
+ hw/misc/nvfwd/refused.c     | 4 +++-
+ hw/misc/nvfwd/refused.h     | 5 ++++-
+ 3 files changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/hw/misc/nvfwd/nvfwd_proto.h b/hw/misc/nvfwd/nvfwd_proto.h
+index 4b17f2c..8f06fe0 100644
+--- a/hw/misc/nvfwd/nvfwd_proto.h
++++ b/hw/misc/nvfwd/nvfwd_proto.h
+@@ -20,6 +20,8 @@ enum { NVFWD_OP_OPEN = 1, NVFWD_OP_CLOSE, NVFWD_OP_IOCTL, NVFWD_OP_MMAP, NVFWD_O
+ /* What REFUSED answers: up to this many lines, one per kind of call the device turned down since it started. */
+ #define NVFWD_REFUSED_MAX 64u
+ #define NVFWD_REFUSED_LINE 48u
++/* The list's last line once it is full. calls.log on the host has the rest. */
++#define NVFWD_REFUSED_FULL "FULL more were turned down"
+ /* First argument of SHOW_SURFACE: which surface, and how its memory is laid out, as NVKMS describes it. */
+ #define NVFWD_SURFACE_ID(id, layout, generic, gobs_y, pitch_blocks) \
+     ((id) | (uint64_t)(layout) << 8 | (uint64_t)!!(generic) << 9 | (uint64_t)(gobs_y) << 12 | (uint64_t)(pitch_blocks) << 32)
+diff --git a/hw/misc/nvfwd/refused.c b/hw/misc/nvfwd/refused.c
+index 66dd600..5be09a1 100644
+--- a/hw/misc/nvfwd/refused.c
++++ b/hw/misc/nvfwd/refused.c
+@@ -6,9 +6,11 @@
+ 
+ void refused_add(RefusedList *list, const char *outcome, const char *what, uint64_t value)
+ {
+-    if (list->count < NVFWD_REFUSED_MAX) {
++    if (list->count < NVFWD_REFUSED_MAX - 1) {
+         snprintf(list->line[list->count++], NVFWD_REFUSED_LINE, "%s %s 0x%llx", outcome, what,
+                  (unsigned long long)value);
++    } else if (list->count == NVFWD_REFUSED_MAX - 1) {
++        snprintf(list->line[list->count++], NVFWD_REFUSED_LINE, "%s", NVFWD_REFUSED_FULL);
+     }
+ }
+ 
+diff --git a/hw/misc/nvfwd/refused.h b/hw/misc/nvfwd/refused.h
+index ad4fa66..2589009 100644
+--- a/hw/misc/nvfwd/refused.h
++++ b/hw/misc/nvfwd/refused.h
+@@ -14,7 +14,10 @@ typedef struct RefusedList {
+     uint32_t count;
+ } RefusedList;
+ 
+-/* Keeps "outcome what 0xvalue", cut to a line's size, while there's room. */
++/*
++ * Keeps "outcome what 0xvalue", cut to a line's size, while there's room. The last line is kept for
++ * NVFWD_REFUSED_FULL, so a full list says it is full.
++ */
+ void refused_add(RefusedList *list, const char *outcome, const char *what, uint64_t value);
+ 
+ /* Writes whole lines, each ending in a newline, into `room` bytes at most, and returns the bytes written. */
+-- 
+2.56.1
+
+From dd9cca8ad79975291d7ccef70d9d630b811bca6b Mon Sep 17 00:00:00 2001
+From: xnixy <x@ruxn.com>
+Date: Mon, 23 Nov 2026 15:41:11 -0800
+Subject: [PATCH] hw/display/virtio-gpu-gl: answer the guest's resource UUID
+ requests
+
+Android's minigbm marks every blob it makes for use across devices, and
+the guest's kernel refuses such a blob unless the GPU offers
+VIRTIO_GPU_F_RESOURCE_UUID. Only vhost-user-gpu did. The GL device now
+answers RESOURCE_ASSIGN_UUID with a fresh UUID, behind a resource_uuid
+property that is off by default. Nothing on the host imports by UUID,
+so any unique one will do.
+---
+ hw/display/virtio-gpu-gl.c    |  2 ++
+ hw/display/virtio-gpu-virgl.c | 34 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 36 insertions(+)
+
+diff --git a/hw/display/virtio-gpu-gl.c b/hw/display/virtio-gpu-gl.c
+index 2b7a41c..4fb64bf 100644
+--- a/hw/display/virtio-gpu-gl.c
++++ b/hw/display/virtio-gpu-gl.c
+@@ -170,6 +170,8 @@ static const Property virtio_gpu_gl_properties[] = {
+                     VIRTIO_GPU_FLAG_VENUS_ENABLED, false),
+     DEFINE_PROP_BIT("drm_native_context", VirtIOGPU, parent_obj.conf.flags,
+                     VIRTIO_GPU_FLAG_DRM_ENABLED, false),
++    DEFINE_PROP_BIT("resource_uuid", VirtIOGPU, parent_obj.conf.flags,
++                    VIRTIO_GPU_FLAG_RESOURCE_UUID_ENABLED, false),
+ };
+ 
+ static void virtio_gpu_gl_device_unrealize(DeviceState *qdev)
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index 9bda572..9eefb28 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -14,6 +14,8 @@
+ #include "qemu/osdep.h"
+ #include "qemu/error-report.h"
+ #include "qemu/iov.h"
++#include "qemu/log.h"
++#include "qemu/uuid.h"
+ #include "trace.h"
+ #include "hw/virtio/virtio.h"
+ #include "hw/virtio/virtio-gpu.h"
+@@ -1033,6 +1035,35 @@ static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
+ }
+ #endif
+ 
++/*
++ * A guest that shares a buffer across devices asks for its UUID first, and
++ * Android's minigbm marks every blob that way. Nothing here imports by UUID,
++ * so any unique one will do.
++ */
++static void virgl_cmd_resource_assign_uuid(VirtIOGPU *g,
++                                           struct virtio_gpu_ctrl_command *cmd)
++{
++    struct virtio_gpu_resource_assign_uuid assign;
++    struct virtio_gpu_resp_resource_uuid resp;
++    QemuUUID uuid;
++
++    VIRTIO_GPU_FILL_CMD(assign);
++    virtio_gpu_bswap_32(&assign, sizeof(assign));
++
++    if (!virtio_gpu_virgl_find_resource(g, assign.resource_id)) {
++        qemu_log_mask(LOG_GUEST_ERROR, "%s: no resource %d\n", __func__,
++                      assign.resource_id);
++        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
++        return;
++    }
++
++    memset(&resp, 0, sizeof(resp));
++    resp.hdr.type = VIRTIO_GPU_RESP_OK_RESOURCE_UUID;
++    qemu_uuid_generate(&uuid);
++    memcpy(resp.uuid, uuid.data, sizeof(resp.uuid));
++    virtio_gpu_ctrl_response(g, cmd, &resp.hdr, sizeof(resp));
++}
++
+ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
+                                       struct virtio_gpu_ctrl_command *cmd)
+ {
+@@ -1102,6 +1133,9 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
+     case VIRTIO_GPU_CMD_GET_EDID:
+         virtio_gpu_get_edid(g, cmd);
+         break;
++    case VIRTIO_GPU_CMD_RESOURCE_ASSIGN_UUID:
++        virgl_cmd_resource_assign_uuid(g, cmd);
++        break;
+ #if VIRGL_VERSION_MAJOR >= 1
+     case VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB:
+         virgl_cmd_resource_create_blob(g, cmd);
+-- 
+2.56.1
+
+From 7ecd37fd8f1f524c1c728925a19a956026c72a53 Mon Sep 17 00:00:00 2001
+From: xnixy <x@ruxn.com>
+Date: Tue, 24 Nov 2026 06:41:35 -0800
+Subject: [PATCH] hw/misc/nvfwd: the card snoops the guest's cache on every
+ mapping
+
+The guest's pages are cached on its CPU whatever it asks for, as an
+Intel host keeps them write-back. NVIDIA's Vulkan driver maps its
+GPFIFO, pushbuffers and semaphores as system memory without snooping,
+so the card read empty GPFIFO entries from RAM while the guest's
+writes were still in the cache. Vulkan waited 11 s and failed in
+vkCreateDevice.
+
+The device now sets the snoop flag on every RM_MAP_MEMORY_DMA it
+passes on, and gives the guest its own flags back. NVIDIA's driver
+says the flag only matters for system memory and does nothing where
+the platform snoops anyway.
+
+Found and measured by s3k000 on an RTX 3080 Ti.
+---
+ hw/misc/nvfwd/forward.c | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/hw/misc/nvfwd/forward.c b/hw/misc/nvfwd/forward.c
+index 0c42a2b..fec8b5a 100644
+--- a/hw/misc/nvfwd/forward.c
++++ b/hw/misc/nvfwd/forward.c
+@@ -25,6 +25,10 @@
+ #define NOT_USED_BY_CLIENTS 0xffffffffull /* the limit the driver reports for that class */
+ #define CLASS_SENSOR_PAGE 0xde
+ #define CTRL_SENSOR_POLL 0xde0001
++#define ESC_RM_MAP_MEMORY_DMA 0x57
++#define RM_MAP_DMA_BYTES 64u /* NVOS46_PARAMETERS */
++#define RM_MAP_DMA_FLAGS 32
++#define MAP_DMA_CACHE_SNOOP 0x10u /* NVOS46_FLAGS_CACHE_SNOOP_ENABLE */
+ 
+ /* ---- guest pages as one host range ---- */
+ 
+@@ -308,6 +312,24 @@ static void refuse_pageable_access(Bounce *b)
+     bounce_patch(b, UVM_INITIALIZE_FLAGS, &flags, sizeof(flags));
+ }
+ 
++/*
++ * The guest's pages are cached on its CPU, whatever caching it asks for: on an Intel host KVM keeps
++ * them write-back. A card mapping system memory without snooping then reads RAM while the guest's
++ * writes are still in the cache, and the guest reads its cached copy of what the card wrote. So the
++ * card always snoops. NVIDIA's driver says the flag only matters for system memory, and does nothing
++ * on a platform that snoops anyway. The guest gets its own flags back.
++ */
++static void snoop_cpu_cache(Bounce *b, uint32_t arg_at)
++{
++    uint32_t flags;
++
++    memcpy(&flags, b->data + arg_at + RM_MAP_DMA_FLAGS, sizeof(flags));
++    if (!(flags & MAP_DMA_CACHE_SNOOP) && b->patches < NVFWD_MAX_FIX) {
++        flags |= MAP_DMA_CACHE_SNOOP;
++        bounce_patch(b, arg_at + RM_MAP_DMA_FLAGS, &flags, sizeof(flags));
++    }
++}
++
+ /* The driver checks a mapping against this too. Here it costs nothing. */
+ static void note_map_access(NvfwdState *s, const struct nvfwd_req *r, const uint8_t *arg)
+ {
+@@ -411,6 +433,9 @@ static void forward_ioctl(NvfwdState *s, Bounce *b, uint32_t *held, uint32_t *nh
+         r->ret = rc;
+         return;
+     }
++    if (!uvm && nr == ESC_RM_MAP_MEMORY_DMA && size == RM_MAP_DMA_BYTES) {
++        snoop_cpu_cache(b, call.arg_at);
++    }
+     /* Before the sensor objects: a mask change there is a call on the host, through the daemon. */
+     throttle(s);
+     if (s->sensors && !uvm) {
+-- 
+2.56.1
+

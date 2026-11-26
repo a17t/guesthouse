@@ -3,7 +3,9 @@
 
 use crate::context::{Context, SLOT_VARIABLE};
 use crate::failure::Result;
+use crate::gpu_maker::GpuMaker;
 use crate::guest_memory::GuestMemory;
+use guesthouse_backend_intel::stage::{DESKTOP_VARIABLE, Desktop};
 use guesthouse_daemon::memory_files::{MemoryFiles, RAM_VARIABLE, WINDOW_VARIABLE};
 use guesthouse_daemon::slot::Slot;
 use guesthouse_daemon::{card_choice, jail};
@@ -17,6 +19,10 @@ pub const DAEMON_PROGRAM: &str = "guesthouse-daemon";
 /// The sockets QEMU connects to, which the daemon makes once it's ready.
 pub const SOCKETS: [&str; 2] = ["vgpu.sock", "global.sock"];
 pub const OUTPUT_FILE: &str = "daemon.out";
+/// Any value makes the daemon say every ten seconds where the guest's work spends its time, at a
+/// clock read a stage. `GUESTHOUSE_VERBOSE`, which logs everything, is left to the environment the
+/// app was started in.
+const TIMING_VARIABLE: &str = "GUESTHOUSE_TIMING";
 
 /// What it takes to start the daemon for one VM.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,9 +49,49 @@ impl DaemonStart {
         }
     }
 
+    /// For a guest on the card at `pci`, which is `maker`'s. An NVIDIA card with no address is the one
+    /// setup chose, which the daemon opens when it's told no other.
+    pub fn on_card(self, maker: GpuMaker, pci: &str) -> Result<Self> {
+        match maker {
+            GpuMaker::Nvidia if pci.is_empty() => Ok(self),
+            GpuMaker::Nvidia => Ok(self.on_nvidia_card(pci)),
+            GpuMaker::Amd => Ok(self.on_amd_card(pci)),
+            GpuMaker::Intel => Ok(self.on_intel_card(pci)),
+        }
+    }
+
+    /// For a guest given an NVIDIA card by its address, which the daemon then opens instead of setup's.
+    fn on_nvidia_card(mut self, pci: &str) -> Self {
+        self.environment.insert(card_choice::NVIDIA_CARD_VARIABLE.to_owned(), pci.to_owned());
+        self
+    }
+
     /// For a guest on an AMD card, which the daemon then opens instead of the NVIDIA card.
-    pub fn on_amd_card(mut self, pci: &str) -> Self {
+    fn on_amd_card(mut self, pci: &str) -> Self {
         self.environment.insert(card_choice::AMD_CARD_VARIABLE.to_owned(), pci.to_owned());
+        self
+    }
+
+    /// For a guest on an Intel card, which the daemon then opens instead of the NVIDIA card.
+    fn on_intel_card(mut self, pci: &str) -> Self {
+        self.environment.insert(card_choice::INTEL_CARD_VARIABLE.to_owned(), pci.to_owned());
+        self.with_intel_test_log()
+    }
+
+    /// Intel's support is experimental, so a report of a run should say where the time goes. The
+    /// daemon is told to say it every ten seconds, which costs a clock read a stage. It isn't told to
+    /// log everything: that writes a line for each of the guest's messages on the thread that answers
+    /// them, at hundreds of kilobytes a second, and a game waits for it. The log's warnings, summaries
+    /// and the names of the guest's programs are enough to follow a run, and a cut keeps them.
+    fn with_intel_test_log(mut self) -> Self {
+        self.environment.insert(TIMING_VARIABLE.to_owned(), "1".to_owned());
+        self
+    }
+
+    /// Where an Intel guest's desktop is drawn, as the app chose for this start: see
+    /// [`crate::intel_desktop`]. The daemon follows the app's choice rather than its own environment.
+    pub fn with_intel_desktop(mut self, desktop: Desktop) -> Self {
+        self.environment.insert(DESKTOP_VARIABLE.to_owned(), desktop.value().to_owned());
         self
     }
 
@@ -74,7 +120,13 @@ impl DaemonStart {
 
     /// Starts it with the guest's memory open, where it looks for it.
     pub fn spawn(&self, run_folder: &Path, memory: &GuestMemory) -> Result<Child> {
-        let output = File::create(run_folder.join(OUTPUT_FILE))?;
+        // Readable too, as the daemon keeps its log under a limit and reads the newest part back.
+        let output = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(run_folder.join(OUTPUT_FILE))?;
         let mut command = self.command();
         memory.hand_to(&mut command);
         let spawned =
@@ -133,7 +185,7 @@ mod tests {
         let context = scratch_context(&scratch);
         let start = DaemonStart::new(&context, slots::first(), "16G", None);
         assert!(!start.environment.contains_key("GUESTHOUSE_AMD_CARD"));
-        let start = start.on_amd_card("0000:7c:00.0");
+        let start = start.on_card(GpuMaker::Amd, "0000:7c:00.0").unwrap();
         assert_eq!(start.environment["GUESTHOUSE_AMD_CARD"], "0000:7c:00.0");
     }
 
@@ -157,6 +209,34 @@ mod tests {
         let set = |name: &str, value: &str| (OsStr::new(name).to_owned(), Some(OsStr::new(value).to_owned()));
         assert!(found.contains(&set(RAM_VARIABLE, "/dev/shm/ram")));
         assert!(found.contains(&set(WINDOW_VARIABLE, "/dev/shm/window")));
+    }
+
+    #[test]
+    fn a_guest_on_nvidia_names_no_card_and_one_on_intel_names_its_card_and_asks_for_timings() {
+        let scratch = Scratch::new();
+        let context = scratch_context(&scratch);
+        let start = DaemonStart::new(&context, slots::first(), "16G", None);
+        let on_nvidia = start.clone().on_card(GpuMaker::Nvidia, "").unwrap();
+        assert_eq!(on_nvidia, start);
+        let on_intel = start.clone().on_card(GpuMaker::Intel, "0000:00:02.0").unwrap();
+        assert_eq!(on_intel.environment["GUESTHOUSE_INTEL_CARD"], "0000:00:02.0");
+        assert_eq!(on_intel.environment["GUESTHOUSE_TIMING"], "1");
+        assert!(!on_intel.environment.contains_key("GUESTHOUSE_VERBOSE"), "the whole log costs a game time");
+        assert!(!on_intel.environment.contains_key("GUESTHOUSE_AMD_CARD"));
+        let on_amd = start.on_card(GpuMaker::Amd, "0000:7c:00.0").unwrap();
+        assert!(!on_amd.environment.contains_key("GUESTHOUSE_TIMING"), "only Intel's starts are timed");
+    }
+
+    #[test]
+    fn a_guest_given_another_nvidia_card_names_it_and_nothing_else() {
+        let scratch = Scratch::new();
+        let context = scratch_context(&scratch);
+        let start = DaemonStart::new(&context, slots::first(), "16G", None);
+        let on_second = start.clone().on_card(GpuMaker::Nvidia, "0000:02:00.0").unwrap();
+        assert_eq!(on_second.environment["GUESTHOUSE_NVIDIA_CARD"], "0000:02:00.0");
+        let mut named = on_second.environment.clone();
+        named.remove("GUESTHOUSE_NVIDIA_CARD");
+        assert_eq!(named, start.environment, "no other maker's card and no timings");
     }
 
     #[test]

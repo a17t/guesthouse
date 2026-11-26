@@ -107,6 +107,7 @@ boot_plain_vm() {
     cp "$vars" "$T/vars.fd"
     qemu-img create -f qcow2 "$T/throwaway.qcow2" 64M >/dev/null
     status=0
+        # shellcheck disable=SC2140 # the quotes around each path are on purpose
     timeout "$VM_SECONDS" "$qemu" -L "$current/qemu/pc-bios" -machine q35,accel=kvm,smm=on -m 256 \
         -display none -monitor none -nodefaults -serial file:"$T/serial.txt" \
         -global driver=cfi.pflash01,property=secure,value=on \

@@ -1,7 +1,7 @@
 #!/bin/sh
 # Builds and runs the driver's tests on Linux. They cover what doesn't need Windows: the protocol, the ring's rules and the colour maths.
 set -e
-HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 BUILD=$HERE/build
 mkdir -p "$BUILD"
 FLAGS="-std=c++17 -Wall -Wextra -Werror -O1 -g -fsanitize=address,undefined -I$HERE/../Common/Include"

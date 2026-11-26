@@ -7,8 +7,12 @@ use super::cursor_layer::CursorLayer;
 use super::dbus_frames::DbusFrames;
 use super::forwarded_frames::ForwardedFrames;
 use super::frames::{FrameRoute, FrameSource, thumbnail};
-use super::overlay::PerformanceOverlay;
+use super::overlay::{OverlayChoice, PerformanceOverlay};
+use super::own_screen::{ShownBy, add_see_through_style};
+use super::own_surface::OwnSurface;
 use super::pointer_lock::{PointerLock, pointer_lock};
+use super::screen_frame::ScreenFrame;
+use super::slot_hold::HeldFrame;
 use super::socket_frames::SocketFrames;
 use adw::prelude::*;
 use gtk::{gdk, glib};
@@ -17,7 +21,7 @@ use guesthouse_app_core::input::{Guest, INPUT_SOCKET, MOUSE, TABLET};
 use guesthouse_app_core::vm_args::{DISPLAY_SOCKET, FORWARDED_INPUT_SOCKET};
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -26,15 +30,28 @@ use std::time::{Duration, Instant};
 const POLL: Duration = Duration::from_millis(1);
 const FOLLOW_GUEST: Duration = Duration::from_secs(1);
 const SPINNER_SIZE: i32 = 48;
-const FIRST_RATIO: f32 = 16.0 / 9.0;
+const FIRST_RATIO: f64 = 16.0 / 9.0;
+/// What the page checks are told is on screen while the app's own surface shows the frames.
+const OWN_SURFACE_KIND: &str = "OwnSurface";
+/// No focus ring on the picture: it would be drawn over the frame, and the screen has the keys
+/// whenever the window does anyway.
 const STYLE: &str = ".guest-screen { background: #000000; color: #ffffff; }
+.guest-picture { outline: none; }
 .performance-overlay { background: rgba(0, 0, 0, 0.65); color: white; padding: 6px 10px; border-radius: 6px;
   font-size: smaller; font-feature-settings: \"tnum\"; }";
+
+/// App windows: what is done with each frame, as its slot, and on each look whether one came or not.
+pub(super) struct SlotHandler {
+    pub frame: Box<dyn Fn(HeldFrame, Option<u32>)>,
+    pub tick: Box<dyn Fn()>,
+}
 
 pub(super) struct Inner {
     pub(super) root: gtk::Overlay,
     pub(super) picture: gtk::Picture,
-    pub(super) aspect: gtk::AspectFrame,
+    /// Lets GTK hand the picture's frames to the compositor instead of drawing them itself.
+    pub(super) offload: gtk::GraphicsOffload,
+    pub(super) aspect: ScreenFrame,
     pub(super) spinner: gtk::Spinner,
     /// The guest's cursor as the host's pointer, once it has one.
     pub(super) guest_pointer: RefCell<Option<gdk::Cursor>>,
@@ -63,14 +80,50 @@ pub(super) struct Inner {
     pub(super) keys_down: RefCell<BTreeSet<u32>>,
     pub(super) buttons_down: RefCell<BTreeSet<&'static str>>,
     pub(super) pointer: Cell<Option<(i64, i64)>>,
+    /// The guest's pointer stays where it is, for a helper's window that is under it.
+    pub(super) pointer_held: Cell<bool>,
+    /// Where the pointer went while it was held.
+    pub(super) pointer_missed: Cell<Option<(f64, f64)>>,
     pub(super) lock: RefCell<Option<Box<dyn PointerLock>>>,
     pub(super) capture: Cell<Capture>,
     pub(super) capture_input: RefCell<Vec<gtk::EventController>>,
     pub(super) capture_changed: RefCell<Box<dyn Fn()>>,
+    /// The picture has the keyboard's focus.
+    pub(super) focused: Cell<bool>,
+    /// Whether the desktop's shortcuts go to the guest whenever the picture has the focus. It's asked
+    /// each time they're given or taken back, so a change in Preferences reaches a screen that's open.
+    pub(super) shortcuts_on_focus: RefCell<Box<dyn Fn() -> bool>>,
     pub(super) overlay_wanted: Cell<bool>,
+    /// Where the figures' readings come from.
+    pub(super) overlay_sensors: PathBuf,
     pub(super) overlay: RefCell<Option<PerformanceOverlay>>,
     pub(super) poll_source: RefCell<Option<glib::SourceId>>,
+    /// The app's own surface for the frames, while it's in use.
+    pub(super) own: RefCell<Option<OwnSurface>>,
+    /// The machine's Direct frames setting: the own surface where it can be made, GTK's offload
+    /// where it can't.
+    pub(super) direct_frames: Cell<bool>,
+    /// The own surface can't be made on this display.
+    pub(super) own_impossible: Cell<bool>,
+    /// The page has stopped moving, which the own surface waits for.
+    pub(super) page_settled: Cell<bool>,
+    /// A frame in the card's tiles reached neither the compositor nor GTK, so rows are asked for.
+    pub(super) tiles_failed: Cell<bool>,
+    /// Whether the connection there is now offered the producer the card's tiles.
+    pub(super) tiles_offered: Cell<bool>,
+    /// Who shows the frames, as the log last had it.
+    pub(super) shown_by: Cell<Option<ShownBy>>,
+    /// Writes a line in the app's log.
+    pub(super) log: Box<dyn Fn(&str)>,
+    /// The frame on the own surface, for GTK to show if the surface has to go.
+    pub(super) on_own_surface: RefCell<Option<HeldFrame>>,
+    /// The frame GTK is showing because the own surface couldn't take it yet, to hand over once it can.
+    pub(super) handover: RefCell<Option<HeldFrame>>,
     pub(super) followed_at: Cell<Instant>,
+    /// App windows: this screen has no window of its own. It only owns the frames and the input, and
+    /// hands each frame to whoever asked for them.
+    pub(super) headless: Cell<bool>,
+    pub(super) on_slots: RefCell<Option<SlotHandler>>,
 }
 
 #[derive(Clone)]
@@ -83,15 +136,26 @@ impl Screen {
         run_folder: PathBuf,
         route: FrameRoute,
         memory_frames: bool,
-        show_overlay: bool,
+        overlay: OverlayChoice,
+        direct_frames: bool,
         capture_changed: impl Fn() + 'static,
+        log: impl Fn(&str) + 'static,
     ) -> Self {
         let picture = gtk::Picture::builder()
             .content_fit(gtk::ContentFit::Fill)
             .can_shrink(true)
             .focusable(true)
+            .css_classes(["guest-picture"])
             .build();
-        let aspect = gtk::AspectFrame::builder().child(&picture).obey_child(false).ratio(FIRST_RATIO).build();
+        // Always there, so the setting can change while the machine runs. Turned off, GTK draws the
+        // picture just as it would without it.
+        let offload = gtk::GraphicsOffload::new(Some(&picture));
+        offload.set_enabled(gtk::GraphicsOffloadEnabled::Disabled);
+        // Otherwise the black bars beside a frame of another shape are GTK's to draw, and the
+        // compositor can't put the frame straight on the display.
+        #[cfg(feature = "hdr")]
+        offload.set_black_background(true);
+        let aspect = ScreenFrame::new(&offload, FIRST_RATIO);
         let spinner = gtk::Spinner::builder().spinning(true).build();
         spinner.set_size_request(SPINNER_SIZE, SPINNER_SIZE);
         spinner.set_halign(gtk::Align::Center);
@@ -109,10 +173,12 @@ impl Screen {
             &style,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
+        add_see_through_style(&WidgetExt::display(&root));
         let lock = pointer_lock(&WidgetExt::display(&root));
         let this = Self(Rc::new(Inner {
             root,
             picture,
+            offload,
             aspect,
             spinner,
             guest_pointer: RefCell::default(),
@@ -133,14 +199,31 @@ impl Screen {
             keys_down: RefCell::default(),
             buttons_down: RefCell::default(),
             pointer: Cell::new(None),
+            pointer_held: Cell::new(false),
+            pointer_missed: Cell::new(None),
             lock: RefCell::new(lock),
             capture: Cell::default(),
             capture_input: RefCell::default(),
             capture_changed: RefCell::new(Box::new(capture_changed)),
-            overlay_wanted: Cell::new(show_overlay),
+            focused: Cell::new(false),
+            shortcuts_on_focus: RefCell::new(Box::new(|| true)),
+            overlay_wanted: Cell::new(overlay.shown),
+            overlay_sensors: overlay.sensors,
             overlay: RefCell::default(),
             poll_source: RefCell::default(),
+            own: RefCell::default(),
+            direct_frames: Cell::new(direct_frames),
+            own_impossible: Cell::new(false),
+            page_settled: Cell::new(false),
+            tiles_failed: Cell::new(false),
+            tiles_offered: Cell::new(false),
+            shown_by: Cell::new(None),
+            log: Box::new(log),
+            handover: RefCell::default(),
+            on_own_surface: RefCell::default(),
             followed_at: Cell::new(Instant::now()),
+            headless: Cell::new(false),
+            on_slots: RefCell::default(),
         }));
         this.add_input();
         this.connect_life();
@@ -157,7 +240,24 @@ impl Screen {
     }
 
     pub fn has_frames(&self) -> bool {
-        self.0.latest.borrow().is_some()
+        self.0.latest.borrow().is_some() || self.0.on_own_surface.borrow().is_some()
+    }
+
+    /// The size of the frame on screen in the guest's pixels, whoever shows it.
+    pub(super) fn frame_size(&self) -> Option<(i32, i32)> {
+        if let Some(frame) = self.0.on_own_surface.borrow().as_ref() {
+            return Some(frame.size());
+        }
+        self.0.latest.borrow().as_ref().map(|texture| (texture.width(), texture.height()))
+    }
+
+    /// The size of the room the picture has in the window, in the screen's own pixels. The picture
+    /// itself is only as large as the guest's frame fits in that.
+    pub(super) fn picture_pixels(&self) -> Option<(u32, u32)> {
+        let room = self.widget();
+        let scale = room.native()?.surface()?.scale();
+        let side = |length: i32| (f64::from(length) * scale).round() as u32;
+        (room.width() > 0 && room.height() > 0).then(|| (side(room.width()), side(room.height())))
     }
 
     pub fn has_input(&self) -> bool {
@@ -191,10 +291,14 @@ impl Screen {
             *self.0.input_socket.borrow_mut() = socket;
             self.close_guest();
             self.follow_guest();
+            // The own surface is only for some routes.
+            self.follow_direct_frames();
         }
     }
 
     fn forget_picture(&self) {
+        self.0.handover.borrow_mut().take();
+        self.0.on_own_surface.borrow_mut().take();
         self.0.latest.borrow_mut().take();
         self.0.picture.set_paintable(None::<&gdk::Paintable>);
         self.0.spinner.set_visible(true);
@@ -225,12 +329,14 @@ impl Screen {
         });
         *self.0.poll_source.borrow_mut() = Some(source);
         self.follow_overlay();
+        self.follow_direct_frames();
     }
 
     fn on_unrealize(&self) {
         if let Some(source) = self.0.poll_source.borrow_mut().take() {
             source.remove();
         }
+        self.stop_own_surface();
         self.0.overlay.borrow_mut().take();
         self.let_go();
         self.close_guest();
@@ -240,19 +346,35 @@ impl Screen {
     }
 
     fn poll(&self) {
+        self.follow_tiles();
         self.follow_capture();
         if let Some(guest) = self.0.guest.borrow_mut().as_mut() {
             guest.flush();
         }
-        if !self.0.waiting.get()
-            && let Some(texture) = self.next_texture()
-        {
-            self.show(texture);
+        if self.0.headless.get() {
+            self.pass_on_slot();
+        } else if !self.show_on_own_surface() {
+            if !self.0.waiting.get() {
+                if let Some(texture) = self.next_texture() {
+                    self.show(texture);
+                }
+            } else if let Some(source) = self.0.gpu.borrow_mut().as_mut() {
+                // GTK draws only when the compositor asks, and one may not ask for a long time.
+                source.keep_up();
+            }
         }
         if self.0.followed_at.get().elapsed() >= FOLLOW_GUEST {
             self.follow_guest();
             self.0.followed_at.set(Instant::now());
         }
+    }
+
+    /// The daemon sent something. A frame goes on screen now rather than at the next look, which
+    /// is a millisecond away at most but still shows as uneven frame times on a screen whose refresh
+    /// follows the frames. One that can't be shown yet is taken in all the same (`poll` keeps up),
+    /// so the socket isn't left readable.
+    fn frames_arrived(&self) {
+        self.poll();
     }
 
     /// GTK is about to draw, which can be a whole refresh after it was handed its frame: it draws when
@@ -268,7 +390,15 @@ impl Screen {
 
     /// The guest's own frames win, and QEMU's are only looked at until they come.
     fn next_texture(&self) -> Option<gdk::Texture> {
-        let from_gpu = self.0.gpu.borrow_mut().as_mut().and_then(|source| source.newest());
+        // While the own surface is there or on its way, the guest's frames are its to hand out, and
+        // it gives GTK the ones it can't take. A frame that came in just after it looked would be
+        // drawn by GTK otherwise: a solid window over the surface, which stood still in fullscreen
+        // until the window had something else to draw.
+        let from_gpu = if self.own_awaited() {
+            None
+        } else {
+            self.0.gpu.borrow_mut().as_mut().and_then(|source| source.newest())
+        };
         self.follow_gpu_cursor();
         if from_gpu.is_some() {
             self.0.booting.set(false);
@@ -296,12 +426,14 @@ impl Screen {
         if let Some(cursor) = source.new_cursor() {
             *self.0.guest_pointer.borrow_mut() = Some(cursor);
         }
-        // A pointer set here would show through the capture, which hides the root's.
+        // The guest's pointer set here would show through the capture, which hides the root's. None
+        // would too while a button is held: GTK then looks no further up than the widget under the
+        // pointer, and shows the desktop's.
         let captured = self.captured();
-        let pointer = if self.guest_draws_pointer() {
+        let pointer = if captured || self.guest_draws_pointer() {
             self.0.no_pointer.clone()
         } else {
-            self.0.guest_pointer.borrow().clone().filter(|_| !captured)
+            self.0.guest_pointer.borrow().clone()
         };
         if self.0.picture.cursor() != pointer {
             self.0.picture.set_cursor(pointer.as_ref());
@@ -322,7 +454,7 @@ impl Screen {
 
     /// A point in the guest's pixels as a point on the screen widget, and the scale between them.
     fn on_widget(&self, x: i32, y: i32) -> Option<(f64, f64, f64)> {
-        let width = self.0.latest.borrow().as_ref()?.width();
+        let (width, _) = self.frame_size()?;
         let bounds = self.0.picture.compute_bounds(&self.0.root)?;
         let scale = f64::from(bounds.width()) / f64::from(width.max(1));
         Some((
@@ -334,7 +466,7 @@ impl Screen {
 
     fn show(&self, texture: gdk::Texture) {
         self.0.picture.set_paintable(Some(&texture));
-        self.0.aspect.set_ratio(texture.width() as f32 / texture.height() as f32);
+        self.0.aspect.set_ratio(f64::from(texture.width()) / f64::from(texture.height()));
         self.0.spinner.set_visible(false);
         // One that takes the place of a frame still waiting to be drawn isn't one more on screen.
         if !self.0.waiting.replace(true) {
@@ -343,13 +475,77 @@ impl Screen {
         *self.0.latest.borrow_mut() = Some(texture);
     }
 
+    /// App windows: makes this screen the owner of the machine's frames and input for windows of
+    /// other widgets. It is never in a window. Every frame goes to `frame` as its slot, as it comes,
+    /// for the windows to hand to the compositor themselves: nothing here draws it. `tick` is called
+    /// on every look, so what the compositor gave back is taken in soon.
+    pub fn start_headless(
+        &self,
+        frame: impl Fn(HeldFrame, Option<u32>) + 'static,
+        tick: impl Fn() + 'static,
+    ) {
+        self.0.headless.set(true);
+        self.0.own_impossible.set(true);
+        self.0.direct_frames.set(false);
+        *self.0.on_slots.borrow_mut() = Some(SlotHandler { frame: Box::new(frame), tick: Box::new(tick) });
+        if self.0.poll_source.borrow().is_some() {
+            return;
+        }
+        let this = self.clone();
+        let source = glib::timeout_add_local(POLL, move || {
+            this.poll();
+            glib::ControlFlow::Continue
+        });
+        *self.0.poll_source.borrow_mut() = Some(source);
+    }
+
+    /// App windows: the newest frame as its slot, to whoever asked for them.
+    fn pass_on_slot(&self) {
+        let newest = {
+            let mut gpu = self.0.gpu.borrow_mut();
+            gpu.as_mut().map(|source| (source.newest_slot(), source.sdr_white_nits()))
+        };
+        self.follow_gpu_cursor();
+        let handler = self.0.on_slots.borrow();
+        let Some(handler) = handler.as_ref() else { return };
+        if let Some((Some(frame), sdr_white_nits)) = newest {
+            self.0.booting.set(false);
+            self.0.frames.set(self.0.frames.get() + 1);
+            (handler.frame)(HeldFrame::new(frame), sdr_white_nits);
+        }
+        (handler.tick)();
+    }
+
+    /// The pointer the guest wants over its screen, for a window that shows part of it.
+    pub fn guest_pointer_cursor(&self) -> Option<gdk::Cursor> {
+        self.0.picture.cursor()
+    }
+
+    /// Lets go of what is held in the guest, and stops following the machine.
+    pub fn end_headless(&self) {
+        self.let_go();
+        if let Some(source) = self.0.poll_source.borrow_mut().take() {
+            source.remove();
+        }
+        *self.0.on_slots.borrow_mut() = None;
+        self.close_guest();
+        self.0.gpu.borrow_mut().take();
+        self.0.qemu.borrow_mut().take();
+        self.0.forwarded.borrow_mut().take();
+        self.0.latest.borrow_mut().take();
+    }
+
     /// The newest frame as a small PNG, or `None` if nothing has been shown.
     pub fn thumbnail(&self, width: usize) -> Option<Vec<u8>> {
-        Some(thumbnail(self.0.latest.borrow().as_ref()?, width))
+        let texture = self.own_surface_texture().or_else(|| self.0.latest.borrow().clone())?;
+        Some(thumbnail(&texture, width))
     }
 
     /// What kind of texture is on screen, for the page checks.
     pub fn texture_kind(&self) -> String {
+        if self.0.on_own_surface.borrow().is_some() {
+            return OWN_SURFACE_KIND.to_owned();
+        }
         self.0.latest.borrow().as_ref().map_or_else(String::new, |texture| texture.type_().name().to_owned())
     }
 
@@ -374,7 +570,7 @@ impl Screen {
     }
 
     /// Picks up the guest's frames once they're on offer, and a restarted daemon's.
-    fn follow_gpu(&self) {
+    pub(super) fn follow_gpu(&self) {
         let mut gpu = self.0.gpu.borrow_mut();
         if gpu.as_ref().is_some_and(|source| !source.alive()) {
             *gpu = None;
@@ -383,21 +579,33 @@ impl Screen {
             let (folder, display) = (self.0.run_folder.borrow(), WidgetExt::display(&self.0.root));
             *gpu = match self.0.route.get() {
                 FrameRoute::QemuDisplay => None,
-                FrameRoute::FrameSocket => {
-                    SocketFrames::connect(
-                        &folder,
-                        &display,
-                        self.monitor_refresh(),
-                        self.0.memory_frames.get(),
-                    )
-                }
-                .ok()
-                .map(|source| Box::new(source) as Box<dyn FrameSource>),
+                FrameRoute::FrameSocket => self.connect_to_daemon(&folder, &display),
                 FrameRoute::Forwarded => ForwardedFrames::connect(&folder, &display)
                     .ok()
                     .map(|source| Box::new(source) as Box<dyn FrameSource>),
             };
         }
+    }
+
+    /// The daemon's frames, if it's offering any yet. What was asked of it goes in the log.
+    fn connect_to_daemon(&self, folder: &Path, display: &gdk::Display) -> Option<Box<dyn FrameSource>> {
+        let (in_memory, tiles) = (self.0.memory_frames.get(), self.wants_tiles());
+        let screen = Rc::downgrade(&self.0);
+        let arrived = move || {
+            if let Some(inner) = screen.upgrade() {
+                Screen(inner).frames_arrived();
+            }
+        };
+        let source =
+            SocketFrames::connect(folder, display, self.monitor_refresh(), in_memory, tiles, arrived).ok()?;
+        self.0.tiles_offered.set(tiles);
+        let layout = match (in_memory, tiles) {
+            (true, _) => "in memory",
+            (false, true) => "with the card's tiles on offer",
+            (false, false) => "in rows only",
+        };
+        (self.0.log)(&format!("frames: connected to the daemon, {layout}"));
+        Some(Box::new(source))
     }
 
     /// An Ubuntu guest's session takes its input down its own port. A Linux the user installed has no
@@ -462,12 +670,21 @@ impl Screen {
         self.follow_overlay();
     }
 
+    /// The machine's Direct frames setting, which can change while the screen is open. On, the
+    /// frames go to the compositor as they are: on the app's own surface, or through GTK's offload
+    /// on a display where that surface can't be made. GTK still draws any that can't be handed over,
+    /// such as frames in memory, or all of them on X11.
+    pub fn set_direct_frames(&self, wanted: bool) {
+        self.0.direct_frames.set(wanted);
+        self.follow_direct_frames();
+    }
+
     /// Only a realized screen has one, as nothing else would stop it again.
     fn follow_overlay(&self) {
         let wanted = self.0.overlay_wanted.get() && self.0.root.is_realized();
         let mut overlay = self.0.overlay.borrow_mut();
         if wanted && overlay.is_none() {
-            *overlay = Some(PerformanceOverlay::new(self));
+            *overlay = Some(PerformanceOverlay::new(self, self.0.overlay_sensors.clone()));
         } else if !wanted {
             overlay.take();
         }

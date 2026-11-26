@@ -4,6 +4,7 @@ pub use guesthouse_backend::GPU_RANGES;
 use guesthouse_backend::{BackendError, GpuRange};
 use guesthouse_messages::wire::align_up;
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 /// Past the last address any mapping can have, which also makes it more than any size can be.
 pub const ADDRESSES_END: u64 = GPU_RANGES[1].end;
@@ -68,6 +69,14 @@ pub struct GpuAddresses {
     placed: Vec<(u64, u64)>,
     /// (start, end) of what the host took for itself.
     host: Vec<(u64, u64)>,
+    /// Past the ranges, where only the guest may choose addresses. See
+    /// `Backend::guest_placed_gpu_ranges`.
+    guest_only: &'static [GpuRange],
+    /// How long a range given back rests before it is handed out again, if a backend asked for a
+    /// rest. See [`GpuAddresses::holding_freed`].
+    hold: Option<Duration>,
+    /// When each resting range was given back, by its start. Only kept while there is a hold.
+    freed_at: HashMap<u64, Instant>,
 }
 
 /// Where a request will accept addresses: from `from`, with everything ending by `to`.
@@ -131,7 +140,33 @@ impl GpuAddresses {
             hand_out,
             placed: Vec::new(),
             host: Vec::new(),
+            guest_only: &[],
+            hold: None,
+            freed_at: HashMap::new(),
         }
+    }
+
+    /// Has a range given back rest for `hold` before it is handed out again, in every space and for
+    /// every use, while new addresses are handed out meanwhile. `None` hands it out again at once,
+    /// as without this. The cost is addresses, not memory: the memory behind a range is gone when
+    /// it is given back, and what rests is only its addresses, as much as is given back in `hold`.
+    /// When nothing else is left a resting range is handed out anyway.
+    pub fn holding_freed(self, hold: Option<Duration>) -> Self {
+        Self { hold: hold.filter(|hold| !hold.is_zero()), ..self }
+    }
+
+    /// Also lets the guest map at addresses it chose in `ranges`, which are never handed out.
+    pub fn with_guest_only(self, ranges: &'static [GpuRange]) -> Self {
+        Self { guest_only: ranges, ..self }
+    }
+
+    /// Whether the guest may map `size` bytes at `address`, an address it chose: in the ranges, or
+    /// wholly in a range only the guest uses.
+    pub fn guest_may_map(&self, address: u64, size: u64) -> bool {
+        let in_guest_only = |range: &GpuRange| {
+            range.contains(address) && address.checked_add(size).is_some_and(|end| end <= range.end)
+        };
+        Self::in_a_range(address) || self.guest_only.iter().any(in_guest_only)
     }
 
     /// Takes `size` bytes: what was given back for this use, or new addresses, moving to the next
@@ -143,12 +178,34 @@ impl GpuAddresses {
 
     /// As [`GpuAddresses::take`], but only if what comes next lies in `window`. Nothing changes if not.
     pub fn take_within(&mut self, size: u64, align: u64, usage: AddressUse, window: Window) -> Option<u64> {
-        if let Some(spare) = self.spare(size, align, usage, window) {
+        self.take_clear_of(size, align, usage, window, &[])
+    }
+
+    /// As [`GpuAddresses::take_within`], stepping over `mapped`: (start, end) of what is mapped now in
+    /// any space. A guest can map pages of its own at addresses it chooses, inside a range that was
+    /// handed out for something else, and keep them there after that range was given back.
+    pub fn take_clear_of(
+        &mut self,
+        size: u64,
+        align: u64,
+        usage: AddressUse,
+        window: Window,
+        mapped: &[(u64, u64)],
+    ) -> Option<u64> {
+        let now = Instant::now();
+        if let Some(spare) = self.spare(size, align, usage, window, mapped, Some(now)) {
             return Some(spare);
         }
-        let Some(base) = self.next_clear(size, align, window) else {
-            let other = usage.last_resort()?;
-            return self.spare(size, align, other, window);
+        let Some(base) = self.next_clear(size, align, window, mapped) else {
+            let rested =
+                |addresses: &mut Self, usage| addresses.spare(size, align, usage, window, mapped, Some(now));
+            let anyway =
+                |addresses: &mut Self, usage| addresses.spare(size, align, usage, window, mapped, None);
+            let other = usage.last_resort();
+            return other
+                .and_then(|other| rested(self, other))
+                .or_else(|| anyway(self, usage))
+                .or_else(|| other.and_then(|other| anyway(self, other)));
         };
         self.next = base + size;
         if usage == AddressUse::Host {
@@ -157,20 +214,41 @@ impl GpuAddresses {
         Some(base)
     }
 
-    /// The newest range given back for this use that hasn't been placed over since.
-    fn spare(&mut self, size: u64, align: u64, usage: AddressUse, window: Window) -> Option<u64> {
+    /// The newest range given back for this use that hasn't been placed or mapped over since. One
+    /// that has stays on the shelf until it is clear again. With `now`, a range still resting then
+    /// stays on the shelf too.
+    fn spare(
+        &mut self,
+        size: u64,
+        align: u64,
+        usage: AddressUse,
+        window: Window,
+        mapped: &[(u64, u64)],
+        now: Option<Instant>,
+    ) -> Option<u64> {
         let spares = self.free.get_mut(&(usage, size, align))?;
+        let resting = |base: &u64| match (now, self.hold, self.freed_at.get(base)) {
+            (Some(now), Some(hold), Some(&freed)) => now.saturating_duration_since(freed) < hold,
+            _ => false,
+        };
         let usable = |base: &u64| {
-            window.holds(*base, size) && !self.placed.iter().any(|&range| overlaps(range, *base, size))
+            let blocked = |&range: &(u64, u64)| overlaps(range, *base, size);
+            window.holds(*base, size)
+                && !self.placed.iter().any(blocked)
+                && !mapped.iter().any(blocked)
+                && !resting(base)
         };
         let found = spares.iter().rposition(usable)?;
-        Some(spares.remove(found))
+        let base = spares.remove(found);
+        self.freed_at.remove(&base);
+        Some(base)
     }
 
-    /// The first new address with room in `window`, past whatever the guest has placed.
-    fn next_clear(&self, size: u64, align: u64, window: Window) -> Option<u64> {
+    /// The first new address with room in `window`, past whatever the guest has placed or mapped.
+    fn next_clear(&self, size: u64, align: u64, window: Window, mapped: &[(u64, u64)]) -> Option<u64> {
+        let blocked = [self.placed.as_slice(), mapped].concat();
         let in_window = self.hand_out.iter().filter_map(|range| window.limit(range));
-        in_window.into_iter().find_map(|range| first_fit(&range, self.next, size, align, &self.placed))
+        in_window.into_iter().find_map(|range| first_fit(&range, self.next, size, align, &blocked))
     }
 
     /// Room in `window`, whatever has been handed out, clear of `taken` and of the host's own ranges.
@@ -203,9 +281,13 @@ impl GpuAddresses {
         &self.host
     }
 
-    /// Makes a range free for the same use again. Nothing may be mapped there now.
+    /// Makes a range free for the same use again. What the host mapped there must be gone; pages the
+    /// guest mapped there itself can stay, and keep it from being handed out until they go.
     pub fn give_back(&mut self, base: u64, size: u64, align: u64, usage: AddressUse) {
         self.free.entry((usage, size, align)).or_default().push(base);
+        if self.hold.is_some() {
+            self.freed_at.insert(base, Instant::now());
+        }
     }
 
     pub fn in_a_range(address: u64) -> bool {
@@ -290,6 +372,26 @@ mod tests {
     }
 
     #[test]
+    fn a_spare_range_with_a_page_still_mapped_in_it_stays_on_the_shelf() {
+        let usage = AddressUse::Mapped;
+        let mut addresses = GpuAddresses::new();
+        addresses.give_back(PLACED_AT, 0x2_0000, ALLOCATION_ALIGN, usage);
+        let page = [(PLACED_AT + 0x1_0000, PLACED_AT + 0x2_0000)];
+        let taken = addresses.take_clear_of(0x2_0000, ALLOCATION_ALIGN, usage, Window::ANYWHERE, &page);
+        assert_ne!(taken, Some(PLACED_AT));
+        let again = addresses.take_clear_of(0x2_0000, ALLOCATION_ALIGN, usage, Window::ANYWHERE, &[]);
+        assert_eq!(again, Some(PLACED_AT));
+    }
+
+    #[test]
+    fn new_addresses_step_over_what_is_mapped() {
+        let mut addresses = GpuAddresses::new();
+        let page = [(0x400_0000, 0x401_0000)];
+        let taken = addresses.take_clear_of(0x1_0000, ALLOCATION_ALIGN, HOST, Window::ANYWHERE, &page);
+        assert_eq!(taken, Some(0x401_0000));
+    }
+
+    #[test]
     fn a_range_two_spaces_placed_stays_clear_until_both_let_go() {
         let mut addresses = GpuAddresses::new();
         addresses.place(0x400_0000, 0x1_0000);
@@ -332,6 +434,25 @@ mod tests {
         assert!(!addresses.reaches(far));
         assert_eq!(addresses.find_gap(far, 0x1000, ALLOCATION_ALIGN, &[]), None);
         assert!(addresses.reaches(Window::ANYWHERE));
+    }
+
+    const ABOVE: GpuRange = GpuRange { start: GPU_RANGES[1].end, end: 1 << 47 };
+
+    #[test]
+    fn with_no_guest_only_ranges_the_guest_maps_only_in_the_ranges() {
+        let addresses = GpuAddresses::new();
+        assert!(addresses.guest_may_map(GPU_RANGES[1].start, 0x1000));
+        assert!(!addresses.guest_may_map(0x255_f13c_0000, 0x1000));
+    }
+
+    #[test]
+    fn a_guest_only_range_takes_the_guests_own_addresses_but_none_are_handed_out_there() {
+        let mut addresses = GpuAddresses::new().with_guest_only(std::slice::from_ref(&ABOVE));
+        assert!(addresses.guest_may_map(0x255_f13c_0000, 0x1000));
+        assert!(!addresses.guest_may_map(ABOVE.end - 0x1000, 0x2000), "it ends past the range");
+        assert!(!addresses.guest_may_map(ABOVE.end, 0x1000));
+        assert!(!addresses.reaches(Window { from: ABOVE.start, to: ABOVE.end }));
+        assert!(addresses.take(GPU_RANGES[1].end, ALLOCATION_ALIGN, HOST).is_err());
     }
 
     #[test]
@@ -389,5 +510,69 @@ mod tests {
         addresses.give_back(0x1000, 1, 1, usage);
         addresses.give_back(0x2000, 1, 1, usage);
         assert_eq!(addresses.take(1, 1, usage), Ok(0x2000));
+    }
+
+    const AN_HOUR: Duration = Duration::from_secs(3600);
+
+    #[test]
+    fn without_a_hold_a_freed_range_comes_back_at_once() {
+        for hold in [None, Some(Duration::ZERO)] {
+            let mut addresses = GpuAddresses::new().holding_freed(hold);
+            let usage = AddressUse::Mapped;
+            let first = addresses.take(0x10000, ALLOCATION_ALIGN, usage).unwrap();
+            addresses.give_back(first, 0x10000, ALLOCATION_ALIGN, usage);
+            assert_eq!(addresses.take(0x10000, ALLOCATION_ALIGN, usage), Ok(first), "{hold:?}");
+            assert!(addresses.freed_at.is_empty(), "nothing is timed without a hold");
+        }
+    }
+
+    #[test]
+    fn a_held_range_rests_while_new_addresses_are_handed_out() {
+        let mut addresses = GpuAddresses::new().holding_freed(Some(AN_HOUR));
+        let usage = AddressUse::Mapped;
+        let first = addresses.take(0x10000, ALLOCATION_ALIGN, usage).unwrap();
+        addresses.give_back(first, 0x10000, ALLOCATION_ALIGN, usage);
+        let second = addresses.take(0x10000, ALLOCATION_ALIGN, usage).unwrap();
+        assert_ne!(second, first);
+        assert_eq!(second, first + 0x10000, "the next new address");
+    }
+
+    #[test]
+    fn a_held_range_comes_back_once_it_has_rested() {
+        let hold = Duration::from_millis(20);
+        let mut addresses = GpuAddresses::new().holding_freed(Some(hold));
+        let usage = AddressUse::Mapped;
+        let first = addresses.take(0x10000, ALLOCATION_ALIGN, usage).unwrap();
+        addresses.give_back(first, 0x10000, ALLOCATION_ALIGN, usage);
+        std::thread::sleep(hold + Duration::from_millis(10));
+        assert_eq!(addresses.take(0x10000, ALLOCATION_ALIGN, usage), Ok(first));
+        assert!(addresses.freed_at.is_empty(), "its time went with it");
+    }
+
+    #[test]
+    fn with_no_new_addresses_left_a_resting_range_is_handed_out_anyway() {
+        let last = GPU_RANGES[1].end - 0x10000;
+        let mut addresses =
+            GpuAddresses::keeping_clear(&[GpuRange { start: 0, end: last }]).holding_freed(Some(AN_HOUR));
+        let usage = AddressUse::Mapped;
+        let only = addresses.take(0x10000, ALLOCATION_ALIGN, usage).unwrap();
+        addresses.give_back(only, 0x10000, ALLOCATION_ALIGN, usage);
+        assert_eq!(addresses.take(0x10000, ALLOCATION_ALIGN, usage), Ok(only));
+        assert!(addresses.take(0x10000, ALLOCATION_ALIGN, usage).is_err());
+    }
+
+    #[test]
+    fn a_rested_range_of_the_other_memory_goes_before_a_resting_one_of_the_same() {
+        let last = GPU_RANGES[1].end - 0x20000;
+        let mut addresses =
+            GpuAddresses::keeping_clear(&[GpuRange { start: 0, end: last }]).holding_freed(Some(AN_HOUR));
+        let (video, system) = (AddressUse::mapped(false), AddressUse::mapped(true));
+        let a = addresses.take(0x10000, ALLOCATION_ALIGN, system).unwrap();
+        let b = addresses.take(0x10000, ALLOCATION_ALIGN, video).unwrap();
+        addresses.give_back(a, 0x10000, ALLOCATION_ALIGN, system);
+        addresses.give_back(b, 0x10000, ALLOCATION_ALIGN, video);
+        // Both rest, so the same memory's range goes out anyway, ahead of the other memory's.
+        assert_eq!(addresses.take(0x10000, ALLOCATION_ALIGN, video), Ok(b));
+        assert_eq!(addresses.take(0x10000, ALLOCATION_ALIGN, video), Ok(a));
     }
 }

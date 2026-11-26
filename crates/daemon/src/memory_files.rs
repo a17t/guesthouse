@@ -90,7 +90,7 @@ fn prepare(path: &Path, bytes: u64, claim: bool) -> io::Result<File> {
         Ok(file) => size(&file, path, bytes, claim).map(|()| file).inspect_err(|_| {
             let _ = fs::remove_file(path);
         }),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => check(path, bytes),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => check(path, bytes, me()),
         Err(error) => Err(failed(path, &format!("it could not be made: {error}."))),
     }
 }
@@ -115,8 +115,13 @@ fn size(file: &File, path: &Path, bytes: u64, claim: bool) -> io::Result<()> {
     }
 }
 
+fn me() -> u32 {
+    // SAFETY: geteuid takes nothing and cannot fail.
+    unsafe { libc::geteuid() }
+}
+
 /// A file that was there already has to be this guest's memory and nobody else's.
-fn check(path: &Path, bytes: u64) -> io::Result<File> {
+fn check(path: &Path, bytes: u64, mine: u32) -> io::Result<File> {
     // A link would let someone else's file stand in for it.
     let file = OpenOptions::new().read(true).write(true).custom_flags(libc::O_NOFOLLOW).open(path).map_err(
         |error| match error.raw_os_error() {
@@ -125,8 +130,6 @@ fn check(path: &Path, bytes: u64) -> io::Result<File> {
         },
     )?;
     let found = file.metadata()?;
-    // SAFETY: geteuid takes nothing and cannot fail.
-    let mine = unsafe { libc::geteuid() };
     if !found.is_file() {
         return Err(failed(path, NOT_A_FILE));
     }
@@ -280,10 +283,14 @@ mod tests {
 
     #[test]
     fn someone_elses_file_is_refused() {
-        // Owned by root, so it is someone else's unless this runs as root, and then it is open to
-        // other users. Either way it can't stand in for the guest's memory.
-        let error = prepare(Path::new("/etc/passwd"), MIB, false).unwrap_err().to_string();
-        assert!(error.contains("isn't yours") || error.contains("other users can open it"), "{error}");
+        // A file can't be handed to another user without being root, so the test is the one user
+        // the file belongs to, told that someone else is asking.
+        let folder = scratch("not-yours");
+        let path = folder.join("ram");
+        prepare(&path, MIB, false).unwrap();
+        let error = check(&path, MIB, me() + 1).unwrap_err().to_string();
+        assert!(error.contains("isn't yours"), "{error}");
+        fs::remove_dir_all(folder).unwrap();
     }
 
     #[test]

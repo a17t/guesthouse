@@ -110,9 +110,22 @@ pub fn scratch_context(scratch: &Scratch) -> Context {
     context.udev_data = scratch.path("udev");
     // A test's PC has no card unless it makes one, whatever cards this PC has.
     context.drm_class = scratch.path("drm");
+    context.pci_devices = scratch.path("pci");
+    context.pci_names = scratch.path("pci.ids");
     context.reserve_memory = crate::guest_memory::GuestMemory::sized;
     // A test's pretend programs are shell scripts, which no jail would let run as they do.
     context.jail_offer = |_| crate::jailing::Offer::nothing();
     context.ram_limit = Some(PLENTY_OF_GIB);
+    // Nor is it short of RAM, however little this PC has free.
+    let plenty_kib = PLENTY_OF_GIB << 20;
+    context.meminfo =
+        scratch.write("meminfo", format!("MemTotal: {plenty_kib} kB\nMemAvailable: {plenty_kib} kB\n"));
+    // Nor does it lack the jail, its cards' devices or udmabuf's room, whatever this PC has.
+    context.jail_support = || guesthouse_jail::Support { landlock_abi: 10, seccomp: true };
+    context.may_open = |_| true;
+    context.card_memories = String::new;
+    context.security_modules = scratch.write("lsm", "capability,landlock");
+    context.apparmor = scratch.path("apparmor.d");
+    context.udmabuf_limit = scratch.path("udmabuf-limit");
     context
 }

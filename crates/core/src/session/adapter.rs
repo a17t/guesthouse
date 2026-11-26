@@ -8,8 +8,9 @@ use guesthouse_backend::{
 };
 use guesthouse_messages::adapter::{
     ASYNC_MESSAGES, AdapterQuery, CapsQuery, DRIVER_MODEL_NUMBER, DisplayMode, FLIP_QUEUE_ANSWER_SIZE,
-    IdentityAnswer, SetIoSpace, adapter_identity, description_answer, driver_caps, flip_queue,
-    guest_adapter_id, node_description, node_of, open_adapter, physical_adapter_ids, segment_sizes,
+    IdentityAnswer, KEEP_CPU_VIEWS, SetIoSpace, adapter_identity, description_answer, driver_caps,
+    flip_queue, guest_adapter_id, node_description, node_of, open_adapter, physical_adapter_ids,
+    segment_sizes,
 };
 use guesthouse_messages::address::{
     ReservationRequest, available_for_reservation, memory_answer, memory_group,
@@ -18,6 +19,9 @@ use guesthouse_messages::indirect;
 use guesthouse_messages::queue::{DriverEscape, clock_answer};
 use guesthouse_messages::registry::RegistryQuery;
 use guesthouse_messages::wire::{align_up, pad_to, put_u32, put_u64, set_u32, u32_at};
+
+/// What the guest's budget leaves free on the card, for the host and the daemon's own memory.
+const CARD_MARGIN: u64 = 512 << 20;
 use guesthouse_messages::{MessageHeader, Status};
 use std::collections::HashMap;
 
@@ -66,7 +70,8 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
             description: &facts.name,
             vendor: facts.card.vendor,
             device: facts.card.device,
-            flags: if self.config.async_messages { ASYNC_MESSAGES } else { 0 },
+            flags: if self.config.async_messages { ASYNC_MESSAGES } else { 0 }
+                | if self.config.keep_cpu_views { KEEP_CPU_VIEWS } else { 0 },
         };
         adapter_identity(&answer, out);
     }
@@ -141,8 +146,21 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
         } else {
             0
         };
-        memory_answer(self.group_budget(group), usage, reserved, out);
+        let budget =
+            if group == VIDEO_MEMORY_GROUP { self.video_budget_now() } else { self.group_budget(group) };
+        memory_answer(budget, usage, reserved, out);
         Ok(())
+    }
+
+    /// The guest's video budget: the fixed one, or less when the card has less free than that. What
+    /// the guest already has on the card counts as its own, and a margin is left for the host's
+    /// desktop and the daemon's own memory, which the guest doesn't see. A game that keeps to its
+    /// budget then doesn't fill the card.
+    fn video_budget_now(&self) -> u64 {
+        let fixed = self.group_budget(VIDEO_MEMORY_GROUP);
+        let Some(free) = self.backend.card_memory_free() else { return fixed };
+        let room = self.video_in_use().saturating_add(free).saturating_sub(CARD_MARGIN);
+        fixed.min(room)
     }
 
     /// Keeps the amount a process asks to have kept, up to what a usage query says it may. Nothing
@@ -191,6 +209,7 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
             size: query.size,
             data: query.data,
             process_is_32_bit: self.processes_32_bit.contains(&process),
+            program: self.programs.get(&process).map_or("", String::as_str),
         };
         put_u32(out, Status::SUCCESS.0);
         let status = match self.backend.adapter_answer(&vendor_query, out) {
@@ -259,7 +278,7 @@ impl<B: Backend, M: GuestMemory> Session<B, M> {
         };
         // Windows fails the lookup of a value that isn't there. A success with the buffer as it came
         // reads as a value found, which is how Direct3D 9 took it.
-        let Some(value) = self.backend.registry_value(&lookup) else {
+        let Some(value) = self.backend.registry_value(&lookup, query.value_type) else {
             log::debug!("no registry value for {:?}", query.name);
             query.unchanged(out);
             return Ok(Status::NOT_FOUND);

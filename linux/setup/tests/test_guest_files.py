@@ -45,6 +45,31 @@ class AllowList(unittest.TestCase):
                       ("ctrl", "0x20808163"), ("class", "0x2")):
             self.assertIn(entry, self.entries())
 
+    def test_cards_before_the_50_series_have_their_own_classes(self):
+        # A card makes its own generation's objects. Without the doorbell alone, CUDA finds no device on an
+        # RTX 4060 Ti and the guest comes up with no GPU.
+        by_card = {
+            "the 20 series": ("0xc461", "0xc46f", "0xc5c0", "0xc597", "0xc5b5", "0xa140", "0xc4b0", "0xc4b7",
+                              "0xb4b7"),
+            "the 30 series": ("0xc461", "0xc56f", "0xc7c0", "0xc797", "0xc7b5", "0xa140", "0xc7b0", "0xc7b7",
+                              "0xc7fa"),
+            "the 40 series": ("0xc461", "0xc56f", "0xc9c0", "0xc997", "0xc7b5", "0xa140", "0xc9b0", "0xc9b7",
+                              "0xc9fa"),
+        }
+        for card, classes in by_card.items():
+            for number in classes:
+                self.assertIn(("class", number), self.entries(), card)
+
+    def test_the_cuda_runtime_has_what_it_needs(self):
+        # Without any one of these, every program built against the CUDA runtime stops at its first call with
+        # "initialization error", while the driver API still works.
+        for control in ("0x20802209", "0x20809001", "0x2080a026"):
+            self.assertIn(("ctrl", control), self.entries())
+
+    def test_what_the_cuda_runtime_can_do_without_stays_refused(self):
+        # It asks for this one too, and starts and runs without it.
+        self.assertFalse([entry for entry in self.entries() if entry[1] == "0x2080a084"])
+
     def test_its_two_neighbours_stay_refused(self):
         for control in ("0x20808164", "0x20808165"):
             self.assertFalse([entry for entry in self.entries() if entry[1] == control])

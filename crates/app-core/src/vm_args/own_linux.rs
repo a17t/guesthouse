@@ -62,6 +62,10 @@ mod tests {
     }
 
     fn with_gpu() -> UbuntuBoot {
+        on_a_card_of(None)
+    }
+
+    fn on_a_card_of(memory_mib: Option<u64>) -> UbuntuBoot {
         UbuntuBoot::WithGpu {
             image: "/images/driver.iso".into(),
             allow_list: "/p/linux/allow.txt".into(),
@@ -70,8 +74,29 @@ mod tests {
                 pci: "0000:05:00.0".into(),
                 minor: 1,
                 render_node: Some("renderD130".into()),
+                memory_mib,
             },
         }
+    }
+
+    #[test]
+    fn a_machine_with_no_cap_gets_the_card_less_the_hosts_share() {
+        let scratch = Scratch::new();
+        let context = scratch_context(&scratch);
+        let uncapped = |memory_mib| {
+            let machine = Machine {
+                kind: Kind::Plain,
+                linux_gpu: true,
+                ..Machine::new("fedora", "Fedora", "/m/fedora/disk.qcow2", "/m/fedora/vars.fd")
+            };
+            let boot = own(on_a_card_of(memory_mib));
+            VmPlan::new(&context, &machine, boot, slots::first(), machine.vram_gib).qemu_arguments()
+        };
+        assert!(!uncapped(None).iter().any(|word| word.contains("max-vram")), "the card's size isn't known");
+        assert!(uncapped(Some(32607)).iter().any(|word| word.ends_with(",max-vram=28G")));
+        assert!(uncapped(Some(8192)).iter().any(|word| word.ends_with(",max-vram=6G")));
+        let capped = plan(&context, own(on_a_card_of(Some(32607)))).qemu_arguments();
+        assert!(capped.iter().any(|word| word.ends_with(",max-vram=12G")), "a chosen cap stays");
     }
 
     fn own(gpu: UbuntuBoot) -> Boot {
@@ -135,7 +160,7 @@ mod tests {
         };
         let plan = VmPlan { jail: Some(jail), ..plan };
         let command = plan.qemu_command();
-        assert_eq!(command[0], "bwrap");
+        assert_eq!(command[0], crate::vm_args::program_word("bwrap"));
         let launcher = command.iter().rposition(|word| word == "/p/guesthouse-jail").unwrap();
         assert_eq!(&command[launcher - 3..launcher], ["setarch", "x86_64", "-L"]);
         let rules = plan.qemu_jail_plan(plan.jail.as_ref().unwrap());
@@ -143,5 +168,29 @@ mod tests {
             rules.paths.iter().filter(|(grant, _)| *grant == guesthouse_jail::Grant::Read).collect();
         assert!(read.iter().any(|(_, path)| path == std::path::Path::new("/iso/Fedora.iso")), "its disc");
         assert!(rules.paths.iter().any(|(_, path)| path == std::path::Path::new("/m/fedora/vars.fd")));
+    }
+
+    #[test]
+    fn jailed_its_tpm_and_frames_sockets_come_from_the_launcher_and_no_daemon_ones() {
+        let scratch = Scratch::new();
+        let plan = plan(&scratch_context(&scratch), own(with_gpu()));
+        let jail = crate::vm_args::QemuJail {
+            launcher: "/p/guesthouse-jail".into(),
+            namespaces: false,
+            qemu_sandbox: false,
+            sound_socket: None,
+            backing_files: Vec::new(),
+        };
+        let plan = VmPlan { jail: Some(jail), tpm: Some("/m/fedora/tpm".into()), ..plan };
+        let command = plan.qemu_command();
+        assert!(command.iter().any(|word| word == "--no-new-unix-sockets"));
+        let tpm = plan.run_folder.join("tpm.sock").display().to_string();
+        let connect = command.iter().position(|word| word == "--unix-connect").unwrap();
+        assert_eq!(command[connect + 1..connect + 3], [tpm, "24".to_owned()]);
+        assert_eq!(command.iter().filter(|word| *word == "--unix-connect").count(), 1, "no daemon sockets");
+        let arguments = plan.qemu_arguments();
+        assert!(arguments.iter().any(|word| word == "socket,id=tpm,fd=24"));
+        assert!(arguments.iter().any(|word| word.starts_with("nvfwd,") && word.contains(",show-fd=25,")));
+        assert!(!arguments.iter().any(|word| word.contains("forwarded-input.sock")), "QEMU's own input");
     }
 }

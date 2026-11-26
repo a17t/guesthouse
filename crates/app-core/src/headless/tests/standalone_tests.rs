@@ -43,6 +43,20 @@ fn a_windows_machine_gets_its_daemon_and_qemu_with_the_memory_in_files() {
     assert!(daemon_at < wait_at && wait_at < qemu_at && qemu_at < stop_at, "{out}");
 }
 
+#[test]
+fn a_machine_on_an_intel_card_names_it_to_the_daemon() {
+    let scratch = Scratch::new();
+    let context = scratch_context(&scratch);
+    let mut machine = make(&context, "arc", "Arc", Kind::Windows);
+    machine.use_windows_card(crate::gpu_maker::GpuMaker::Intel, "0000:00:02.0");
+    machine.save(&context).unwrap();
+    let (out, result) = said(&context, "command arc");
+    assert_eq!(result, Ok(()));
+    let named =
+        out.lines().any(|line| line.contains("GUESTHOUSE_INTEL_CARD=") && line.contains("0000:00:02.0"));
+    assert!(named && !out.contains("GUESTHOUSE_AMD_CARD"), "{out}");
+}
+
 /// Every word of the fixture that names no path is a word of the guest's machine, and must be there,
 /// in the same order. The paths differ with the PC, and the two memory paths are what this changes.
 #[test]

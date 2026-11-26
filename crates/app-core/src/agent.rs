@@ -1,7 +1,9 @@
 //! The guest's agent: PowerShell over a socket, with each machine's own token.
 
 use crate::context::Context;
+use crate::driver_modes::{DriverModes, Mode};
 use crate::failure::{Failure, Result};
+use crate::guest_files::Helper;
 use crate::machine::Machine;
 use crate::random::random_hex;
 use crate::text::{base64_decode, base64_encode};
@@ -22,6 +24,20 @@ const TOKEN_BYTES: usize = 16;
 pub const MOST_CLIPBOARD_TEXT: usize = 1 << 20;
 pub const QUICK_SECONDS: u64 = 10;
 const CLIPBOARD_START_SECONDS: u64 = 20;
+const WINDOW_SIZE_START_SECONDS: u64 = 20;
+/// A new size took about a second in a guest. The helper itself gives up on Windows after four.
+const WINDOW_SIZE_SECONDS: u64 = 12;
+/// What the helper says, before the size, when Windows has taken it.
+const SIZE_SET: &str = "set";
+/// What the helper says when an app in the guest is fullscreen, and the screen was left alone.
+const SIZE_HELD: &str = "held";
+/// The first start on a machine also opens the helper's port in Windows' firewall.
+const FILES_START_SECONDS: u64 = 30;
+/// The helpers in the user's session, by the name their file, start script and task share.
+const CLIPBOARD_HELPER: &str = "clipboard";
+const FILES_HELPER: &str = "files";
+const WINDOW_SIZE_HELPER: &str = "window-size";
+const HELPER_STOP_SCRIPT: &str = "helper-stop.ps1";
 
 pub trait GuestAgent: Send + Sync {
     /// Runs PowerShell in the guest, and returns what it said. Nothing if the agent isn't up yet.
@@ -108,8 +124,9 @@ pub fn import_token(context: &Context, machine: &Machine, file: &Path) -> Result
     Ok(())
 }
 
-fn read_token(context: &Context, machine: &Machine) -> Option<String> {
-    let text = fs::read_to_string(machine.token_file(context)).ok()?;
+pub(crate) fn read_token(context: &Context, machine: &Machine) -> Option<String> {
+    // A throwaway run's guest is moved to a token of its own at each start.
+    let text = fs::read_to_string(crate::token_change::token_in_use(context, machine)).ok()?;
     Some(text.trim().to_owned())
 }
 
@@ -123,19 +140,75 @@ impl Context {
     /// token, which from the app's side is the same thing.
     pub fn ask_guest(&self, machine: &Machine, script: &str, seconds: u64, slot: Option<Slot>) -> String {
         let Some(token) = read_token(self, machine) else { return String::new() };
-        self.agent.ask(self.agent_port(slot), &token, script, seconds)
+        let port = self.agent_port(slot);
+        let answer = self.agent.ask(port, &token, script, seconds);
+        if !answer.is_empty() {
+            return answer;
+        }
+        match crate::token_change::recovered_token(self, machine, port) {
+            Some(token) => self.agent.ask(port, &token, script, seconds),
+            None => answer,
+        }
+    }
+}
+
+/// What ends a helper in the guest: its task, and the PowerShell the task's console left running.
+fn helper_stop(context: &Context, name: &str) -> Result<String> {
+    Ok(format!("$helperName = '{name}'\n{}", guest_script(context, HELPER_STOP_SCRIPT)?))
+}
+
+/// What starts a helper: the helper's own file in Base64, and its start script. Any helper of the
+/// same name is ended first, as one left by an earlier viewer holds the port the new one needs.
+pub(crate) fn helper_start(context: &Context, name: &str) -> Result<String> {
+    helper_start_with(context, name, &[])
+}
+
+/// The same, with more files for the guest to have: each is a variable the start script finds set, and
+/// the file it holds in Base64. A file that is not in the program folder is left out.
+pub(crate) fn helper_start_with(context: &Context, name: &str, more: &[(&str, &str)]) -> Result<String> {
+    let helper = base64_encode(&fs::read(context.paths.guest_files().join(format!("{name}.ps1")))?);
+    let start = guest_script(context, &format!("{name}-start.ps1"))?;
+    let mut extra = String::new();
+    for (variable, file) in more {
+        if let Ok(data) = fs::read(context.paths.guest_files().join(file)) {
+            extra += &format!("${variable} = '{}'\n", base64_encode(&data));
+        }
+    }
+    Ok(format!("{}\n$helper = '{helper}'\n{extra}{start}", helper_stop(context, name)?))
+}
+
+pub(crate) fn stop_helper(context: &Context, machine: &Machine, slot: Option<Slot>, name: &str) {
+    if let Ok(script) = helper_stop(context, name) {
+        context.ask_guest(machine, &script, QUICK_SECONDS, slot);
     }
 }
 
 /// Says whether the helper is running in the user's session.
 pub fn start_guest_clipboard(context: &Context, machine: &Machine, slot: Option<Slot>) -> Result<bool> {
-    let helper = base64_encode(&fs::read(context.paths.guest_files().join("clipboard.ps1"))?);
-    let script = format!("$helper = '{helper}'\n{}", guest_script(context, "clipboard-start.ps1")?);
+    let script = helper_start(context, CLIPBOARD_HELPER)?;
     Ok(context.ask_guest(machine, &script, CLIPBOARD_START_SECONDS, slot).contains("started"))
 }
 
 pub fn stop_guest_clipboard(context: &Context, machine: &Machine, slot: Option<Slot>) {
-    context.ask_guest(machine, "Stop-ScheduledTask -TaskName gpupv-clipboard", QUICK_SECONDS, slot);
+    stop_helper(context, machine, slot, CLIPBOARD_HELPER);
+}
+
+/// Says whether the helper for dropped and dragged files was started in the user's session. It
+/// takes a moment more to listen: [`Helper::answers`] says when it does.
+pub fn start_guest_files(context: &Context, machine: &Machine, slot: Option<Slot>) -> Result<bool> {
+    let script = helper_start(context, FILES_HELPER)?;
+    Ok(context.ask_guest(machine, &script, FILES_START_SECONDS, slot).contains("started"))
+}
+
+pub fn stop_guest_files(context: &Context, machine: &Machine, slot: Option<Slot>) {
+    stop_helper(context, machine, slot, FILES_HELPER);
+}
+
+/// The way to the machine's files helper. `None` for a machine with no token, which has no agent
+/// to start one.
+pub fn files_helper(context: &Context, machine: &Machine, slot: Option<Slot>) -> Option<Helper> {
+    let token = read_token(context, machine)?;
+    Some(Helper::new(slot.unwrap_or(context.slot).files_port(), &token))
 }
 
 /// What the helper answered, or `None` if it didn't. The agent can wrap long lines.
@@ -151,6 +224,52 @@ fn ask_guest_clipboard(
         return Ok(None);
     }
     Ok(Some(answer.split_whitespace().skip(1).collect()))
+}
+
+/// Says whether the helper that sizes the screen is running in the user's session.
+pub fn start_guest_window_size(context: &Context, machine: &Machine, slot: Option<Slot>) -> Result<bool> {
+    let script = helper_start(context, WINDOW_SIZE_HELPER)?;
+    Ok(context.ask_guest(machine, &script, WINDOW_SIZE_START_SECONDS, slot).contains("started"))
+}
+
+pub fn stop_guest_window_size(context: &Context, machine: &Machine, slot: Option<Slot>) {
+    stop_helper(context, machine, slot, WINDOW_SIZE_HELPER);
+}
+
+/// What became of a size the guest's screen was asked to take.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Sized {
+    Set,
+    /// An app in the guest has the screen in fullscreen, so its size was left alone. Changing it
+    /// under a game can close the game.
+    Held,
+    /// The helper's own words: no display of the driver's, or Windows refusing the mode.
+    Not(String),
+    /// The helper didn't answer.
+    NoHelper,
+}
+
+/// Has the guest's screen take a size, at a rate. `modes` is the driver's own list, which the helper
+/// adds the size to if Windows doesn't list it yet.
+pub fn size_guest_screen(
+    context: &Context,
+    machine: &Machine,
+    (width, height, hz): Mode,
+    modes: &DriverModes,
+    slot: Option<Slot>,
+) -> Result<Sized> {
+    let request = format!("{width} {height} {hz} {}", modes.list());
+    let script = format!("$request = '{request}'\n{}", guest_script(context, "window-size-ask.ps1")?);
+    let answer = context.ask_guest(machine, &script, WINDOW_SIZE_SECONDS, slot);
+    let Some(said) = answer.trim().strip_prefix("answer") else { return Ok(Sized::NoHelper) };
+    let said = said.trim();
+    Ok(match said.split_whitespace().next() {
+        Some(SIZE_SET) => Sized::Set,
+        Some(SIZE_HELD) => Sized::Held,
+        Some(_) => Sized::Not(said.to_owned()),
+        // It took the request and said nothing, which is what it does with one it can't read.
+        None => Sized::NoHelper,
+    })
 }
 
 /// The guest's text with Linux line ends, or `None` if the helper didn't answer.
@@ -226,6 +345,18 @@ mod tests {
         scratch.write("program/guest/clipboard.ps1", "the helper");
         scratch.write("program/guest/clipboard-start.ps1", "start it");
         scratch.write("program/guest/clipboard-ask.ps1", "ask it");
+        scratch.write("program/guest/helper-stop.ps1", "stop it");
+    }
+
+    #[test]
+    fn a_helper_is_ended_by_name_and_a_start_ends_the_one_before_it() {
+        let scratch = Scratch::new();
+        let context = scratch_context(&scratch);
+        with_guest_files(&scratch);
+        assert_eq!(helper_stop(&context, CLIPBOARD_HELPER).unwrap(), "$helperName = 'clipboard'\nstop it");
+        let start = helper_start(&context, CLIPBOARD_HELPER).unwrap();
+        let helper = base64_encode(b"the helper");
+        assert_eq!(start, format!("$helperName = 'clipboard'\nstop it\n$helper = '{helper}'\nstart it"));
     }
 
     fn answering_with(reply: impl FnOnce(TcpStream) + Send + 'static) -> u16 {
@@ -357,6 +488,32 @@ mod tests {
     }
 
     #[test]
+    fn a_size_a_fullscreen_app_holds_back_is_told_apart() {
+        let scratch = Scratch::new();
+        let mut context = scratch_context(&scratch);
+        scratch.write("program/guest/window-size-ask.ps1", "ask it");
+        let agent = Arc::new(ScriptedAgent::answering(&[
+            "answer set 1920x1080\r\n",
+            "answer held by a fullscreen app\r\n",
+            "answer no driver display\r\n",
+            "answer \r\n",
+            "",
+        ]));
+        context.agent = agent.clone();
+        let vm = machine(&context, "vm");
+        make_token(&context, &vm).unwrap();
+        let modes = DriverModes::default();
+        let size = || size_guest_screen(&context, &vm, (1920, 1080, 144), &modes, None).unwrap();
+        assert_eq!(size(), Sized::Set);
+        assert_eq!(size(), Sized::Held, "a fullscreen app has the screen");
+        assert_eq!(size(), Sized::Not("no driver display".into()));
+        assert_eq!(size(), Sized::NoHelper, "a request it couldn't read");
+        assert_eq!(size(), Sized::NoHelper, "no answer at all");
+        let requests = agent.requests.lock().unwrap();
+        assert!(requests[0].2.starts_with("$request = '1920 1080 144 '\n"), "{}", requests[0].2);
+    }
+
+    #[test]
     fn the_clipboard_goes_through_the_helper() {
         let scratch = Scratch::new();
         let mut context = scratch_context(&scratch);
@@ -389,7 +546,8 @@ mod tests {
         let requests = agent.requests.lock().unwrap();
         assert!(requests[0].2.starts_with("$request = 'get'\n"));
         assert!(requests[4].2.contains(&format!("$request = '{encoded}'\n")));
-        let helper = requests[6].2.strip_prefix("$helper = '").unwrap().split('\'').next().unwrap();
+        let start = requests[6].2.strip_prefix("$helperName = 'clipboard'\nstop it\n").unwrap();
+        let helper = start.strip_prefix("$helper = '").unwrap().split('\'').next().unwrap();
         assert_eq!(base64_decode(helper).unwrap(), b"the helper");
     }
 }

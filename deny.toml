@@ -1,0 +1,34 @@
+# What cargo deny checks. Everything here is GPL-2.0-or-later, so a dependency has to be
+# something that licence can take in.
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+# Three pieces of zbus 5, which have moved inside zbus 6 and get no releases of their own any
+# more. That is all these say: nothing is known to be wrong with the code. They come with ksni,
+# the tray's library, which is still on zbus 5, and go from this list when it moves on.
+ignore = ["RUSTSEC-2026-0370", "RUSTSEC-2026-0371", "RUSTSEC-2026-0372"]
+
+[licenses]
+version = 2
+allow = [
+    "GPL-2.0-or-later",
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    # ksni, which speaks the tray's protocol for the app's icon.
+    "Unlicense",
+]
+
+[bans]
+multiple-versions = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

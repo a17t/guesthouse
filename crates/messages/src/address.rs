@@ -28,6 +28,14 @@ impl MapRequest {
     const ALLOCATION: usize = 0x38;
     const FIRST_PAGE: usize = 0x40;
     const PAGES: usize = 0x48;
+    const PROTECTION: usize = 0x50;
+    const DRIVER_PROTECTION: usize = 0x58;
+
+    /// The protection the guest asked for and its driver's own word, in a message long enough to
+    /// carry them. Nothing acts on these yet: they are read to be logged.
+    pub fn protections(message: &[u8]) -> Option<(u64, u64)> {
+        Some((u64_at(message, Self::PROTECTION).ok()?, u64_at(message, Self::DRIVER_PROTECTION).ok()?))
+    }
 
     pub fn parse(message: &[u8]) -> Result<Self, Malformed> {
         Ok(Self {
@@ -66,6 +74,14 @@ impl ReserveRequest {
     const LOWEST: usize = 0x28;
     const LIMIT: usize = 0x30;
     const SIZE: usize = 0x38;
+    const PROTECTION: usize = 0x40;
+    const DRIVER_PROTECTION: usize = 0x48;
+
+    /// What the range is for and the driver's own word on it, in a message long enough to carry
+    /// them. The driver's word is laid out as a protected map's is.
+    pub fn protections(message: &[u8]) -> Option<(u64, u64)> {
+        Some((u64_at(message, Self::PROTECTION).ok()?, u64_at(message, Self::DRIVER_PROTECTION).ok()?))
+    }
 
     pub fn parse(message: &[u8]) -> Result<Self, Malformed> {
         Ok(Self {

@@ -5,8 +5,7 @@
 
 use super::Task;
 use super::desktop::{boots, wait_for_desktop};
-use super::gpu_check::check_gpu;
-use super::identity::after_failed_gpu;
+use super::gpu_check::{Gpu, confirm_gpu};
 use crate::failure::{Failure, Result};
 use crate::gpu_identity::{maker_name, read_state, write_state};
 use crate::log::write_log;
@@ -37,29 +36,35 @@ fn wait_for_new_boot(task: &Task, before: usize) -> bool {
     false
 }
 
-/// Restarts Windows if this is its first start on its maker's number, and waits for the desktop again.
-pub(super) fn restart_after_switch(task: &mut Task) -> Result<()> {
-    let mut state = read_state(task.context, &task.machine);
-    if !state.restarts_windows() {
-        return Ok(());
-    }
-    task.step(&restarting(&task.machine));
+/// Asks Windows to restart, and says whether the firmware started another boot in time.
+pub(super) fn restart_windows(task: &Task) -> bool {
     let before = boots(task.context, None);
     task.ask_guest(RESTART_SCRIPT, RESTART_ANSWER_SECONDS);
-    let restarted = wait_for_new_boot(task, before);
+    wait_for_new_boot(task, before)
+}
+
+/// Restarts Windows if this is its first start on its maker's number, and waits for the desktop again.
+pub(super) fn restart_after_switch(task: &mut Task) -> Result<Gpu> {
+    let mut state = read_state(task.context, &task.machine);
+    if !state.restarts_windows() {
+        return Ok(Gpu::Working);
+    }
+    task.step(&restarting(&task.machine));
+    let restarted = restart_windows(task);
     // Once is enough either way: by the next start the device's install has long finished.
     state.restart_due = false;
     write_state(task.context, &task.machine, &state)?;
     if !restarted {
         write_log(task.context, "gpu identity: Windows did not restart when asked")?;
         task.error = DID_NOT_RESTART.to_owned();
-        return Ok(());
+        // The GPU was there before the restart was asked for.
+        return Ok(Gpu::Working);
     }
     task.step("Waiting for the desktop");
     if !wait_for_desktop(task) {
         return Err(Failure::new(DESKTOP_GONE));
     }
-    check_gpu(task).map_err(|failure| after_failed_gpu(task, failure))
+    confirm_gpu(task)
 }
 
 #[cfg(test)]

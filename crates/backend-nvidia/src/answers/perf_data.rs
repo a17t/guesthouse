@@ -109,7 +109,7 @@ mod tests {
     }
 
     fn query<'a>(kind: u32, size: usize, data: &'a [u8]) -> VendorQuery<'a> {
-        VendorQuery { kind, size, data, process_is_32_bit: false }
+        VendorQuery { kind, size, data, process_is_32_bit: false, program: "" }
     }
 
     fn long(bytes: &[u8], at: usize) -> u64 {

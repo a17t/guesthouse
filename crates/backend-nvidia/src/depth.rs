@@ -3,6 +3,7 @@
 //! for depth memory and told the packing, so a depth surface passes on the packing its driver chose.
 //! Blackwell's RM gives such memory the plain kind anyway, so nothing changes there.
 
+use crate::page_kind::{CLASS_S8, CLASS_S8Z24, CLASS_Z16, CLASS_Z24S8, CLASS_ZF32_X24S8};
 use guesthouse_backend::MemoryKind;
 
 /// Bit 1 of the usage byte marks a surface the guest's driver will use for depth or stencil.
@@ -15,6 +16,7 @@ const Z_FLOAT_SHIFT: u32 = 18;
 const PACKING_SHIFT: u32 = 19;
 const PACKING_MASK: u32 = 7;
 const DEPTH_UNKNOWN: u32 = 0;
+const DEPTH_8: u32 = 1;
 const DEPTH_16: u32 = 2;
 const DEPTH_32: u32 = 4;
 const DEPTH_64: u32 = 5;
@@ -44,11 +46,15 @@ const fn packed(packing: u32) -> u32 {
 // out in. A typeless surface a program may bind for depth gets one of these too.
 const FORMAT_Z16: u8 = 0x16;
 const FORMAT_S8Z24: u8 = 0x17;
+/// A second 24 bit depth format. NVIDIA's Vulkan driver describes a depth image with it on a Turing
+/// card, and asks for the packing of the one above.
+const FORMAT_DEPTH_24: u8 = 0x19;
 const FORMAT_Z32_FLOAT: u8 = 0x38;
 const FORMAT_Z32_FLOAT_X24S8: u8 = 0x39;
-const FORMAT_PACKINGS: [(u8, u32); 4] = [
+const FORMAT_PACKINGS: [(u8, u32); 5] = [
     (FORMAT_Z16, packed(PACKING_Z16) | DEPTH_16),
     (FORMAT_S8Z24, packed(PACKING_S8Z24) | DEPTH_32),
+    (FORMAT_DEPTH_24, packed(PACKING_S8Z24) | DEPTH_32),
     (FORMAT_Z32_FLOAT, Z_FLOAT | packed(PACKING_Z32) | DEPTH_32),
     (FORMAT_Z32_FLOAT_X24S8, Z_FLOAT | packed(PACKING_Z32_X24S8) | DEPTH_64),
 ];
@@ -99,6 +105,13 @@ pub fn memory_kind(rule: DepthKinds, usage: u8, format: u8, attributes: u32) -> 
         return MemoryKind::PLAIN;
     }
     let chosen = match (stated(attributes), rule) {
+        // OpenGL makes a big float depth buffer from pieces, and one of them can come with a word
+        // that reads as fixed point. A piece of the wrong kind faults the depth unit, so the format
+        // decides when the two disagree on float.
+        (Some(bits), _) if format_bits.is_some_and(|known| known & Z_FLOAT != bits & Z_FLOAT) => {
+            log::debug!("a depth surface's attributes {attributes:#x} disagree with its format {format:#x}");
+            format_bits
+        }
         (Some(bits), _) => Some(bits),
         (None, DepthKinds::Always) => format_bits,
         (None, DepthKinds::AsStated) => None,
@@ -120,10 +133,40 @@ pub fn memory_kind(rule: DepthKinds, usage: u8, format: u8, attributes: u32) -> 
     }
 }
 
+/// The depth class a map names for pages laid out as this kind of memory, in the numbering of
+/// [`crate::page_kind`]. `None` for plain memory, and for 32 bit float depth with no stencil, whose
+/// pages are of the plain kind.
+pub fn view_class(kind: MemoryKind) -> Option<u8> {
+    let bits = stated(kind.0)?;
+    let depth = bits >> DEPTH_SHIFT & DEPTH_MASK;
+    let packing = bits >> PACKING_SHIFT & PACKING_MASK;
+    let float = bits & Z_FLOAT != 0;
+    match (packing, float) {
+        (PACKING_Z24S8, false) if depth == DEPTH_8 => Some(CLASS_S8),
+        (PACKING_Z24S8 | PACKING_Z24X8, false) => Some(CLASS_Z24S8),
+        (PACKING_S8Z24 | PACKING_X8Z24, false) => Some(CLASS_S8Z24),
+        (PACKING_Z16, false) => Some(CLASS_Z16),
+        (PACKING_Z32_X24S8, true) => Some(CLASS_ZF32_X24S8),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use DepthKinds::{Always, AsStated};
+
+    #[test]
+    fn each_kind_of_depth_memory_names_its_class() {
+        let class_of = |format: u8| view_class(memory_kind(Always, NO_USAGE, format, 0));
+        assert_eq!(class_of(FORMAT_Z16), Some(CLASS_Z16));
+        assert_eq!(class_of(FORMAT_S8Z24), Some(CLASS_S8Z24));
+        assert_eq!(class_of(FORMAT_Z32_FLOAT_X24S8), Some(CLASS_ZF32_X24S8));
+        assert_eq!(class_of(FORMAT_Z32_FLOAT), None, "its pages are plain");
+        assert_eq!(view_class(MemoryKind::PLAIN), None);
+        assert_eq!(view_class(MemoryKind(packed(PACKING_Z24S8) | DEPTH_32)), Some(CLASS_Z24S8));
+        assert_eq!(view_class(MemoryKind(packed(PACKING_Z24S8) | DEPTH_8)), Some(CLASS_S8));
+    }
 
     const RENDER_TARGET: u8 = 0x11;
     const DEPTH_STENCIL: u8 = 0x12;
@@ -161,6 +204,17 @@ mod tests {
     }
 
     #[test]
+    fn a_vulkan_depth_image_on_turing_is_known_by_its_format() {
+        // As an RTX 2080's log has it: the image's description, with a usage that marks nothing.
+        const DESCRIPTION: u8 = 0x01;
+        let kind = memory_kind(Always, DESCRIPTION, FORMAT_DEPTH_24, ADA_D24S8);
+        assert_eq!(kind, MemoryKind(0x08_0004));
+        assert_eq!(view_class(kind), Some(crate::page_kind::CLASS_S8Z24));
+        assert_eq!(memory_kind(Always, DESCRIPTION, FORMAT_DEPTH_24, 0), MemoryKind(0x08_0004));
+        assert_eq!(memory_kind(AsStated, DESCRIPTION, FORMAT_DEPTH_24, ADA_D24S8), MemoryKind::PLAIN);
+    }
+
+    #[test]
     fn a_small_depth_surface_with_no_usage_still_gets_its_kind() {
         let small = ADA_D24S8 | 5 << 4;
         assert_eq!(memory_kind(Always, NO_USAGE, FORMAT_S8Z24, small), MemoryKind(0x08_0004));
@@ -176,6 +230,18 @@ mod tests {
             assert_eq!(memory_kind(Always, NO_USAGE, format, BLOCK_LINEAR), MemoryKind(kind));
             assert_eq!(memory_kind(AsStated, DEPTH_STENCIL, format, BLOCK_LINEAR), MemoryKind::PLAIN);
         }
+    }
+
+    #[test]
+    fn a_float_format_wins_over_a_word_that_says_fixed_point() {
+        // As an RTX 2080's OpenGL log has it: the first piece of a float depth buffer.
+        const OPENGL_PIECE: u32 = 0x80_0004;
+        let float = Z_FLOAT | packed(PACKING_Z32) | DEPTH_32;
+        for rule in [AsStated, Always] {
+            assert_eq!(memory_kind(rule, DEPTH_STENCIL, FORMAT_Z32_FLOAT, OPENGL_PIECE), MemoryKind(float));
+        }
+        let fixed = packed(PACKING_S8Z24) | DEPTH_32;
+        assert_eq!(memory_kind(Always, DEPTH_STENCIL, FORMAT_S8Z24, float), MemoryKind(fixed));
     }
 
     #[test]
